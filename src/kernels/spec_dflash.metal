@@ -1331,6 +1331,57 @@ struct DflDepthParams {
   }
 }
 
+// Copy lane (model/copy_lane.h): the conversation's own continuation c_0 .. c_6 (the host's copy_lookup) replaces the
+// drafted chain when it is expected to accept more: expect (the host's, by the match length) > E_d + margin, where
+// E_d = sum_{j < K} prod_{i <= j} c_i is the drafter's own expectation. c_i: at T = 0 the greedy walk's
+// softmax(S_i)[k_i]; at T > 0 the top candidate's share of proposal i's 16 raw draft logits (cand_v), which no draw of
+// this cycle has touched: the choice must not depend on the drafter's sampled tokens, or the proposals would not
+// follow the law the acceptance assumes (as for dfl_depth). A copy chain is deterministic, so its q is one-hot
+// (cand_i[i] = {c_i, -2 ..}, qprob[i] = {1, 0 ..}, walk_k[i] = 0): u q(d) < p(d) accepts c_i with probability p(c_i),
+// and the residual is p without c_i, the target's law exactly. It is written whenever the copy is taken, also where
+// the drafter drew the same tokens (their q would be the walk's, not the one-hot law the copy follows). walk_s gets
+// (0, -inf ..) so dfl_depth sees c = 1 and verifies every proposal. flag = {taken, the drafted chain equal to the
+// copy's over the K proposals, E_d}. grid 1 x 32.
+struct DflCopyParams {
+  int chain[7];
+  uint P;  // anchor position
+  uint K;  // proposals verified
+  float expect, margin, temp;
+};
+[[kernel]] void dfl_copy_pick(device int* tokens [[buffer(0)]], device float* walk_s [[buffer(1)]],
+                              device int* walk_k [[buffer(2)]], device float* qprob [[buffer(3)]],
+                              device int* cand_i [[buffer(4)]], const device float* cand_v [[buffer(5)]],
+                              device uint* flag [[buffer(6)]], constant DflCopyParams& p [[buffer(7)]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+  float c = 1.0f;
+  if (lane < 7) {
+    const device float* S = (p.temp > 0.0f ? cand_v : walk_s) + lane * 16;
+    float mx = -INFINITY;
+    for (uint k = 0; k < 16; ++k) mx = max(mx, S[k]);
+    float z = 0.0f;
+    for (uint k = 0; k < 16; ++k) z += exp(S[k] - mx);
+    c = exp(S[p.temp > 0.0f ? 0 : walk_k[lane]] - mx) / z;
+  }
+  const float cum = simd_prefix_inclusive_product(c);
+  const float ed = simd_sum(lane < p.K ? cum : 0.0f);
+  const bool same = simd_all(lane >= p.K || tokens[p.P + 1 + lane] == p.chain[min(lane, 6u)]);
+  const bool take = p.expect > ed + p.margin;
+  if (lane == 0) {
+    flag[0] = take ? 1u : 0u;
+    flag[1] = same ? 1u : 0u;
+    flag[2] = as_type<uint>(ed);
+  }
+  if (!take || lane >= 7) return;
+  const int t = p.chain[lane];
+  tokens[p.P + 1 + lane] = t;
+  walk_k[lane] = 0;
+  for (uint k = 0; k < 16; ++k) {
+    cand_i[lane * 16 + k] = k == 0 ? t : -2;
+    qprob[lane * 16 + k] = k == 0 ? 1.0f : 0.0f;
+    walk_s[lane * 16 + k] = k == 0 ? 0.0f : -INFINITY;
+  }
+}
+
 // ---- the verify GEMMs' input layout (verify8.metal "X8 table") ----
 // The drafter's tables are row-major half [8][K]; the 8-row verify GEMMs (qmm8pf, qmm8_gu*) read the
 // fragment-order table table[(g * 32 + lane) * 16 + 2 f + e] = x[fn + e][64 g + k8(f, fm)] with

@@ -26,7 +26,7 @@ first use instead.
 
 ## Tests
 
-These run on the CPU. The tools (`build/api_test`, `build/parser_test`, `build/vit_check`, `build/bench_test`) come with
+These run on the CPU. The tools (`build/api_test`, `build/parser_test`, `build/copy_lane_check`, `build/vit_check`, `build/bench_test`) come with
 the full build.
 
 | Command | What it checks | Needs |
@@ -40,6 +40,7 @@ the full build.
 | `build/api_test [MODEL_DIR...]` | The Anthropic Messages and OpenAI Responses translations: request mapping, exact event sequences, each coding agent's settings; the Chat Completions stream's bytes, keepalive and errors; with a model folder, tool loops through its chat template | a model folder for the template checks (default: the 35B and 27B, if downloaded) |
 | `venv/bin/python tests/sdk_check.py build/api_test` | The official `anthropic` and `openai` Python SDKs parse every recorded reply | a venv: `python3 -m venv venv && venv/bin/pip install anthropic openai` |
 | `build/parser_test MODEL_DIR` | The streaming parser (reasoning, content, tool calls) on real token ids | a Qwen model folder |
+| `build/copy_lane_check [SEQS]` | The copy lane's lookup on small hand-made sequences; with `bench/harness/tools/copy_lane_seqs.py`'s token sequences of an agent trace, the calibration table behind `copy_expect` | nothing (transformers and a Qwen model folder for the sequences) |
 | `python3 tests/vision/check_cpu.py build/vit_check MODEL_DIR [--quick]` | The Qwen image processor against Pillow (and Hugging Face's processors when torch and transformers are installed) | a Qwen3.5-4B, Qwen3.6 or Qwen3.8 folder; Pillow and numpy |
 | `python3 tests/vision/check_radio_cpu.py MODEL_DIR build/vit_check IMAGE.png...` | Nemotron 3.5 Bolt's image processor against NVIDIA's own | the Bolt folder; torch |
 

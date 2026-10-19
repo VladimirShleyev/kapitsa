@@ -524,6 +524,7 @@ this Mac, on `127.0.0.1:8000`) in the background and at each login, restarting i
 | `NI_MEM_BUDGET` | | The GPU memory budget in GB, as `--mem-budget`. |
 | `NI_ANE` | on where supported | `0` keeps prefill on the GPU, without the Neural Engine. |
 | `NI_DFLASH` | `auto` | As `--dflash` when the option is absent: `auto`, `none` or a folder. |
+| `NI_COPY` | on | The copy lane of the Qwen models' DFlash drafters: where the text before the cursor appeared earlier in the conversation (a file the agent read, its own earlier output), a decode cycle verifies what followed it instead of the drafter's guess when that is expected to accept more; the output is the same. `0` turns it off. `NI_COPY_MARGIN` (default `-1.5`, the drafter rates itself high) is how many more expected tokens the copy needs. |
 | `NI_TURN_MS` | `30` | Requests at once: how long a decoding request keeps the GPU before it gives its turn to a waiting one, in ms; `0` = after every decode step. |
 | `NI_BATCH` | on where measured | Requests decoding at once share one GPU pass ([Requests at once](#requests-at-once)): the 27B, the 35B and Bolt; `1`: the 4B, Lightning and Super-VL too (not measured yet); `0`: they take turns instead, each with the tokens it gets alone. |
 | `NI_HISTORY_PREFILL` | on | After a reply, while the server is idle, prepare the conversation's next turn so a follow-up starts sooner; `0` turns it off. |

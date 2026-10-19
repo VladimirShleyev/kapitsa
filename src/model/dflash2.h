@@ -4,6 +4,7 @@
 // encodes one drafting pass (anchor + 7 mask rows -> 7 proposals) into a command buffer.
 // Opt-in: nothing here is constructed unless a drafter directory is given.
 #pragma once
+#include "model/copy_lane.h"
 #include "model/qwen35.h"
 
 #include <algorithm>
@@ -188,6 +189,16 @@ class DFlash2 {
   // sampled cycles verify with row-independent MoE numerics (Qwen35::set_verify_moe_exact)
   bool exact_moe() const { return exact_moe_; }
 
+  // ---- copy lane (copy_lane.h) ----
+  // The next encode_cycle_verify (that one only) starts with dfl_copy_pick, which verifies c instead of the drafted
+  // chain when c is expected to accept more; null: the drafted chain. Afterwards (host-visible once its command buffer
+  // completed): whether that cycle verified the copy, whether the drafted chain was the same, the drafter's own
+  // expectation (sum over the proposals of the product of its confidences).
+  void set_copy(const CopyChain* c);
+  bool copy_taken() const { return copy_flag_.as<uint32_t>()[0] == 1; }
+  bool copy_same() const { return copy_flag_.as<uint32_t>()[1] == 1; }
+  float copy_drafter_expect() const { return copy_flag_.as<float>()[2]; }
+
   // results of the last pass (host-visible after the command buffer completed)
   const int* cand_ids() const { return cand_i_.as<int>(); }       // [7][16]
   const float* cand_vals() const { return cand_v_.as<float>(); }  // [7][16]
@@ -265,6 +276,10 @@ class DFlash2 {
   Buffer logits_, sel_, tk_v_, tk_i_, cand_v_, cand_i_, edges_, walk_s_, qprob_, walk_k_, rope_cs_;
   // acceptance: target distributions of the verify rows, result {a, token}
   Buffer dist_id_, dist_p_, dist_keep_, acc_, kdyn_, gst_;
+  // copy lane: the chain set for the next verify, dfl_copy_pick's result {taken, same, E_d}
+  Buffer copy_flag_;
+  CopyChain copy_;
+  bool copy_on_ = false;
   float dyn_tau_ = 0.0f;    // T = 0 (0: dynamic depth off)
   float dyn_tau_t_ = 0.0f;  // T > 0 (exclusive-product rule)
   bool exact_moe_ = true;  // T > 0 on MoE targets: row-independent expert numerics (NI_DFLASH_EXACT_MOE=0 off)

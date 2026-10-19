@@ -260,6 +260,12 @@ struct DflDepth {
   uint32_t rule;  // 0: exact rule (exclusive product at T > 0); 1: inclusive at any T (tests only)
 };
 
+struct DflCopy {
+  int32_t chain[7];  // the copy lane's proposals
+  uint32_t P, K;
+  float expect, margin, temp;
+};
+
 struct DflPerm {
   uint32_t K;
 };

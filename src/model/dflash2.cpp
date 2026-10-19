@@ -484,6 +484,8 @@ void DFlash2::alloc_buffers() {
   kdyn_ = g.alloc(16, "dfl_kdyn");
   kdyn_.as<uint32_t>()[0] = 7;
   kdyn_.as<uint32_t>()[1] = 8;
+  copy_flag_ = g.alloc(16, "dfl_copy_flag");
+  memset(copy_flag_.ptr(), 0, copy_flag_.size);
   capt_ = g.alloc(8 * nH * 2, "dfl_capt");
   y8_ = g.alloc(8 * H * 4, "dfl_y8");
   c8_ = g.alloc(8 * H * 4, "dfl_c8");
@@ -492,7 +494,8 @@ void DFlash2::alloc_buffers() {
   memset(capt_.ptr(), 0, capt_.size);
   for (Buffer* b : {&h_, &n_, &xh_, &xs_, &hh_, &hs_, &dyn_, &q_, &kv_, &Q_, &Kb_, &Vb_, &part_o_, &part_ml_, &u_,
                     &logits_, &sel_, &tk_v_, &tk_i_, &cand_v_, &cand_i_, &edges_, &walk_s_, &qprob_, &walk_k_, &capt_,
-                    &y8_, &c8_, &kv8_, &cdbg_, &rope_cs_, &dist_id_, &dist_p_, &dist_keep_, &acc_, &kdyn_, &gst_})
+                    &y8_, &c8_, &kv8_, &cdbg_, &rope_cs_, &dist_id_, &dist_p_, &dist_keep_, &acc_, &kdyn_, &gst_,
+                    &copy_flag_})
     resident_ += b->size;
 }
 
@@ -1352,7 +1355,27 @@ void DFlash2::encode_cycle_draft(Encoder& e, Seq& s, DFlashSeq& d, int P, int m_
   encode_draft(e, s, d, P, sp);
 }
 
+void DFlash2::set_copy(const CopyChain* c) {
+  copy_on_ = c != nullptr;
+  if (c) copy_ = *c;
+}
+
 void DFlash2::encode_cycle_verify(Encoder& e, Seq& s, int P, int K, const SamplingParams& sp) {
+  if (copy_on_) {  // the copy lane's chain instead of the drafted one when it is expected to accept more
+    kp::DflCopy cp{};
+    for (int j = 0; j < CopyChain::kLen; ++j) cp.chain[j] = copy_.tok[j];
+    cp.P = uint32_t(P);
+    cp.K = uint32_t(K);
+    cp.expect = copy_.expect;
+    cp.margin = copy_lane_margin();
+    cp.temp = sp.temperature > 0 ? sp.temperature : 0.0f;
+    e.use(dpipe("dfl_copy_pick"));
+    e.buf(0, s.tok); e.buf(1, walk_s_); e.buf(2, walk_k_); e.buf(3, qprob_); e.buf(4, cand_i_); e.buf(5, cand_v_);
+    e.buf(6, copy_flag_);
+    e.val(7, cp);
+    e.dispatch(1, 1, 1, 32);
+    copy_on_ = false;
+  }
   const Buffer rows = kdyn_.view(4, 4);
   if (dyn_tau_ > 0) {
     kp::DflDepth dp{uint32_t(K), sp.temperature > 0 ? dyn_tau_t_ : dyn_tau_, sp.temperature > 0 ? sp.temperature : 0.0f, 0u};

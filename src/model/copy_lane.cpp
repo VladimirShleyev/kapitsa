@@ -1,0 +1,70 @@
+#include "model/copy_lane.h"
+
+#include <cstdlib>
+
+namespace ni {
+
+bool copy_lookup(const int* tok, int P, CopyChain& out, int min_match) {
+  out.match = 0;
+  if (P < 2) return false;
+  const int a = tok[P - 1], b = tok[P];
+  int best = -1, best_ml = 0, seen = 0;
+  for (int i = P - 1; i >= 1; --i) {  // an occurrence of (a, b) ending at i < P
+    if (tok[i] != b || tok[i - 1] != a) continue;
+    int ml = 2;
+    while (ml < CopyChain::kMaxMatch && i - ml >= 0 && tok[i - ml] == tok[P - ml]) ++ml;
+    if (ml > best_ml) {
+      best = i;
+      best_ml = ml;
+    }
+    if (++seen >= CopyChain::kMaxOcc || best_ml >= CopyChain::kMaxMatch) break;
+  }
+  if (best < 0 || best_ml < min_match) return false;
+  for (int j = 0; j < CopyChain::kLen; ++j) {
+    const int p = best + 1 + j;  // what followed the occurrence; past the anchor, the chain's own earlier tokens
+    out.tok[j] = p <= P ? tok[p] : out.tok[p - P - 1];
+  }
+  out.match = best_ml;
+  out.expect = copy_expect(best_ml);
+  return true;
+}
+
+float copy_expect(int match) {
+  // Measured on the harness's recorded coding-agent session (bench/harness/agent-traces/opencode-ledger.json:
+  // opencode fixing a Python project on Qwen3.6-35B-A3B, 19 requests: the prompts as agent_replay.py sends them and
+  // the 3,558 answer tokens as the model writes them), teacher-forced at every answer token with copy_lookup itself:
+  // the mean number of the 7 copied tokens right in a row, by match length (tools/copy_lane_check on
+  // bench/harness/tools/copy_lane_seqs.py's sequences; positions 430 / 254 / 329 / 235 / 346 / 257 / 492 / 455, 760
+  // without a copy chain).
+  if (match < 2) return 0.0f;
+  if (match == 2) return 1.09f;
+  if (match == 3) return 2.38f;
+  if (match <= 5) return 3.16f;
+  if (match <= 7) return 3.74f;
+  if (match <= 11) return 4.23f;
+  if (match <= 15) return 4.41f;
+  if (match <= 31) return 4.92f;
+  return 5.96f;
+}
+
+bool copy_lane_enabled() {
+  static const bool on = [] {
+    const char* v = getenv("NI_COPY");
+    return !(v && *v) || atoi(v) != 0;
+  }();
+  return on;
+}
+
+float copy_lane_margin() {
+  // The drafter's own expectation runs high: in greedy runs of the 35B on the agent session's requests 6, 7, 12, 14
+  // and 18 (ni_run, NI_COPY_LOG), the cycles that kept the drafted chain accepted 4.35 drafts against an E_d of 5.45.
+  // Replaying those cycles with the copy's known outcome, a margin of -1.5 took the copy in 88 of 226 and accepted
+  // 4.66 drafts a cycle (4.35 at 0, 4.72 at -2), and lost on none of the five requests (-2 lost on the plain-text one).
+  static const float m = [] {
+    const char* v = getenv("NI_COPY_MARGIN");
+    return v && *v ? float(atof(v)) : -1.5f;
+  }();
+  return m;
+}
+
+}  // namespace ni

@@ -1847,6 +1847,7 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
   };
   int fed_until = n;  // exclusive: tokens whose effect is in the live state
   int req_cycles = 0;  // DFlash2 cycles of this request
+  int req_copy = 0;    // of which verified the copy lane's chain
   const int depth = spec_ ? opts_.spec_depth : 0;
   auto cycle_done = [live](int m) {  // a decode cycle wrote m tokens (for a display)
     if (!live) return;
@@ -2012,6 +2013,11 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
         break;
       }
       next_draft.reset();
+      // the copy lane: the conversation's continuation of the text before the anchor, verified instead of the drafted
+      // chain when it is expected to accept more (tokens 0 .. P are final; the drafting half in flight writes P + 1 ..)
+      CopyChain cc;
+      const bool copy = copy_lane_enabled() && copy_lookup(s.tokens(), P, cc);
+      if (copy) dfl_->set_copy(&cc);
       auto e2 = g.begin();
       dfl_->encode_cycle_verify(*e2, s, P, K, sp);
       e2->commit();
@@ -2037,6 +2043,7 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
       e2->wait();
       const int a = dfl_->accepted();
       a_last = a;
+      if (copy && dfl_->copy_taken()) ++req_copy;
       const int* tk = s.tokens();
       m = 0;  // tokens consumed before stopping = rows committed
       while (m < a + 1) {
@@ -2318,9 +2325,11 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
   }
   if (finish == "stop" && !res.tool_calls.empty()) finish = "tool_calls";
   res.finish_reason = finish;
-  char cyc[64] = "";
+  char cyc[96] = "";
   if ((dfl_ || lili_ || dory_spec_) && req_cycles > 0)
     snprintf(cyc, sizeof cyc, ", %.2f tok/cycle", double(gen - 1) / req_cycles);
+  if (req_copy > 0)
+    snprintf(cyc + strlen(cyc), sizeof cyc - strlen(cyc), " (%d of %d cycles from the copy lane)", req_copy, req_cycles);
   // requests in flight at once: the slot, the wait for it, the turns given to the others (prefill, decode)
   char conc[256] = "";
   if (res.yields > 0 || res.queue_ms > 0 || res.batched > 0)

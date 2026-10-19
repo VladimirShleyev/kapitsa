@@ -398,6 +398,12 @@ int main(int argc, char** argv) {
     // NI_DFLASH_CONF=<file>: per cycle "a c_0 .. c_6", c_p = softmax over the 16 candidates of the walk's
     // scores S_p at the chosen candidate (the drafter's confidence; calibration data for a dynamic depth)
     FILE* conf = getenv("NI_DFLASH_CONF") ? fopen(getenv("NI_DFLASH_CONF"), "a") : nullptr;
+    // copy lane (NI_COPY, default on): per run, the cycles that had a copy chain, took it, found the drafted chain the
+    // same, and the tokens the copy cycles emitted; NI_COPY_LOG=<file>: per cycle with a copy chain "P match expect
+    // E_d taken same a" (calibration data for the rule)
+    const bool copy_lane = copy_lane_enabled();
+    FILE* copy_log = getenv("NI_COPY_LOG") ? fopen(getenv("NI_COPY_LOG"), "a") : nullptr;
+    int copy_found = 0, copy_taken = 0, copy_same = 0, copy_emitted = 0;
     double ts = now_ms();
     int P = n, m_prev = 0, cycles = 0, emitted = 0;
     int div_at = -1, div_tok[2] = {0, 0}, div_row = 0, div_P = 0;
@@ -435,6 +441,9 @@ int main(int argc, char** argv) {
     while (int(out.size()) < n_gen && !stop2) {
       if (P + DFlash2::kB + 2 >= s.cap) break;
       const double tc0 = now_ms();
+      CopyChain cc;  // tokens 0 .. P are final here (the drafting half in flight writes P + 1 ..)
+      const bool cl = copy_lane && copy_lookup(s.tokens(), P, cc);
+      if (cl) dfl->set_copy(&cc);
       std::unique_ptr<Encoder> e1;
       auto e = g.begin();
       if (mode == 1) {
@@ -468,9 +477,21 @@ int main(int argc, char** argv) {
       if (cycles > 0) ab_ms[cycles & 1].push_back(gms);  // the first cycle includes the first drafting half
       const int a = dfl->accepted();
       const int* tk = s.tokens();
+      if (cl) {
+        ++copy_found;
+        if (dfl->copy_same()) ++copy_same;
+        if (dfl->copy_taken()) {
+          ++copy_taken;
+          copy_emitted += a + 1;
+        }
+        if (copy_log)
+          fprintf(copy_log, "%d %d %.2f %.3f %d %d %d\n", P, cc.match, cc.expect, dfl->copy_drafter_expect(),
+                  int(dfl->copy_taken()), int(dfl->copy_same()), a);
+      }
       if (trace)
-        fprintf(stderr, "P=%d a=%d chain=%d,%d,%d,%d,%d,%d,%d next=%d wall=%.2fms gpu=%.2fms\n", P, a, tk[P + 1],
-                tk[P + 2], tk[P + 3], tk[P + 4], tk[P + 5], tk[P + 6], tk[P + 7], tk[P + 1 + a], wall, gms);
+        fprintf(stderr, "P=%d a=%d chain=%d,%d,%d,%d,%d,%d,%d next=%d wall=%.2fms gpu=%.2fms%s\n", P, a, tk[P + 1],
+                tk[P + 2], tk[P + 3], tk[P + 4], tk[P + 5], tk[P + 6], tk[P + 7], tk[P + 1 + a], wall, gms,
+                cl && dfl->copy_taken() ? " copy" : "");
       if (conf) {
         fprintf(conf, "%d", a);
         for (int p = 0; p < 7; ++p) {
@@ -535,6 +556,11 @@ int main(int argc, char** argv) {
     fprintf(stderr, "; %.2f proposals verified per cycle; acceptance by position", double(verified_sum) / std::max(cycles, 1));
     for (int i = 0; i < K; ++i) fprintf(stderr, " %.2f", reached[i] ? double(acc_pos[i]) / reached[i] : 0.0);
     fprintf(stderr, "\n");
+    if (copy_log) fclose(copy_log);
+    if (copy_lane)
+      fprintf(stderr, "copy lane (margin %.2f): a copy chain in %d of %d cycles, verified in %d (%d tokens, %.3f tok/cycle), "
+              "the drafted chain the same in %d\n", copy_lane_margin(), copy_found, cycles, copy_taken, copy_emitted,
+              double(copy_emitted) / std::max(copy_taken, 1), copy_same);
     if (ab) {
       double med[2], mean[2];
       for (int k = 0; k < 2; ++k) {
