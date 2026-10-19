@@ -1641,7 +1641,7 @@ struct DflAcceptParams {
   uint seed;
   uint dyn;  // 1: only the first kdyn[0] proposals were verified (dfl_depth)
 };
-// NC: candidates per proposal of the walk (16: DFlash2's walk; 32: the DFlash3 decoder's, dfl_accept32).
+// NC: candidates per proposal of the walk (16: DFlash2's walk; 32: the KFlash decoder's, dfl_accept32).
 template <uint NC>
 NI_INLINE void dfl_accept_impl(device int* tokens, const device int* samp, const device int* dist_id,
                                const device float* dist_p, const device int* cand_i, const device float* qprob,

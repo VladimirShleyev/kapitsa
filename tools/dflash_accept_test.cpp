@@ -12,11 +12,11 @@
 //    dynamic verify depth (dfl_depth before dfl_accept): its exact T > 0 rules (0, and 2, the earlier one) must
 //    pass; the rule that also uses the proposal's own confidence (rule 1, not used by the engine at T > 0) must fail in the depth-sensitive
 //    regime (q = p at the first proposal, q = 0.9 / 0.1 vs p = 1/2 at the second: that rule emits 0.55 / 0.45).
-// 3. The DFlash3 decoder's sampled walk (d3_soft's chain step, src/kernels/spec_dflash3.metal) drawing every proposal on
+// 3. The KFlash decoder's sampled walk (kf_soft's chain step, src/kernels/spec_kflash.metal) drawing every proposal on
 //    the GPU from its q over 32 candidates (scores S = log q here), then dfl_accept32 (and dfl_depth32 before it): the
 //    same joint-law test, with candidate lists of 32 from a larger universe (p's support partly outside them).
 #include "metal/gpu.h"
-#include "model/dflash3.h"
+#include "model/kflash.h"
 #include "model/kparams.h"
 #include "util/log.h"
 
@@ -512,7 +512,7 @@ int main(int argc, char** argv) {
            out + out1, ok ? "PASS" : "FAIL", expect_fail ? (ok ? " (biased rule NOT detected)" : " (biased rule detected, as expected)") : "");
     if (ok == expect_fail) ++fails;
   }
-  // ---- 3. the DFlash3 decoder's sampled walk on the GPU + dfl_accept32 ----
+  // ---- 3. the KFlash decoder's sampled walk on the GPU + dfl_accept32 ----
   {
     struct Case3 {
       int regime, K;
@@ -524,8 +524,8 @@ int main(int argc, char** argv) {
                                        {kPoint, Kmain, 0.6f},  {kMixed, Kmain, 0.6f}, {kRandom, 1, 0.6f},
                                        {kRandom, 7, 1.0f},     {kMixed, 7, 1.0f},     {kRandom, 3, 0.6f, 0.1f},
                                        {kMixed, 7, 0.6f, 0.2f}, {kMixed, 7, 0.6f, 0.2f, 2}};
-    const int B3 = 1024;  // trials per batch (one D3Tree each)
-    const size_t TB = sizeof(D3Tree);
+    const int B3 = 1024;  // trials per batch (one KFlashTree each)
+    const size_t TB = sizeof(KFlashTree);
     Buffer trees = g.alloc(size_t(B3) * TB), tok3 = g.alloc(size_t(B3) * 16 * 4), ci3 = g.alloc(size_t(B3) * 224 * 4);
     Buffer cv3 = g.alloc(size_t(B3) * 224 * 4), q3 = g.alloc(size_t(B3) * 224 * 4), wk3 = g.alloc(size_t(B3) * 8 * 4);
     Buffer ws3 = g.alloc(size_t(B3) * 224 * 4), did3 = g.alloc(size_t(B3) * 256 * 4), dp3 = g.alloc(size_t(B3) * 256 * 4);
@@ -534,7 +534,7 @@ int main(int argc, char** argv) {
     memset(cd0.ptr(), 0, cd0.size);
     memset(dummy.ptr(), 0, dummy.size);
     for (int i = 0; i < 16; ++i) ls1.as<float>()[i] = 1.0f;
-    Pipeline soft = g.pipeline("d3_soft"), acc32 = g.pipeline("dfl_accept32"), dep32 = g.pipeline("dfl_depth32");
+    Pipeline soft = g.pipeline("kf_soft"), acc32 = g.pipeline("dfl_accept32"), dep32 = g.pipeline("dfl_depth32");
     for (size_t ci = 0; ci < cases3.size(); ++ci) {
       if (only >= 0 && int(ci + cases.size()) != only) continue;
       const Case3& cs = cases3[ci];
@@ -551,7 +551,7 @@ int main(int argc, char** argv) {
                          std::vector<std::vector<int>>* chain) {
           const int n = int(idx.size());
           for (int i = 0; i < n; ++i) {
-            D3Tree& T = *reinterpret_cast<D3Tree*>(trees.as<uint8_t>() + size_t(i) * TB);
+            KFlashTree& T = *reinterpret_cast<KFlashTree*>(trees.as<uint8_t>() + size_t(i) * TB);
             T.n_nodes = 1;
             T.n_front = 1;
             T.front[0] = 0;
@@ -587,7 +587,7 @@ int main(int argc, char** argv) {
             if (p == cs.K) break;
             auto e = g.begin();
             for (int i = 0; i < n; ++i) {
-              kp::D3Soft sp{0, 1024, 0, 0, 1.0f, 0.0f, 0.0f, cs.temp, seeds[idx[i]], 1u, uint32_t(cs.K), 1u};
+              kp::KfSoft sp{0, 1024, 0, 0, 1.0f, 0.0f, 0.0f, cs.temp, seeds[idx[i]], 1u, uint32_t(cs.K), 1u};
               e->use(soft);
               e->buf(0, trees, size_t(i) * TB); e->buf(1, dummy); e->buf(2, ci3, size_t(i) * 224 * 4);
               e->buf(3, cv3, size_t(i) * 224 * 4); e->buf(4, cd0); e->buf(5, ls1); e->buf(6, dummy);

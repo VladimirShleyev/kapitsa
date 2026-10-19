@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""DFlash3Turbo candidate decoder: random-init checkpoints and the NumPy reference the Metal decoder is checked against.
+"""KFlash candidate decoder: random-init checkpoints and the NumPy reference the Metal decoder is checked against.
 
-  dflash3_ref.py init <out_dir> --hidden H [--vocab 248320] [--seed 0] [--zero-out] [--backbone dflash|dflash2]
-      A random checkpoint in the trainer's format (tools/dflash3/README.md: d 1024, 2 layers, 8 heads x 128, SwiGLU
+  kflash_ref.py init <out_dir> --hidden H [--vocab 248320] [--seed 0] [--zero-out] [--backbone dflash|dflash2]
+      A random checkpoint in the trainer's format (M2's README.md: d 1024, 2 layers, 8 heads x 128, SwiGLU
       2816, W_h / W_e: H -> d, emb_norm, W_o: d -> H, logit_scale, the two-row acceptance head), safetensors +
       config.json. Every part is random (W_o, the embedding norm, the logit scales and the acceptance head too) so a
       check exercises all of it; --zero-out sets W_o = 0 and logit_scale = 1 (S = U: the backbone's own scores).
 
-  dflash3_ref.py check <ckpt_dir> <dump_dir> [--no-mimic]
-      Recomputes every decoder row of the engine's dump (tools/dflash3_check --out <dump_dir>) from the checkpoint:
+  kflash_ref.py check <ckpt_dir> <dump_dir> [--no-mimic]
+      Recomputes every decoder row of the engine's dump (tools/kflash_check --out <dump_dir>) from the checkpoint:
       the 4-bit weights quantized here with mx.quantize's rounding (compared code for code with the engine's), each
       expanded node's whole branch run from scratch (no K/V cache), then S, softmax(S / T_q), the acceptance head and
       the walk's choices. --no-mimic skips the fp16 rounding of the GEMM inputs the engine's 8-row GEMMs apply.
 
-Formulas (the trainer's, tools/dflash3/model.py): x_j = W_h h_{j+1} + W_e (RMSNorm(E[t_j]) * emb_norm) + pos[j],
+Formulas (the trainer's model.py, M2): x_j = W_h h_{j+1} + W_e (RMSNorm(E[t_j]) * emb_norm) + pos[j],
 pre-norm layers (RMSNorm x * rsqrt(mean x^2 + eps) * w; multi-head attention over the branch rows 0..j, no RoPE, scale
 1/sqrt(128); SwiGLU silu(gate) * up), y = RMSNorm(x; norm), z = out_proj y,
 S[k] = logit_scale[j] U_{j+1}[k] + <z, E_out[c_k]>, acceptance row r: sigmoid(<w_y[r], y> + <w_e[r], E_out[c_k]> /
@@ -160,11 +160,11 @@ def cmd_init(a):
     t["acc_head.weight"] = ("F32", acc)
     t["acc_head.bias"] = ("F32", np.array([-1.0, -0.5], np.float32))
     os.makedirs(a.out, exist_ok=True)
-    save_safetensors(os.path.join(a.out, "model.safetensors"), t, {"format": "dflash3-decoder-v1", "init": "random",
+    save_safetensors(os.path.join(a.out, "model.safetensors"), t, {"format": "kflash-decoder-v1", "init": "random",
                                                                    "seed": str(a.seed)})
     cfg = {"hidden_size": d, "num_hidden_layers": NL, "num_attention_heads": nh, "head_dim": hd,
            "intermediate_size": I, "target_hidden_size": H, "vocab_size": a.vocab, "num_candidates": 32,
-           "max_positions": mp, "rms_norm_eps": 1e-6, "block_size": 8, "architectures": ["DFlash3CandidateDecoder"],
+           "max_positions": mp, "rms_norm_eps": 1e-6, "block_size": 8, "architectures": ["KFlashCandidateDecoder"],
            "format_version": 1, "emb_norm": True, "logit_scale": True, "acc_rows": ["greedy", "sampled"],
            "backbone": a.backbone, "init": "random" + (" (W_o = 0)" if a.zero_out else "")}
     with open(os.path.join(a.out, "config.json"), "w") as f:

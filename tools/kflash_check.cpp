@@ -1,5 +1,5 @@
-// DFlash3Turbo candidate decoder: checks against the NumPy reference (tools/dflash3_ref.py check) and timings.
-//   dflash3_check <model_dir> <decoder_dir> [--out dump_dir] [--prompt text | @file.txt] [--time N] [--temp T]
+// KFlash candidate decoder: checks against the NumPy reference (tools/kflash_ref.py check) and timings.
+//   kflash_check <model_dir> <decoder_dir> [--out dump_dir] [--prompt text | @file.txt] [--time N] [--temp T]
 //                 [--seed S] [--ctx N]
 // Prefills a prompt with the drafter's capture hook (DFlash2::find's drafter for the model), runs the drafting
 // backbone at the next position, then:
@@ -11,15 +11,15 @@
 //     every branch, per-row depths and parents in one step.
 //  --out writes, per case, the backbone rows, the top-32, the target's embedding / LM-head rows of every token
 //  involved, the tree, and the decoder's 4-bit weights + the root row's intermediates (tree case) for
-//  `dflash3_ref.py check <decoder_dir> <dump_dir>`.
+//  `kflash_ref.py check <decoder_dir> <dump_dir>`.
 //  --time N: GPU ms of the drafting pass with DFlash2's walk vs the decoder's chain (interleaved), of the decoder alone
 //  (root + 7 steps + walks), and of one decoder step at 1 / 2 / 4 / 8 front rows (medians of N).
 //  --ref-vectors <dir> --out <dump>: instead of all that, the trainer's reference vectors (<dir>/reference.safetensors:
-//  h, tok, cand, u of recorded drafting passes; tools/dflash3/ref_vectors.py): each anchor's path as one 7-row front,
+//  h, tok, cand, u of recorded drafting passes; the trainer's ref_vectors.py): each anchor's path as one 7-row front,
 //  the decoder's y, z, S and both acceptance rows -> <dump>/ref_{y,z,S,a0,a1}.npy (compare with the trainer's forward).
 #include "metal/gpu.h"
 #include "model/dflash2.h"
-#include "model/dflash3.h"
+#include "model/kflash.h"
 #include "model/qwen35.h"
 #include "model/qwen4_exp.h"
 #include "tokenizer/tokenizer.h"
@@ -58,7 +58,7 @@ static void save_npy(const std::string& path, const std::string& descr, const st
   f.write((const char*)data, std::streamsize(bytes));
 }
 
-// One row of a 4/8-bit group-64 table in fp32, as the decoder's kernels dequantize it (d3_row2)
+// One row of a 4/8-bit group-64 table in fp32, as the decoder's kernels dequantize it (kf_row2)
 static void row_f32(const QLinear& L, uint32_t row, float* out) {
   const uint32_t gpr = L.K / uint32_t(L.gs);
   const uint16_t* S = L.s->buf.as<uint16_t>() + size_t(row) * gpr;
@@ -78,11 +78,11 @@ static double median(std::vector<double> v) {
 
 int main(int argc, char** argv) {
   if (argc < 3) {
-    fprintf(stderr, "usage: dflash3_check <model_dir> <decoder_dir> [--out dir] [--prompt text|@file] [--time N] "
+    fprintf(stderr, "usage: kflash_check <model_dir> <decoder_dir> [--out dir] [--prompt text|@file] [--time N] "
                     "[--temp T] [--seed S] [--ctx N]\n");
     return 2;
   }
-  const std::string mdir = argv[1], d3dir = argv[2];
+  const std::string mdir = argv[1], kfdir = argv[2];
   std::string out, prompt =
       "Write a C++ function that parses a comma-separated list of integers from a string and returns their sum. "
       "Handle whitespace and negative numbers, and explain the edge cases you considered.";
@@ -101,19 +101,19 @@ int main(int argc, char** argv) {
     else if (a == "--ref-vectors" && i + 1 < argc) refv = argv[++i];
     else fatal("unknown option %s", a.c_str());
   }
-  if (getenv("NI_DFLASH_QT")) fatal("dflash3_check: unset NI_DFLASH_QT (the sampled case assumes q = softmax(S / T))");
+  if (getenv("NI_DFLASH_QT")) fatal("kflash_check: unset NI_DFLASH_QT (the sampled case assumes q = softmax(S / T))");
   if (!prompt.empty() && prompt[0] == '@') {
     std::ifstream f(prompt.substr(1));
     prompt.assign(std::istreambuf_iterator<char>(f), {});
   }
   setvbuf(stdout, nullptr, _IOLBF, 0);
-  setenv("NI_DFLASH3", d3dir.c_str(), 1);
+  setenv("NI_KFLASH", kfdir.c_str(), 1);
   Gpu& g = Gpu::get();
   std::unique_ptr<Qwen35> tp = load_qwen(mdir, 2048);
   Qwen35& tgt = *tp;
   if (!refv.empty()) {  // ---- the trainer's reference vectors ----
     if (out.empty()) fatal("--ref-vectors needs --out");
-    DFlash3 dd(tgt, d3dir);
+    KFlash dd(tgt, kfdir);
     const int H = dd.config().H, d = dd.config().d;
     WeightStore rv;
     rv.open_dir(refv, nullptr, [](const std::string& f) { return f == "reference.safetensors"; });
@@ -143,7 +143,7 @@ int main(int argc, char** argv) {
       memcpy(ci.ptr(), tc.buf.as<int32_t>() + size_t(n) * 224, 224 * 4);
       memcpy(cv.ptr(), tu.buf.as<float>() + size_t(n) * 224, 224 * 4);
       for (int row = 0; row < 2; ++row) {
-        D3Tree& T = *dd.tree().as<D3Tree>();
+        KFlashTree& T = *dd.tree().as<KFlashTree>();
         T.n_nodes = 7;
         T.n_front = 7;
         for (int j = 0; j < 7; ++j) {
@@ -180,10 +180,10 @@ int main(int argc, char** argv) {
   const std::string ddir = DFlash2::find(mdir, tgt.config());
   if (ddir.empty()) fatal("no DFlash2 / DFlash drafter for %s", mdir.c_str());
   DFlash2 dr(tgt, ddir);
-  DFlash3* d3 = dr.d3();
-  if (!d3) fatal("the decoder did not load");
-  const int H = d3->config().H, d = d3->config().d;
-  printf("== dflash3_check %s (drafter %s, decoder %s, H %d, d %d)\n", mdir.c_str(), ddir.c_str(), d3dir.c_str(), H, d);
+  KFlash* kf = dr.kflash();
+  if (!kf) fatal("the decoder did not load");
+  const int H = kf->config().H, d = kf->config().d;
+  printf("== kflash_check %s (drafter %s, decoder %s, H %d, d %d)\n", mdir.c_str(), ddir.c_str(), kfdir.c_str(), H, d);
 
   Tokenizer tok;
   tok.load(mdir + "/tokenizer.json");
@@ -223,7 +223,7 @@ int main(int argc, char** argv) {
   json meta;
   meta["model"] = mdir;
   meta["drafter"] = ddir;
-  meta["decoder"] = d3dir;
+  meta["decoder"] = kfdir;
   meta["P"] = P;
   meta["cases"] = json::array();
   const QLinear& E = tgt.embed_table();
@@ -231,7 +231,7 @@ int main(int argc, char** argv) {
 
   // dumps one case: backbone rows, top-32, the tree, the target rows of every token involved
   auto dump_case = [&](const std::string& name, const std::string& kind, float t, float qtemp, uint32_t sd, int acc_row) {
-    const D3Tree& T = d3->tree_host();
+    const KFlashTree& T = kf->tree_host();
     json c;
     c["name"] = name;
     c["kind"] = kind;
@@ -261,7 +261,7 @@ int main(int argc, char** argv) {
     save_npy(cd + "/row_ids.npy", "<i4", {M}, rid.data(), rid.size() * 4);
     save_npy(cd + "/erows.npy", "<f4", {M, H}, er.data(), er.size() * 4);
     save_npy(cd + "/orows.npy", "<f4", {M, H}, orow.data(), orow.size() * 4);
-    const int64_t NN = D3Tree::kMaxNodes, C = D3Tree::kCand;
+    const int64_t NN = KFlashTree::kMaxNodes, C = KFlashTree::kCand;
     save_npy(cd + "/tree_parent.npy", "<i4", {NN}, T.parent, NN * 4);
     save_npy(cd + "/tree_token.npy", "<i4", {NN}, T.token, NN * 4);
     save_npy(cd + "/tree_depth.npy", "<i4", {NN}, T.depth, NN * 4);
@@ -302,7 +302,7 @@ int main(int argc, char** argv) {
   // ---- 2. greedy chain (the integrated walk) ----
   // the chain's nodes in the tree: from the root, the child whose token is the next drafted one (with speculative passes
   // the tree also holds the guessed nodes that were not taken)
-  auto chain_nodes = [&](const D3Tree& T) {
+  auto chain_nodes = [&](const KFlashTree& T) {
     std::vector<int> ch = {0};
     for (int j = 0; j < 7; ++j) {
       int nx = -1;
@@ -317,7 +317,7 @@ int main(int argc, char** argv) {
     auto e = g.begin();
     dr.encode_draft_sel(*e, s, ds, P, sp, 1);
     e->commit_and_wait();
-    const D3Tree& T = d3->tree_host();
+    const KFlashTree& T = kf->tree_host();
     const std::vector<int> ch = chain_nodes(T);
     int bad = ch.size() == 8 ? 0 : 1;
     for (int j = 0; j < 7 && j + 1 < int(ch.size()); ++j) {
@@ -339,7 +339,7 @@ int main(int argc, char** argv) {
     printf("; %u speculative passes); tree / sequence / walk outputs consistent: %s\n", T.walk_passes, bad ? "FAIL" : "PASS");
     fails += bad != 0;
   };
-  // the speculative passes (DFlash3::encode_chain) against the sequential walk: with 7 passes the same chain and walk
+  // the speculative passes (KFlash::encode_chain) against the sequential walk: with 7 passes the same chain and walk
   // outputs, bitwise; the passes it took
   auto spec_check = [&](const char* name, const SamplingParams& sp) {
     const float tq = sp.temperature > 0 ? sp.temperature : 1.0f;
@@ -350,7 +350,7 @@ int main(int argc, char** argv) {
     for (int mode = 0; mode < 2; ++mode) {
       auto e = g.begin();
       dr.encode_draft_sel(*e, s, ds, P, sp, 2);
-      D3WalkArgs w;
+      KFlashWalk w;
       w.tokens = s.tok;
       w.qprob = mode ? q2 : q1;
       w.walk_k = mode ? k2 : k1;
@@ -360,15 +360,15 @@ int main(int argc, char** argv) {
       w.qt = true;
       w.maxdep = 7;
       if (mode == 0) {
-        d3->encode_root(*e, s.tok, uint32_t(P), d3->tree());
-        for (int j = 0; j < 7; ++j) d3->encode_step(*e, dr.cand32_ids_buf(), dr.cand32_vals_buf(), tq, sp.temperature > 0, &w);
+        kf->encode_root(*e, s.tok, uint32_t(P), kf->tree());
+        for (int j = 0; j < 7; ++j) kf->encode_step(*e, dr.cand32_ids_buf(), dr.cand32_vals_buf(), tq, sp.temperature > 0, &w);
       } else {
-        d3->encode_chain(*e, s.tok, uint32_t(P), d3->tree(), dr.cand32_ids_buf(), dr.cand32_vals_buf(), tq,
+        kf->encode_chain(*e, s.tok, uint32_t(P), kf->tree(), dr.cand32_ids_buf(), dr.cand32_vals_buf(), tq,
                          sp.temperature > 0, w, 7);
       }
       e->commit_and_wait();
       for (int j = 0; j < 7; ++j) (mode ? chain_spec : chain_seq)[j] = s.tokens()[P + 1 + j];
-      if (mode) passes_used = int(d3->tree_host().walk_passes);
+      if (mode) passes_used = int(kf->tree_host().walk_passes);
     }
     if (chain_seq != chain_spec) ++bad;
     if (memcmp(q1.ptr(), q2.ptr(), q1.size) || memcmp(k1.ptr(), k2.ptr(), 28) || memcmp(s1.ptr(), s2.ptr(), s1.size)) ++bad;
@@ -392,12 +392,12 @@ int main(int argc, char** argv) {
   {
     auto e = g.begin();
     dr.encode_draft_sel(*e, s, ds, P, greedy, 2);
-    d3->encode_root(*e, s.tok, uint32_t(P), d3->tree());  // explicit P: the drafter-state buffer is not read
-    d3->set_debug(true);
-    d3->encode_step(*e, dr.cand32_ids_buf(), dr.cand32_vals_buf(), 1.0f, 0);
+    kf->encode_root(*e, s.tok, uint32_t(P), kf->tree());  // explicit P: the drafter-state buffer is not read
+    kf->set_debug(true);
+    kf->encode_step(*e, dr.cand32_ids_buf(), dr.cand32_vals_buf(), 1.0f, 0);
     e->commit_and_wait();
-    d3->set_debug(false);
-    D3Tree& T = *d3->tree().as<D3Tree>();
+    kf->set_debug(false);
+    KFlashTree& T = *kf->tree().as<KFlashTree>();
     // children of `node` ranked by q
     auto ranked = [&](int node) {
       std::vector<int> k(32);
@@ -428,7 +428,7 @@ int main(int argc, char** argv) {
       T.n_front = uint32_t(front.size());
       for (size_t i = 0; i < front.size(); ++i) T.front[i] = uint32_t(front[i]);
       auto e2 = g.begin();
-      d3->encode_step(*e2, dr.cand32_ids_buf(), dr.cand32_vals_buf(), 1.0f, 0);
+      kf->encode_step(*e2, dr.cand32_ids_buf(), dr.cand32_vals_buf(), 1.0f, 0);
       e2->commit_and_wait();
       ++steps;
       rows += int(front.size());
@@ -438,7 +438,7 @@ int main(int argc, char** argv) {
         if (T.depth[f] >= 6) continue;  // its children (depth 7) cannot be expanded
         const auto r = ranked(f);
         const int want = it == 1 && i < 3 ? 2 : 1;  // the third step widens to 8 rows
-        for (int w = 0; w < want && int(T.n_nodes) < D3Tree::kMaxNodes && next.size() < 8; ++w) next.push_back(add(f, r[w]));
+        for (int w = 0; w < want && int(T.n_nodes) < KFlashTree::kMaxNodes && next.size() < 8; ++w) next.push_back(add(f, r[w]));
       }
       if (it == 0) {  // root's 4th and 5th children join the depth-2 nodes: a front of depths 1 and 2
         next.push_back(add(0, root_rank[3]));
@@ -468,7 +468,7 @@ int main(int argc, char** argv) {
       T.front[2] = uint32_t(b2);
       T.front[3] = uint32_t(b);
       auto e2 = g.begin();
-      d3->encode_step(*e2, dr.cand32_ids_buf(), dr.cand32_vals_buf(), 1.0f, 0);
+      kf->encode_step(*e2, dr.cand32_ids_buf(), dr.cand32_vals_buf(), 1.0f, 0);
       e2->commit_and_wait();
       ++steps;
       rows += 4;
@@ -478,8 +478,8 @@ int main(int argc, char** argv) {
     dump_case("tree", "tree", 0.0f, 1.0f, 0, 0);
     if (!out.empty()) {
       for (const char* k : {"x", "h0", "h1", "y", "z"}) {
-        auto it = d3->debug_bufs().find(k);
-        if (it == d3->debug_bufs().end()) continue;
+        auto it = kf->debug_bufs().find(k);
+        if (it == kf->debug_bufs().end()) continue;
         const int w = std::string(k) == "z" ? H : d;
         save_npy(out + "/tree/dbg_" + k + ".npy", "<f4", {8, w}, it->second.ptr(), size_t(8) * w * 4);
       }
@@ -489,9 +489,9 @@ int main(int argc, char** argv) {
   {
     auto e = g.begin();
     dr.encode_draft_sel(*e, s, ds, P, greedy, 2);
-    d3->encode_root(*e, s.tok, uint32_t(P), d3->tree());
+    kf->encode_root(*e, s.tok, uint32_t(P), kf->tree());
     e->commit_and_wait();
-    D3Tree& T = *d3->tree().as<D3Tree>();
+    KFlashTree& T = *kf->tree().as<KFlashTree>();
     for (int j = 1; j < 7; ++j) {
       T.parent[j] = j - 1;
       T.depth[j] = j;
@@ -503,7 +503,7 @@ int main(int argc, char** argv) {
     T.n_front = 7;
     for (int j = 0; j < 7; ++j) T.front[j] = uint32_t(6 - j);  // reversed: order must not matter
     auto e2 = g.begin();
-    d3->encode_step(*e2, dr.cand32_ids_buf(), dr.cand32_vals_buf(), 1.0f, 0);
+    kf->encode_step(*e2, dr.cand32_ids_buf(), dr.cand32_vals_buf(), 1.0f, 0);
     e2->commit_and_wait();
     int n_exp = 0;
     for (int j = 0; j < 7; ++j) n_exp += T.expanded[j];
@@ -515,14 +515,14 @@ int main(int argc, char** argv) {
   if (!out.empty()) {  // the decoder's 4-bit weights as the engine quantized them
     const std::string wd = out + "/weights";
     mkdir(wd.c_str(), 0755);
-    for (const std::string& nm : d3->weight_names()) {
-      const QLinear* L = d3->weight(nm);
+    for (const std::string& nm : kf->weight_names()) {
+      const QLinear* L = kf->weight(nm);
       save_npy(wd + "/" + nm + ".w.npy", "<u4", {int64_t(L->N), int64_t(L->K / 8)}, L->w->buf.ptr(), size_t(L->N) * L->K / 2);
       save_npy(wd + "/" + nm + ".s.npy", "<u2", {int64_t(L->N), int64_t(L->K / 64)}, L->s->buf.ptr(), size_t(L->N) * L->K / 32);
       save_npy(wd + "/" + nm + ".b.npy", "<u2", {int64_t(L->N), int64_t(L->K / 64)}, L->b->buf.ptr(), size_t(L->N) * L->K / 32);
     }
     std::ofstream(out + "/meta.json") << meta.dump(2);
-    printf("dumps -> %s (dflash3_ref.py check %s %s)\n", out.c_str(), d3dir.c_str(), out.c_str());
+    printf("dumps -> %s (kflash_ref.py check %s %s)\n", out.c_str(), kfdir.c_str(), out.c_str());
   }
 
   // ---- timings ----
@@ -543,14 +543,14 @@ int main(int argc, char** argv) {
       dr.encode_draft_sel(*e, s, ds, P, greedy, 2);
       e->commit_and_wait();
     }
-    D3WalkArgs w;
+    KFlashWalk w;
     w.tokens = s.tok;
     w.qprob = tq;
     w.walk_k = tk;
     w.walk_s = tws;
     auto chain = [&](Encoder& e) {
-      d3->encode_root(e, s.tok, uint32_t(P), d3->tree());
-      for (int j = 0; j < 7; ++j) d3->encode_step(e, dr.cand32_ids_buf(), dr.cand32_vals_buf(), 1.0f, 0, &w);
+      kf->encode_root(e, s.tok, uint32_t(P), kf->tree());
+      for (int j = 0; j < 7; ++j) kf->encode_step(e, dr.cand32_ids_buf(), dr.cand32_vals_buf(), 1.0f, 0, &w);
     };
     for (int i = 0; i <= time_n; ++i) {
       auto e = g.begin();
@@ -558,7 +558,7 @@ int main(int argc, char** argv) {
       e->commit_and_wait();
       if (i) t_dec.push_back(e->gpu_ms());
     }
-    printf("[time] drafting pass GPU ms (median of %d, interleaved): DFlash2 walk %.3f, DFlash3 chain %.3f (%+.3f); "
+    printf("[time] drafting pass GPU ms (median of %d, interleaved): DFlash2 walk %.3f, KFlash chain %.3f (%+.3f); "
            "decoder alone (root + 7 steps + walks) %.3f\n", time_n, median(t_walk2), median(t_chain),
            median(t_chain) - median(t_walk2), median(t_dec));
     {  // the chain as speculative passes: at most 1, 2, 3 and 7 (= the sequential walk's chain) passes
@@ -568,21 +568,21 @@ int main(int argc, char** argv) {
         uint32_t used = 0;
         for (int i = 0; i <= time_n; ++i) {
           auto e = g.begin();
-          d3->encode_chain(*e, s.tok, uint32_t(P), d3->tree(), dr.cand32_ids_buf(), dr.cand32_vals_buf(), 1.0f, 0, w, cap);
+          kf->encode_chain(*e, s.tok, uint32_t(P), kf->tree(), dr.cand32_ids_buf(), dr.cand32_vals_buf(), 1.0f, 0, w, cap);
           e->commit_and_wait();
           if (i) t.push_back(e->gpu_ms());
-          used = d3->tree_host().walk_passes;
+          used = kf->tree_host().walk_passes;
         }
         printf("  cap %d: %.3f (%u)", cap, median(t), used);
       }
       printf("\n");
     }
-    {  // the fixed cost of a dependent dispatch: 40 one-threadgroup d3_root dispatches in a serial encoder
+    {  // the fixed cost of a dependent dispatch: 40 one-threadgroup kf_root dispatches in a serial encoder
       std::vector<double> t1, t40;
       for (int i = 0; i <= time_n; ++i)
         for (int n_disp : {1, 40}) {
           auto e = g.begin();
-          for (int k = 0; k < n_disp; ++k) d3->encode_root(*e, s.tok, uint32_t(P), d3->tree());
+          for (int k = 0; k < n_disp; ++k) kf->encode_root(*e, s.tok, uint32_t(P), kf->tree());
           e->commit_and_wait();
           if (i) (n_disp == 1 ? t1 : t40).push_back(e->gpu_ms());
         }
@@ -592,10 +592,10 @@ int main(int argc, char** argv) {
     // (c) one decoder step at F front rows (F of the root's children, depth 1): command buffers of 1 and 5 steps
     {
       auto e = g.begin();
-      d3->encode_root(*e, s.tok, uint32_t(P), d3->tree());
-      d3->encode_step(*e, dr.cand32_ids_buf(), dr.cand32_vals_buf(), 1.0f, 0);
+      kf->encode_root(*e, s.tok, uint32_t(P), kf->tree());
+      kf->encode_step(*e, dr.cand32_ids_buf(), dr.cand32_vals_buf(), 1.0f, 0);
       e->commit_and_wait();
-      D3Tree& T = *d3->tree().as<D3Tree>();
+      KFlashTree& T = *kf->tree().as<KFlashTree>();
       for (int i = 1; i <= 8; ++i) {
         T.parent[i] = 0;
         T.token[i] = T.ch_tok[i - 1];
@@ -610,7 +610,7 @@ int main(int argc, char** argv) {
         T.front[0] = 1;
         for (int i = 0; i < 10; ++i) {
           auto e2 = g.begin();
-          d3->encode_step(*e2, dr.cand32_ids_buf(), dr.cand32_vals_buf(), 1.0f, 0);
+          kf->encode_step(*e2, dr.cand32_ids_buf(), dr.cand32_vals_buf(), 1.0f, 0);
           e2->commit_and_wait();
         }
         Encoder::profile_report(10);
@@ -625,13 +625,31 @@ int main(int argc, char** argv) {
           for (int reps : {1, 5}) {
             auto e2 = g.begin();
             for (int r = 0; r < reps; ++r)
-              d3->encode_step(*e2, dr.cand32_ids_buf(), dr.cand32_vals_buf(), 1.0f, 0);
+              kf->encode_step(*e2, dr.cand32_ids_buf(), dr.cand32_vals_buf(), 1.0f, 0);
             e2->commit_and_wait();
             if (i) (reps == 1 ? t1 : t5).push_back(e2->gpu_ms());
           }
         printf("  %d row%s %.3f (in a 5-step buffer %.3f each)", F, F > 1 ? "s" : "", median(t1), median(t5) / 5);
       }
       printf("\n");
+      // interleaved A/B in this process: the projections on kf_qmm8 vs dfl_qmm8, scoring fused vs two kernels (1 row)
+      T.n_front = 1;
+      T.front[0] = 1;
+      std::vector<double> tv[4];
+      for (int i = 0; i <= time_n; ++i)
+        for (int v = 0; v < 4; ++v) {
+          kf->set_hoisted_gemm(v & 1);
+          kf->set_fused_score(v & 2);
+          auto e2 = g.begin();
+          for (int r = 0; r < 5; ++r) kf->encode_step(*e2, dr.cand32_ids_buf(), dr.cand32_vals_buf(), 1.0f, 0);
+          e2->commit_and_wait();
+          if (i) tv[v].push_back(e2->gpu_ms() / 5);
+        }
+      printf("[time] one step, interleaved A/B (median of %d, 5-step buffers): dfl_qmm8 + 2-kernel scores %.3f | "
+             "kf_qmm8 + 2-kernel %.3f | dfl_qmm8 + fused scores %.3f | kf_qmm8 + fused %.3f\n", time_n, median(tv[0]),
+             median(tv[1]), median(tv[2]), median(tv[3]));
+      kf->set_hoisted_gemm(true);
+      kf->set_fused_score(true);
     }
   }
   printf(fails ? "FAILED: %d\n" : "ALL PASSED\n", fails);

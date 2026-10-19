@@ -1,10 +1,10 @@
-// DFlash3Turbo candidate decoder (internal/DFLASH3TURBO.md §1, §4): a small autoregressive decoder that scores the
+// KFlash candidate decoder (internal/KFLASH.md §1, §4): a small autoregressive decoder that scores the
 // block drafter's top-32 candidates of each position given the whole drafted path, replacing DFlash2's first-order
-// selector. Loads <model>/dflash3 in the trainer's format (tools/dflash3/README.md: bf16 projections, quantized at
+// selector. Loads <model>/kflash in the trainer's format (M2's README: bf16 projections, quantized at
 // load to 4-bit group 64 with mx.quantize's rounding as the DFlash2 drafter's; the embedding norm, per-row logit
-// scales and the two-row acceptance head as stored), keeps the drafting tree on the GPU (D3Tree) and encodes decoder
-// steps over the tree's front nodes. Kernels in src/kernels/spec_dflash3.metal.
-// Opt-in: DFlash2 constructs one only with NI_DFLASH3 set (see DFlash3::find).
+// scales and the two-row acceptance head as stored), keeps the drafting tree on the GPU (KFlashTree) and encodes decoder
+// steps over the tree's front nodes. Kernels in src/kernels/spec_kflash.metal.
+// Opt-in: DFlash2 constructs one only with NI_KFLASH set (see KFlash::find).
 #pragma once
 #include "model/qwen35.h"
 
@@ -19,14 +19,14 @@ namespace ni {
 // Node 0 = the anchor (depth 0); a node at depth j is a draft at block row j, position P + j. Expanding a node at depth j
 // runs the decoder's path row j over its branch and writes its children: the backbone's 32 candidates of block row
 // j + 1 with their scores (ch_*[node * 32 + k]). Node ids are allocated in order; ancestors are expanded before
-// descendants. Mirrors D3Tree in spec_dflash3.metal.
-struct D3Tree {
+// descendants. Mirrors KFlashTree in spec_kflash.metal.
+struct KFlashTree {
   static constexpr int kCand = 32, kMaxNodes = 64, kMaxFront = 8;
   uint32_t n_nodes;             // nodes in the tree
   uint32_t n_front;             // nodes the next decoder step expands (<= kMaxFront)
   uint32_t front[kMaxFront];    // their ids
   uint32_t P;                   // anchor position
-  uint32_t walk_at;             // the speculative chain walk (d3_jac): the chain node whose row the next pass decides
+  uint32_t walk_at;             // the speculative chain walk (kf_jac): the chain node whose row the next pass decides
   uint32_t walk_done;           // 1 once that chain is complete
   uint32_t walk_passes;         // passes that decided rows
   uint32_t spare[2];
@@ -43,17 +43,17 @@ struct D3Tree {
   float ch_q[kMaxNodes * kCand];  // softmax(S / T_q)
   float ch_a[kMaxNodes * kCand];  // acceptance head
 };
-static_assert(sizeof(D3Tree) == 4 * (16 + 8 * 64 + 4 * 64 * 32), "D3Tree layout");
+static_assert(sizeof(KFlashTree) == 4 * (16 + 8 * 64 + 4 * 64 * 32), "KFlashTree layout");
 
-struct DFlash3Config {
+struct KFlashConfig {
   int d = 1024, NL = 2, nh = 8, hd = 128, I = 2816, H = 0, vocab = 0, ncand = 32, max_pos = 16;
   float eps = 1e-6f;
   std::string backbone;  // "dflash" | "dflash2" (informational)
 };
 
-// The chain walk fused into a decoder step (DFlash3::encode_step): the front row's child goes to tokens[P + 1 + j] and
+// The chain walk fused into a decoder step (KFlash::encode_step): the front row's child goes to tokens[P + 1 + j] and
 // the walk's outputs for dfl_accept32 / dfl_depth32: q, scores [7][32], k [7]
-struct D3WalkArgs {
+struct KFlashWalk {
   Buffer tokens, qprob, walk_k, walk_s;
   float temp = 0.0f;  // 0: argmax; > 0: a draw from q (qt) or the argmax with a one-hot q (!qt)
   uint32_t seed = 0;
@@ -61,14 +61,15 @@ struct D3WalkArgs {
   int maxdep = 7;     // the child at this depth is not expanded further (n_front = 0)
 };
 
-class DFlash3 {
+class KFlash {
  public:
-  static constexpr int kCand = D3Tree::kCand, kMaxNodes = D3Tree::kMaxNodes, kMaxFront = D3Tree::kMaxFront;
-  DFlash3(Qwen35& target, const std::string& dir);
-  // The decoder directory for NI_DFLASH3 (unset or "0": none): a directory, or "1" / "auto" = <model_dir>/dflash3, then
-  // dflash3/ beside the drafter directory. "" when there is none (or its config.json does not fit the target).
+  static constexpr int kCand = KFlashTree::kCand, kMaxNodes = KFlashTree::kMaxNodes, kMaxFront = KFlashTree::kMaxFront;
+  KFlash(Qwen35& target, const std::string& dir);
+  // The decoder directory for NI_KFLASH (unset or "0": none): a directory, or "1" / "auto" = <model_dir>/kflash, then
+  // kflash/ beside the drafter directory (and dflash3/ in both places: checkpoints exported before the rename). ""
+  // when there is none (or its config.json does not fit the target).
   static std::string find(const std::string& model_dir, const std::string& drafter_dir, const Qwen35Config& target);
-  const DFlash3Config& config() const { return cfg_; }
+  const KFlashConfig& config() const { return cfg_; }
   size_t resident_bytes() const { return resident_; }
   const std::string& dir() const { return dir_; }
 
@@ -81,29 +82,31 @@ class DFlash3 {
   void encode_prep(Encoder& e, const Buffer& xh, const Buffer& xs);
   // One decoder step over the tree's front (<= 8 nodes, read on the GPU): cand_i / cand_v = the top-32 ids / draft
   // logits of block rows 1..7, [7][32]; ch_q = softmax(S / qtemp); ch_a = the acceptance head's row acc_row (0: greedy,
-  // 1: sampled; 1 when the checkpoint has one row). walk: the chain builder's step on front row 0 (D3WalkArgs).
+  // 1: sampled; 1 when the checkpoint has one row). walk: the chain builder's step on front row 0 (KFlashWalk).
   // ind: every dispatch indirect from the step's argument block (kSlots x MTLDispatchThreadgroupsIndirectArguments,
-  // written by d3_jac: zero threadgroups once the chain is complete).
+  // written by kf_jac: zero threadgroups once the chain is complete).
   void encode_step(Encoder& e, const Buffer& cand_i, const Buffer& cand_v, float qtemp, int acc_row,
-                   const D3WalkArgs* walk = nullptr, const Buffer* ind = nullptr);
-  // The chain walk as speculative passes (d3_jac): the first pass scores the backbone's top-1 chain (all rows in one
+                   const KFlashWalk* walk = nullptr, const Buffer* ind = nullptr);
+  // The chain walk as speculative passes (kf_jac): the first pass scores the backbone's top-1 chain (all rows in one
   // step), every later pass the chain below the first position where the walk left the previous guess; passes after
   // the chain is complete are skipped (indirect dispatches of zero threadgroups). passes = maxdep: always the
   // sequential walk's chain and outputs, bitwise; fewer: the positions still open after the last pass draw from that
   // pass's (stale-branch) rows, which keeps the acceptance exact.
   void encode_chain(Encoder& e, const Buffer& tokens, uint32_t Pk, const Buffer& gst, const Buffer& cand_i,
-                    const Buffer& cand_v, float qtemp, int acc_row, const D3WalkArgs& walk, int passes);
+                    const Buffer& cand_v, float qtemp, int acc_row, const KFlashWalk& walk, int passes);
   static constexpr int kSlots = 9;  // distinct dispatch shapes of a step (encode_step's indirect argument block)
   const QLinear* weight(const std::string& name) const {
     auto it = named_.find(name);
     return it == named_.end() ? nullptr : it->second;
   }
   Buffer tree() const { return tree_; }
-  const D3Tree& tree_host() const { return *tree_.as<D3Tree>(); }  // after the command buffer completed
+  const KFlashTree& tree_host() const { return *tree_.as<KFlashTree>(); }  // after the command buffer completed
 
-  // candidate scores: one threadgroup per row (d3_score) or per row and candidate + an epilogue kernel (d3_cand +
-  // d3_soft); NI_DFLASH3_SCORE=0/1
+  // candidate scores: one threadgroup per row (kf_score) or per row and candidate + an epilogue kernel (kf_cand +
+  // kf_soft); NI_KFLASH_SCORE=0/1
   void set_fused_score(bool on) { fused_score_ = on; }
+  // projections on kf_qmm8 (loads issued up front) or dfl_qmm8; NI_KFLASH_GEMM=1/0
+  void set_hoisted_gemm(bool on) { hoisted_gemm_ = on; }
 
   // ---- tests ----
   // Per-step copies of the residual stream after the input and after each layer, of y and z, for row 0..7
@@ -128,7 +131,7 @@ class DFlash3 {
 
   Qwen35& tg_;
   std::string dir_;
-  DFlash3Config cfg_;
+  KFlashConfig cfg_;
   size_t resident_ = 0;
   std::deque<Tensor> owned_;
   std::vector<Buffer> owned_bufs_;
@@ -142,9 +145,9 @@ class DFlash3 {
   // step buffers (8 rows): A = W_h h of the pass's block rows, cd = candidate dot products [8][32][4]
   Buffer tree_, kv_, A_, xin_h_, xin_s_, hres_, n_, xh_, xs_, hh_, hs_, u_, qkv_, z_, cd_;
   // speculative passes: the full indirect arguments of a step (kSlots x 3 uints, filled at encode time) and one
-  // argument block per pass (d3_jac writes the next pass's)
+  // argument block per pass (kf_jac writes the next pass's)
   Buffer full_args_, pass_args_;
-  bool debug_ = false, fused_score_ = true;
+  bool debug_ = false, fused_score_ = true, hoisted_gemm_ = true;
   std::map<std::string, Buffer> dbg_;
 };
 
