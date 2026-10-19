@@ -126,9 +126,11 @@ struct V8Knobs {
   // 8192 conv / attention projections, 16384 ring commit. With NI_AB: the in-pipeline cost of those kernels.
   int skip = 0;
   int pad = 0;  // timing only: this many empty dispatches after every verify GEMM (the per-dispatch cost, with NI_AB)
+  // fused verify passes (verify8_fuse.metal, bitwise the passes they replace): 1 = MoE combine + the next norm's X8 table
+  int fuse = 1;
 };
 V8Knobs& v8_knobs();
-// "key=value,..." over a copy of `base` (keys: cm, pair, kplan, gusplit, gdnsplit, prepu, skip, pad); unknown keys are fatal
+// "key=value,..." over a copy of `base` (keys: cm, pair, kplan, gusplit, gdnsplit, prepu, skip, pad, fuse); unknown keys are fatal
 V8Knobs v8_knobs_parse(const char* spec, V8Knobs base);
 
 class Qwen35 : public Model {
@@ -477,9 +479,13 @@ class Qwen35 : public Model {
   // x rows (fp32, x_ld floats apart) -> X8 table (+ group sums), optional RMSNorm, optional lo table
   void enc_x8(Encoder& e, const Buffer& x, int R, int K, const Tensor* norm, bool lo = false, int x_ld = 0,
               const Buffer* xn_out = nullptr);
-  void enc_attn8(Encoder& e, const Seq& s, const Layer& L, const Buffer& kc, const Buffer& vc, int cap, int pos, int R);
+  // table_ready: the layer's input-norm table is already written (by the previous layer's enc_moe8)
+  void enc_attn8(Encoder& e, const Seq& s, const Layer& L, const Buffer& kc, const Buffer& vc, int cap, int pos, int R,
+                 bool table_ready = false);
   void enc_mlp8(Encoder& e, const Layer& L, int R);
-  void enc_moe8(Encoder& e, const Layer& L, int R, int li);
+  // next_norm: the norm of what follows (the next layer's input norm, or the final norm); when given, the combine may
+  // also write that norm's X8 table (V8Knobs::fuse & 1). Returns whether it did.
+  bool enc_moe8(Encoder& e, const Layer& L, int R, int li, const Tensor* next_norm = nullptr);
 
   std::string dir_;
   std::string prefix_;
