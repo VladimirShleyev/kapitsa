@@ -102,26 +102,6 @@ struct Moe8CombineX8Params {
   }
 }
 
-// MoE router top-k + plan (moe_topk256_rows + moe8_plan, their shared bodies): simdgroup t routes row t, the plan
-// reads the rows' ids from threadgroup memory. E = 256, one threadgroup of 256 threads (R <= 8 simdgroups route).
-[[kernel]] void moe8_topk_plan(const device float* logits [[buffer(0)]], const device float* shared [[buffer(1)]],
-                               device uint* idx [[buffer(2)]], device float* wts [[buffer(3)]],
-                               constant TopkParams& tp [[buffer(4)]], device uint* tiles [[buffer(5)]],
-                               device uint* ntiles [[buffer(6)]], device uint* slot [[buffer(7)]],
-                               device uint* args [[buffer(8)]], constant Moe8PlanParams& p [[buffer(9)]],
-                               device uint* stats [[buffer(10)]], device uint* sm [[buffer(11)]],
-                               const device uint* rows_lim [[buffer(12)]],
-                               uint tid [[thread_position_in_threadgroup]], uint ntg [[threads_per_threadgroup]],
-                               uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup uint ids[64];
-  threadgroup uint cnt[2][32];
-  threadgroup uint total[2];
-  if (sg < p.R) moe_topk256_row(logits, shared, idx, wts, tp, sg, lane, ids);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  const uint R = p.rlim ? min(p.R, rows_lim[0]) : p.R;
-  moe8_plan_body(ids, R, tiles, ntiles, slot, args, p, stats, sm, tid, ntg, sg, lane, cnt, total);
-}
-
 // gdn_prep_verify with the rows' q / k norms reduced together: each row's conv output first (all R in registers), then
 // one threadgroup exchange for the R sums of squares (tg_sum's two stages per row: simd_sum, then the simd_sum of the
 // simdgroups' partials) instead of R tg_sums in sequence (two barriers each). Bitwise gdn_prep_verify.
