@@ -12,6 +12,8 @@
 //  --out writes, per case, the backbone rows, the top-32, the target's embedding / LM-head rows of every token
 //  involved, the tree, and the decoder's 4-bit weights + the root row's intermediates (tree case) for
 //  `kflash_ref.py check <decoder_dir> <dump_dir>`.
+//  --emb-bf16: the decoder reads node tokens' embedding rows from a bf16 copy of the target's table (the formats
+//  library's kf_in_f16, as with a bf16 target); the dumped rows are those bf16 values.
 //  --time N: GPU ms of the drafting pass with DFlash2's walk vs the decoder's chain (interleaved), of the decoder alone
 //  (root + 7 steps + walks), and of one decoder step at 1 / 2 / 4 / 8 front rows (medians of N).
 //  --ref-vectors <dir> --out <dump>: instead of all that, the trainer's reference vectors (<dir>/reference.safetensors:
@@ -58,8 +60,13 @@ static void save_npy(const std::string& path, const std::string& descr, const st
   f.write((const char*)data, std::streamsize(bytes));
 }
 
-// One row of a 4/8-bit group-64 table in fp32, as the decoder's kernels dequantize it (kf_row2)
+// One row of a 4/8-bit group-64 (or bf16) table in fp32, as the decoder's kernels dequantize it (kf_row2)
 static void row_f32(const QLinear& L, uint32_t row, float* out) {
+  if (L.bits == 16) {
+    const uint16_t* r = L.w->buf.as<uint16_t>() + size_t(row) * L.K;
+    for (uint32_t k = 0; k < L.K; ++k) out[k] = bf16_to_f32(r[k]);
+    return;
+  }
   const uint32_t gpr = L.K / uint32_t(L.gs);
   const uint16_t* S = L.s->buf.as<uint16_t>() + size_t(row) * gpr;
   const uint16_t* B = L.b->buf.as<uint16_t>() + size_t(row) * gpr;
@@ -87,6 +94,7 @@ int main(int argc, char** argv) {
       "Write a C++ function that parses a comma-separated list of integers from a string and returns their sum. "
       "Handle whitespace and negative numbers, and explain the edge cases you considered.";
   int time_n = 0, ctx = 0;
+  bool emb_bf16 = false;
   std::string refv;
   float temp = 0.7f;
   uint32_t seed = 1234;
@@ -99,6 +107,7 @@ int main(int argc, char** argv) {
     else if (a == "--seed" && i + 1 < argc) seed = uint32_t(strtoul(argv[++i], nullptr, 10));
     else if (a == "--ctx" && i + 1 < argc) ctx = atoi(argv[++i]);
     else if (a == "--ref-vectors" && i + 1 < argc) refv = argv[++i];
+    else if (a == "--emb-bf16") emb_bf16 = true;
     else fatal("unknown option %s", a.c_str());
   }
   if (getenv("NI_DFLASH_QT")) fatal("kflash_check: unset NI_DFLASH_QT (the sampled case assumes q = softmax(S / T))");
@@ -226,8 +235,32 @@ int main(int argc, char** argv) {
   meta["decoder"] = kfdir;
   meta["P"] = P;
   meta["cases"] = json::array();
-  const QLinear& E = tgt.embed_table();
+  const QLinear& E0 = tgt.embed_table();
   const QLinear& O = tgt.lm_head();
+  // --emb-bf16: a bf16 copy of the embedding (each row dequantized in fp32 as the kernels do, rounded to bf16)
+  QLinear Eb;
+  Tensor Ebt;
+  if (emb_bf16) {
+    const uint32_t V = E0.N;
+    Buffer b = g.alloc(size_t(V) * H * 2, "emb_bf16", false);
+    std::vector<float> row(H);
+    for (uint32_t t = 0; t < V; ++t) {
+      row_f32(E0, t, row.data());
+      for (int k = 0; k < H; ++k) b.as<uint16_t>()[size_t(t) * H + k] = f32_to_bf16(row[k]);
+    }
+    Ebt = Tensor{b, DType::BF16, {int64_t(V), int64_t(H)}};
+    Eb.w = &Ebt;
+    Eb.s = &Ebt;  // unread for bf16
+    Eb.b = &Ebt;
+    Eb.N = V;
+    Eb.K = uint32_t(H);
+    Eb.bits = 16;
+    Eb.gs = 64;
+    kf->set_embed_table(&Eb);
+    printf("decoder embedding: a bf16 copy of the target's %s table (kf_in_%s)\n", format_name(E0.bits, E0.gs).c_str(),
+           Eb.fmt().c_str());
+  }
+  const QLinear& E = emb_bf16 ? Eb : E0;
 
   // dumps one case: backbone rows, top-32, the tree, the target rows of every token involved
   auto dump_case = [&](const std::string& name, const std::string& kind, float t, float qtemp, uint32_t sd, int acc_row) {

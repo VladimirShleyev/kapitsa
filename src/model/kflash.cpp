@@ -415,7 +415,7 @@ void KFlash::encode_prep(Encoder& e, const Buffer& xh, const Buffer& xs) {
 void KFlash::encode_step(Encoder& e, const Buffer& cand_i, const Buffer& cand_col, const Buffer& cand_v, float qtemp,
                          int acc_row, const KFlashWalk* walk, const Buffer* ind) {
   const uint32_t d = uint32_t(cfg_.d), H = uint32_t(cfg_.H), I = uint32_t(cfg_.I), NL = uint32_t(cfg_.NL);
-  const QLinear& E = tg_.embed_table();
+  const QLinear& E = emb_ ? *emb_ : tg_.embed_table();
   if (!out_head_ || !(out_head_->q4() || out_head_->q8()) || out_head_->K != H)
     fatal("KFlash: no 4 / 8-bit table for the candidates' LM-head rows (set_out_head)");
   const QLinear& O = *out_head_;

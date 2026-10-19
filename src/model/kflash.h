@@ -39,7 +39,7 @@ struct KFlashTree {
   int32_t expanded[kMaxNodes];  // 1 once a decoder step scored its children
   int32_t row[kMaxNodes];       // verify row (the builder's)
   int32_t ch_tok[kMaxNodes * kCand];
-  float ch_s[kMaxNodes * kCand];  // raw scores S = U + <z, E_out[c]>
+  float ch_s[kMaxNodes * kCand];  // scores S = logit_scale U + <z, E_out[c]>
   float ch_q[kMaxNodes * kCand];  // softmax(S / T_q)
   float ch_a[kMaxNodes * kCand];  // acceptance head
 };
@@ -92,6 +92,8 @@ class KFlash {
   // its reduced rows, or their 8-bit copy for heads in other formats; 4 / 8-bit group 64). Default: the target's LM
   // head with cand_col = token ids (4 / 8-bit heads only).
   void set_out_head(const QLinear* head) { out_head_ = head; }
+  // tests: the embedding table node tokens are read from (default: the target's; any format format_supported takes)
+  void set_embed_table(const QLinear* emb) { emb_ = emb; }
   // The chain walk as speculative passes (kf_jac): the first pass scores the backbone's top-1 chain (all rows in one
   // step), every later pass the chain below the first position where the walk left the previous guess; passes after
   // the chain is complete are skipped (indirect dispatches of zero threadgroups). passes = maxdep: always the
@@ -130,6 +132,7 @@ class KFlash {
   };
   int acc_rows_ = 0;  // acceptance-head rows in the checkpoint (0: none)
   const QLinear* out_head_ = nullptr;
+  const QLinear* emb_ = nullptr;
   void load_config(const std::string& dir);
   const Tensor* own(const Tensor& t, const char* label);
   QLinear quantize(const std::vector<std::vector<const Tensor*>>& rows, const char* label);
