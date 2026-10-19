@@ -559,7 +559,8 @@ void Qwen35::encode_verify8(Encoder& e, Seq& s, int pos, int R, const SamplingPa
       if (!table_ready) enc_x8(e, x_, R, D, L.in_norm);
       if (!(skip & 32)) enc_qmm8(e, {{&L.qkv, qkv_}, {&L.z, zb_}, {&L.b, bb_}, {&L.a, ab_}}, R, v8t_, v8s_);
       if (!(skip & 4)) {
-        e.use(pipe8("gdn_prep_verify"));
+        // fuse & 4: gdn_prep_verify8 (the rows' q / k norms reduced together; bitwise gdn_prep_verify)
+        e.use(pipe8(R <= 8 && cfg_.lin_dk == 128 && (v8_knobs().fuse & 4) ? "gdn_prep_verify8" : "gdn_prep_verify"));
         e.buf(0, qkv_); e.buf(1, ab_); e.buf(2, bb_); e.buf(3, s.conv[i]);
         e.buf(4, L.conv_w->buf); e.buf(5, L.A_log->buf); e.buf(6, L.dt_bias->buf);
         e.buf(7, gq_); e.buf(8, gk_); e.buf(9, gv_); e.buf(10, gg_); e.buf(11, gbeta_);

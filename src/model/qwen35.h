@@ -127,8 +127,8 @@ struct V8Knobs {
   int skip = 0;
   int pad = 0;  // timing only: this many empty dispatches after every verify GEMM (the per-dispatch cost, with NI_AB)
   // fused verify passes (verify8_fuse.metal, bitwise the passes they replace): 1 = MoE combine + the next norm's X8
-  // table, 2 = MoE top-k + plan
-  int fuse = 3;
+  // table, 2 = MoE top-k + plan, 4 = GDN prep with the rows' norms reduced together
+  int fuse = 7;
 };
 V8Knobs& v8_knobs();
 // "key=value,..." over a copy of `base` (keys: cm, pair, kplan, gusplit, gdnsplit, prepu, skip, pad, fuse); unknown keys are fatal
