@@ -27,7 +27,10 @@ they decode.
 4. **Draft and verify.** Qwen uses its block drafter when available (DFlash2 on the 35B and 27B, DFlash on the 4B),
    otherwise its MTP head where supported. Nemotron uses a block drafter: LiLiCorr (Bolt, Super-VL) or DSpark
    (Lightning). The target verifies proposed tokens; accepted tokens advance the sequence, and rejected proposals do
-   not become committed recurrent history. Plain generation is available with `--spec 0`.
+   not become committed recurrent history. On the dense Qwen models (27B, 4B) the drafter's candidates are verified as
+   a tree of 7 drafts per pass (its likeliest branches; each row attends to its own ancestors and runs the recurrent
+   layers from their state), which costs the same 8-row pass as a chain; the 35B-A3B, whose verify pays per row for
+   its experts, verifies a chain. Plain generation is available with `--spec 0`.
 5. **Stream and retain state.** The output parser separates content, reasoning and complete tool calls. The engine
    retains the slot for follow-ups and can prefill the rendered assistant history while idle.
 

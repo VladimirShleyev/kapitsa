@@ -131,6 +131,7 @@ struct MoeRowsDown {
 struct GdnVerify {
   uint32_t R, n_pend, Hk, Hv, C;
   float eps;
+  uint32_t tree = 0, pidx = 0;  // the *_tree kernels: rows form a tree / pending rows are a tree cycle's path
 };
 
 struct SampleRows {
@@ -217,6 +218,7 @@ struct DflCommit {
 struct DflX8 {
   uint32_t K, m, src_ld;
   float scale;
+  uint32_t gather = 0;  // 1: row r from source row gst[4 + r] (a tree cycle's accepted path)
 };
 
 struct DflRows {
@@ -259,6 +261,15 @@ struct DflAccept {
   float temp;
   uint32_t seed;
   uint32_t dyn;  // 1: K = min(K, kdyn[0]) (dynamic verify depth)
+};
+
+struct DflTree {
+  uint32_t P, out_index;
+  float tau, slope;  // node score temperature tau (1 + slope d) at position d
+};
+
+struct KvTree {
+  uint32_t pos, Hkv, D, max_seq;
 };
 
 struct DflDepth {

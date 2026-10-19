@@ -25,6 +25,10 @@ struct Seq {
   // speculative decoding: rows accepted by the last verify, not yet folded into conv/rec
   std::vector<Buffer> pend_qkv, pend_k, pend_g, pend_d;  // per recurrent layer
   int n_pend = 0;
+  // Qwen35 tree verifies (DFlash2 tree drafting): the pending rows are the tape rows pend_path[0 .. n_pend) (int32
+  // [9], the accepted path dfl_accept_tree writes), not rows 0 .. n_pend
+  Buffer pend_path;
+  bool pend_tree = false;
   int pend_pos = 0;                // position of the first pending row (Nemotron-H)
   int pend_half = 0;               // which half of pend_qkv holds the pending rows (Nemotron-H: 2 x 8 rows)
   Buffer mtp_kc, mtp_vc;           // MTP head's attention cache (positions = trunk positions)

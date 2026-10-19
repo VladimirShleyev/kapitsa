@@ -2145,7 +2145,15 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
       ++req_cycles;
       spec_accepted_ += m;
       cycle_done(m);
-      if (trace_path) trace_fn(q35_->logits(), m, tk + P + 1);
+      if (trace_path && dfl_->tree()) {  // the accepted path's verify rows (tree slots), in order
+        const size_t V = size_t(model_->vocab());
+        std::vector<float> rows(size_t(m) * V);
+        for (int j = 0; j < m; ++j)
+          memcpy(rows.data() + size_t(j) * V, q35_->logits() + size_t(s.pend_path.as<int>()[j]) * V, V * 4);
+        trace_fn(rows.data(), m, tk + P + 1);
+      } else if (trace_path) {
+        trace_fn(q35_->logits(), m, tk + P + 1);
+      }
       q35_->commit_rows(s, m);  // rows P .. P+m-1 are fed; tk[P+m] is the new anchor
       P += m;
       d.ctx = P;  // the committed drafting half (if any) puts these rows into the ring

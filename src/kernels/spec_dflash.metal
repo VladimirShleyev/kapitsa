@@ -824,6 +824,7 @@ struct DflCommitParams {
 struct DflX8Params {
   uint K, m, src_ld;
   float scale;
+  uint gather;  // 1: row r is source row gst[4 + r] (a tree cycle's accepted path, dfl_accept_tree)
 };
 // grid (8 rows, column blocks) x 256: block y converts groups y * 8 + sg, then every 8 * blocks.
 [[kernel]] void dfl_x8_from_bf16(const device bfloat* src [[buffer(0)]], device half* xh [[buffer(1)]],
@@ -834,10 +835,11 @@ struct DflX8Params {
                                  uint lane [[thread_index_in_simdgroup]]) {
   const uint m = p.m == kDflGpu ? gst[1] : p.m;
   const uint r = tg.x;
+  const uint rs = p.gather && r < m ? gst[4 + r] : r;
   for (uint g = tg.y * nsg + sg; g < p.K / 64; g += nsg * ntgs.y) {
     const uint c = g * 64 + 2 * lane;
     float2 v = float2(0.0f);
-    if (r < m) v = float2(*(const device bfloat2*)(src + size_t(r) * p.src_ld + c)) * p.scale;
+    if (r < m) v = float2(*(const device bfloat2*)(src + size_t(rs) * p.src_ld + c)) * p.scale;
     dfl_put2(xh, xs, r, p.K, g, lane, v.x, v.y);
   }
 }
@@ -1540,6 +1542,136 @@ struct DflSelectParams {
     walk_k[pp] = int(kb);
     jp = kb;
     tokens[out_index + pp] = cand_i[pp * 16 + kb];
+  }
+}
+
+// ---- DFlash 3 tree drafting (dense targets): a best-first tree of 7 nodes from the lattice ----
+// Slot 0 is the anchor; node t = 1..7 is candidate k_t of position d_t - 1 (d_t = its depth) under parent slot
+// par_t. A node's children are the 16 candidates of the next position with conditional probabilities
+// c(k | parent) = softmax_k((U_d[k] + E[d][k_par][k]) / tau_d) (the walk's scores, E row 0 under the anchor; DFlash
+// v1 drafters have E = 0), tau_d = tau (1 + slope d): the drafter's mid-range confidences are too high at depth
+// (tools/tree_sim.py measures it on lattice recordings). Each step adds the frontier node with the largest product
+// of conditional probabilities along its path (ties: the lower slot, then the lower candidate), so the 7 nodes
+// maximize the expected accepted length under that model, and slots are in insertion order (a parent before its
+// children). Writes slot t's token to tokens[out_index + t - 1] and the tree descriptor: tree[0..7] parent slot (-1
+// for the anchor), [8..15] depth, [16..23] ancestor-or-self mask (bit j = slot j), [24] the slots whose parent is
+// not the slot before them (bit t). grid: 1 x 32 (one simdgroup).
+struct DflTreeParams {
+  uint P;          // anchor position (kDflGpu: from the drafter state)
+  uint out_index;  // tokens[out_index + t - 1] = slot t's token (P + 1)
+  float tau;       // the score temperature at position 0
+  float slope;     // its growth per position
+};
+// node v's children (position d, under its candidate kpar of position d - 1): lanes 0..15 compute the 16
+// conditional probabilities and store their logs best first into cl[v] / ck[v]
+NI_INLINE void dfl_tree_kids(const device float* cand_v, const device float* E, constant DflTreeParams& p, uint d,
+                             uint kpar, uint v, threadgroup float (*cl)[16], threadgroup uchar (*ck)[16], uint lane) {
+  const bool on = lane < 16;
+  float s = -INFINITY;
+  if (on) {
+    const float e = E[d * 256 + (d == 0 ? 0u : kpar) * 16 + lane];
+    s = (cand_v[d * 16 + lane] + (isnan(e) ? 0.0f : e)) / (p.tau * (1.0f + p.slope * float(d)));
+  }
+  const float mx = simd_max(s);
+  const float ex = on ? metal::precise::exp(s - mx) : 0.0f;
+  const float pc = ex / simd_sum(ex);
+  const float lpc = on ? metal::precise::log(max(pc, 1e-30f)) : -INFINITY;
+  uint rank = 0;
+  for (ushort j = 0; j < 16; ++j) {
+    const float o = simd_shuffle(lpc, j);
+    rank += (o > lpc || (o == lpc && uint(j) < lane)) ? 1u : 0u;
+  }
+  if (on) {
+    cl[v][rank] = lpc;
+    ck[v][rank] = uchar(lane);
+  }
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+}
+[[kernel]] void dfl_tree(const device int* cand_i [[buffer(0)]], const device float* cand_v [[buffer(1)]],
+                         const device float* E [[buffer(2)]], device int* tokens [[buffer(3)]],
+                         device int* tree [[buffer(4)]], constant DflTreeParams& p [[buffer(5)]],
+                         const device uint* gst [[buffer(6)]], uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float cl[8][16];
+  threadgroup uchar ck[8][16];
+  const uint P = dfl_pos(p.P, gst), out_index = p.P == kDflGpu ? P + 1 : p.out_index;
+  uint dep[8], nxt[8], anc[8];
+  int par[8];
+  float lp[8];
+  for (uint i = 0; i < 8; ++i) {
+    dep[i] = 0;
+    nxt[i] = 0;
+    anc[i] = 1u << i;
+    par[i] = -1;
+    lp[i] = 0.0f;
+  }
+  dfl_tree_kids(cand_v, E, p, 0, 0, 0, cl, ck, lane);
+  for (uint t = 1; t < 8; ++t) {
+    // the frontier: node v's best child not taken yet (nodes at depth 7 have none)
+    const float val = lane < t && dep[lane] < 7 && nxt[lane] < 16 ? lp[lane] + cl[lane][nxt[lane]] : -INFINITY;
+    const float m = simd_max(val);
+    const uint v = simd_min(val == m && lane < t ? lane : 32u);
+    const uint k = ck[v][nxt[v]];
+    nxt[v] += 1;
+    dep[t] = dep[v] + 1;
+    par[t] = int(v);
+    lp[t] = m;
+    anc[t] = anc[v] | (1u << t);
+    if (lane == 0) tokens[out_index + t - 1] = cand_i[(dep[t] - 1) * 16 + k];
+    if (dep[t] < 7) dfl_tree_kids(cand_v, E, p, dep[t], k, t, cl, ck, lane);
+  }
+  if (lane < 8) {
+    tree[lane] = par[lane];
+    tree[8 + lane] = int(dep[lane]);
+    tree[16 + lane] = int(anc[lane]);
+  }
+  const uint jump = simd_or(lane > 0 && lane < 8 && par[min(lane, 7u)] != int(lane) - 1 ? 1u << lane : 0u);
+  if (lane == 0) tree[24] = int(jump);
+}
+
+// Tree acceptance (greedy and sampled alike): verify row t holds the target's own token after slot t's path (its
+// argmax at T = 0; at T > 0 a draw of the plain sampler with the uniform of the position that token takes,
+// sample_stage2_rows_tree). From the anchor, descend into the child whose token equals the current row's token while
+// there is one: the emitted tokens are then exactly the plain decoding's (each one the plain sampler's draw given the
+// tokens before it, whatever the tree's shape, which the drafter fixed without seeing any of them). Writes the
+// accepted path's tokens to tokens[P+1 .. P+a] (they held the slots' tokens) and the token after them to
+// tokens[P+1+a]; res = {a, that token}; the drafter state for the next pass, with the path's slots in gst[4 + i]
+// (the ring commit gathers their captures); path[i] = slot of the path's i-th row (path[0] = 0, the anchor),
+// path[8] = a + 1 rows (the target folds those rows' tape and moves their K/V, Qwen35::set_verify_tree) and path[9]
+// the slots packed 4 bits each (row i at bits 4i).
+// grid: 1 x 32.
+[[kernel]] void dfl_accept_tree(device int* tokens [[buffer(0)]], const device int* samp [[buffer(1)]],
+                                const device int* tree [[buffer(2)]], device int* res [[buffer(3)]],
+                                constant uint& P [[buffer(4)]], device uint* gst [[buffer(5)]],
+                                device int* path [[buffer(6)]], uint lane [[thread_index_in_simdgroup]]) {
+  const int par = lane < 8 ? tree[lane] : -2;
+  const int tok = lane < 8 ? tokens[P + lane] : -1;
+  uint v = 0, a = 0, mine = 0;  // lane i: the slot of the path's i-th row
+  int y = samp[0];
+  while (a < 7) {
+    const bool hit = lane > 0 && lane < 8 && par == int(v) && tok == y;
+    const uint c = simd_min(hit ? lane : 32u);
+    if (c == 32u) break;
+    ++a;
+    if (lane == a) mine = c;
+    v = c;
+    y = samp[v];
+  }
+  const int ptok = simd_shuffle(tok, ushort(mine));
+  if (lane >= 1 && lane <= a) tokens[P + lane] = ptok;
+  if (lane <= a) {
+    gst[4 + lane] = mine;
+    path[lane] = int(mine);
+  }
+  const uint packed = simd_or(lane <= a && lane < 8 ? mine << (4 * lane) : 0u);
+  if (lane == 0) {
+    tokens[P + 1 + a] = y;
+    res[0] = int(a);
+    res[1] = y;
+    gst[0] = P + a + 1;
+    gst[1] = a + 1;
+    gst[2] = P;
+    path[8] = int(a + 1);
+    path[9] = int(packed);
   }
 }
 

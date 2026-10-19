@@ -439,6 +439,19 @@ DFlash2::DFlash2(Qwen35& target, const std::string& dir, int bits) : tg_(target)
   if (dyn_tau_ > 0) logi("DFlash2: dynamic verify depth, tau %.3f (T = 0) / %.3f (T > 0)", dyn_tau_, dyn_tau_t_);
   if (const char* v = getenv("NI_DFLASH_EXACT_MOE")) exact_moe_ = atoi(v) != 0;
   if (const char* v = getenv("NI_DFLASH_QT")) walk_tf_ = std::max(0.0f, float(atof(v)));
+  // Tree drafting on dense targets, whose 8-row verify costs the same whatever the rows hold (MoE targets keep the
+  // chain: there a row's experts are its cost, and the dynamic depth spends them). NI_DFLASH_TREE=0/1 overrides.
+  // Node score temperature (tools/tree_sim.py replays on lattice recordings of the agent session's 19 requests and
+  // code_27b, greedy, tokens per cycle over the chain): DFlash2 drafters 1.3, growing 10% per position (27B: session
+  // +4.1%, code +9.9%); DFlash v1 drafters (no edge scores) 1.2 flat (4B: +7.4%, +12.1%).
+  {
+    tree_tau_ = cfg_.v1 ? 1.2f : 1.3f;
+    tree_slope_ = cfg_.v1 ? 0.0f : 0.1f;
+    if (const char* t = getenv("NI_DFLASH_TREE_TAU")) tree_tau_ = std::max(0.05f, float(atof(t)));
+    if (const char* t = getenv("NI_DFLASH_TREE_SLOPE")) tree_slope_ = std::max(0.0f, float(atof(t)));
+    const char* v = getenv("NI_DFLASH_TREE");
+    set_tree(v && *v ? atoi(v) != 0 : !tg_.config().moe);
+  }
   if (cfg_.v1)
     logi("DFlash drafter (v1) %s: blocks of %d rows (trained %d), context window %d positions (trained %d)",
          dir.c_str(), kB, cfg_.trained_block, kCtxKeep, cfg_.trained_window);
@@ -502,8 +515,10 @@ void DFlash2::alloc_buffers() {
     v8hs_ = g.alloc(I / 64 * 8 * 4, "dfl_v8_hs");
     resident_ += v8t_.size + v8h_.size + v8hs_.size;
   }
-  gst_ = g.alloc(16, "dfl_gpu_state");
+  gst_ = g.alloc(64, "dfl_gpu_state");  // [0] anchor, [1] rows to commit, [2] their first position, [4 + i] tree path
   memset(gst_.ptr(), 0, gst_.size);
+  tree_buf_ = g.alloc(32 * 4, "dfl_tree");
+  memset(tree_buf_.ptr(), 0, tree_buf_.size);
   kdyn_ = g.alloc(16, "dfl_kdyn");
   kdyn_.as<uint32_t>()[0] = 7;
   kdyn_.as<uint32_t>()[1] = 8;
@@ -515,7 +530,8 @@ void DFlash2::alloc_buffers() {
   memset(capt_.ptr(), 0, capt_.size);
   for (Buffer* b : {&h_, &n_, &xh_, &xs_, &xh2_, &xs2_, &hh_, &gu_g_, &gu_u_, &hs_, &dyn_, &q_, &kv_, &Q_, &Kb_, &Vb_, &part_o_, &part_ml_, &u_,
                     &logits_, &sel_, &tk_v_, &tk_i_, &cand_v_, &cand_i_, &edges_, &walk_s_, &qprob_, &walk_k_, &capt_,
-                    &y8_, &c8_, &kv8_, &cdbg_, &rope_cs_, &dist_id_, &dist_p_, &dist_keep_, &acc_, &kdyn_, &gst_})
+                    &y8_, &c8_, &kv8_, &cdbg_, &rope_cs_, &dist_id_, &dist_p_, &dist_keep_, &acc_, &kdyn_, &gst_,
+                    &tree_buf_})
     resident_ += b->size;
 }
 
@@ -1118,7 +1134,18 @@ void DFlash2::arm_verify(int P) {
 
 void DFlash2::disarm() { tg_.set_capture(nullptr); }
 
-void DFlash2::encode_commit(Encoder& e, DFlashSeq& d, int m) { enc_commit_from(e, d, m, capt_); }
+void DFlash2::encode_commit(Encoder& e, DFlashSeq& d, int m) { enc_commit_from(e, d, m, capt_, gst_tree_); }
+
+void DFlash2::set_tree(bool on) {
+  // the tree spends all 8 rows: NI_DFLASH_VERIFY below 7 keeps the chain
+  tree_ = on && tg_.block_drafter_ok() && tg_.verify_tree_ok() && verify_depth() == kB - 1;
+  if (on && !tree_)
+    logi("DFlash2: tree drafting needs all 8 verify rows and the 8-row verify's attn8m and split GDN paths; the chain "
+         "stays");
+  if (tree_)
+    logi("DFlash2: tree drafting (best-first, 7 nodes per cycle; score temperature %.2f, +%.0f%% per position)",
+         tree_tau_, 100 * tree_slope_);
+}
 
 void DFlash2::stage_init(DFlashSeq& d) {
   if (d.stage) return;
@@ -1174,7 +1201,7 @@ void DFlash2::encode_commit_staged(Encoder& e, DFlashSeq& d) {
   d.staged = 0;
 }
 
-void DFlash2::enc_commit_from(Encoder& e, DFlashSeq& d, int m, const Buffer& src) {
+void DFlash2::enc_commit_from(Encoder& e, DFlashSeq& d, int m, const Buffer& src, bool gather) {
   // m < 0: GPU-driven (rows and positions from the drafter state; d.ctx is advanced by the caller)
   const bool gpu = m < 0;
   if (!gpu && (m < 1 || m > kB)) fatal("DFlash2 commit: m=%d", m);
@@ -1184,7 +1211,7 @@ void DFlash2::enc_commit_from(Encoder& e, DFlashSeq& d, int m, const Buffer& src
   }
   const uint32_t H = uint32_t(cfg_.H), nH = hook_vf_.ld;
   {
-    kp::DflX8 p{nH, gpu ? 0xffffffffu : uint32_t(m), nH, 1.0f / 16.0f};
+    kp::DflX8 p{nH, gpu ? 0xffffffffu : uint32_t(m), nH, 1.0f / 16.0f, gather ? 1u : 0u};
     // one group per simdgroup: 8 x 32 threadgroups for the 35B's 8 captured layers (12.5 -> ~3 us isolated, vs 8)
     e.use(dpipe("dfl_x8_from_bf16"));
     e.buf(0, src); e.buf(1, xh_); e.buf(2, xs_);
@@ -1231,7 +1258,8 @@ void DFlash2::encode_draft(Encoder& e, Seq& s, DFlashSeq& d, int P, const Sampli
   encode_draft_impl(e, s, d, P, sp, false);
 }
 
-void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const SamplingParams& sp, bool gpu) {
+void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const SamplingParams& sp, bool gpu,
+                                bool tree) {
   // gpu: the anchor position comes from the drafter state (gst_); P is only its upper bound here
   if (!gpu && P != d.ctx) fatal("DFlash2 draft: anchor position %d but the ring holds %d positions", P, d.ctx);
   if (P + kB >= s.cap) fatal("DFlash2 draft: context full (%d)", s.cap);
@@ -1465,6 +1493,15 @@ void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const S
       e.buf(7, gst_);
       e.dispatch(7, 8, 1, 256);  // 8 threadgroups per position (7 x 1: +0.006 to +0.018 ms per pass)
     }
+    if (tree) {  // the best-first tree into tokens[P+1 ..] (slot order) and its descriptor (no walk)
+      kp::DflTree tp{Pk, uint32_t(P + 1), tree_tau_, tree_slope_};
+      e.use(dpipe("dfl_tree"));
+      e.buf(0, cand_i_); e.buf(1, cand_v_); e.buf(2, edges_); e.buf(3, s.tok); e.buf(4, tree_buf_);
+      e.val(5, tp);
+      e.buf(6, gst_);
+      e.dispatch(1, 1, 1, 32);
+      return;
+    }
     kp::DflSelect p{Pk, sp.temperature, sp.seed, uint32_t(P + 1), sp.temperature * walk_tf_};
     e.use(dpipe("dfl_walk"));
     e.buf(0, cand_i_); e.buf(1, cand_v_); e.buf(2, edges_); e.buf(3, s.tok); e.buf(4, walk_s_); e.buf(5, qprob_);
@@ -1510,10 +1547,34 @@ void DFlash2::encode_accept(Encoder& e, Seq& s, int P, int K, const SamplingPara
 
 void DFlash2::encode_cycle_draft(Encoder& e, Seq& s, DFlashSeq& d, int P, int m_prev, const SamplingParams& sp) {
   if (m_prev) encode_commit(e, d, m_prev);
-  encode_draft(e, s, d, P, sp);
+  encode_draft_impl(e, s, d, P, sp, false, tree_);
 }
 
 void DFlash2::encode_cycle_verify(Encoder& e, Seq& s, int P, int K, const SamplingParams& sp) {
+  if (tree_) {
+    // the tree's 8 rows (anchor + 7 nodes) with captures; the acceptance walks the rows' own tokens (argmax, or the
+    // plain sampler's draw keyed by the token's position), writes the path, moves its K/V into place, and leaves the
+    // path for the target's next fold (s.pend_tree) and the next ring commit (gst[4 ..])
+    if (!s.pend_path) s.pend_path = Gpu::get().alloc(64, "pend_path");
+    tg_.set_verify_tree(&tree_buf_);
+    tg_.set_verify_moe_exact(exact_moe_ && sp.temperature > 0);  // (a tree forced onto a MoE target)
+    arm_verify(P);
+    tg_.encode_verify(e, s, P, kB, sp, uint32_t(P), /*v8=*/true);
+    disarm();
+    tg_.set_verify_moe_exact(false);
+    tg_.set_verify_tree(nullptr);
+    const uint32_t Pu = uint32_t(P);
+    e.use(dpipe("dfl_accept_tree"));
+    e.buf(0, s.tok); e.buf(1, tg_.verify_samples()); e.buf(2, tree_buf_); e.buf(3, acc_);
+    e.val(4, Pu);
+    e.buf(5, gst_); e.buf(6, s.pend_path);
+    e.dispatch(1, 1, 1, 32);
+    tg_.encode_kv_tree_compact(e, s, P);
+    s.pend_tree = true;
+    gst_tree_ = true;
+    return;
+  }
+  gst_tree_ = false;
   const Buffer rows = kdyn_.view(4, 4);
   if (dyn_tau_ > 0) {
     kp::DflDepth dp{uint32_t(K), sp.temperature > 0 ? dyn_tau_t_ : dyn_tau_, sp.temperature > 0 ? sp.temperature : 0.0f,
@@ -1544,7 +1605,7 @@ void DFlash2::gpu_state_reset(int P) {
 
 void DFlash2::encode_cycle_draft_gpu(Encoder& e, Seq& s, DFlashSeq& d, int P_max, const SamplingParams& sp) {
   encode_commit(e, d, -1);  // the rows the last acceptance kept (none after gpu_state_reset)
-  encode_draft_impl(e, s, d, P_max, sp, true);
+  encode_draft_impl(e, s, d, P_max, sp, true, tree_);
 }
 
 void DFlash2::encode_cycle(Encoder& e, Seq& s, DFlashSeq& d, int P, int m_prev, int K, const SamplingParams& sp) {
