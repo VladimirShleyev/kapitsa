@@ -2,6 +2,10 @@
 // random data at several context lengths, including P > 2047 (wrapped ring, per-row window bound
 // j >= P + r - 2047, SPEC §5). Also times both kernels.
 //   dflash_attn_test [P ...]   (default 1 85 700 2047 2048 2055 4100 9000)
+// Then dfl_attn_qk (fused q / k norm + RoPE) against dfl_qk_prep + dfl_attn_mma at 8 / 16 / 32 splits, host- and
+// GPU-planned. DAT_MMA_ONLY=1 skips the scalar kernel (its threadgroup memory exceeds what the two Metal validation
+// layers together allow), DAT_REPS=n times n back-to-back pairs per command buffer, DAT_PARTS=1/2 only the attention
+// / the reduce, DAT_SRC=<file> + DAT_KERNEL=<name> (+ DAT_THREADS) a variant appended to the library.
 #include "metal/gpu.h"
 #include "model/dflash2.h"
 #include "model/kparams.h"
@@ -23,6 +27,17 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) Ps.push_back(atoi(argv[i]));
   if (Ps.empty()) Ps = {1, 85, 700, 2047, 2048, 2055, 4100, 9000};
   Gpu& g = Gpu::get();
+  if (const char* src = getenv("DAT_SRC")) {  // extra kernel source (variants of dfl_attn_qk, picked by DAT_KERNEL)
+    FILE* f = fopen(src, "rb");
+    std::string x;
+    if (f) {
+      char buf[4096];
+      size_t n;
+      while ((n = fread(buf, 1, sizeof buf, f)) > 0) x.append(buf, n);
+      fclose(f);
+    }
+    g.compile(x);
+  }
   std::mt19937 rng(7);
   std::normal_distribution<float> nd(0.0f, 1.0f);
   const int R = 8, HQ = 32, HKV = 8, D = 128, W = 2048, S = 32;
@@ -182,20 +197,25 @@ int main(int argc, char** argv) {
             e->commit_and_wait();
           }
           const uint32_t c2 = gpu ? 0u : chunk, n2 = gpu ? splits : nsplit;
+          static const int parts = getenv("DAT_PARTS") ? atoi(getenv("DAT_PARTS")) : 3;  // 1 attention, 2 reduce
           auto enc = [&](Encoder& e) {
             kp::DflAttnQk ap{Pk, gpu ? 0u : lo, c2, n2, scale, 1e-6f, 4096, 2048};
-            e.use(g.pipeline("dfl_attn_qk"));
-            e.buf(0, q); e.buf(1, kv); e.buf(2, qn); e.buf(3, kn); e.buf(4, cs); e.buf(5, rk); e.buf(6, rv);
-            e.buf(7, po); e.buf(8, pml);
-            e.val(9, ap);
-            e.buf(10, gst);
-            e.dispatch(n2, 8, 1, 128);
-            kp::DflAttnRed rp{n2, Pk, gpu ? 0u : lo, c2};
-            e.use(pr);
-            e.buf(0, po); e.buf(1, pml); e.buf(2, xh2); e.buf(3, xs2);
-            e.val(4, rp);
-            e.buf(5, gst);
-            e.dispatch(32, 8, 1, 128);
+            if (parts & 1) {
+              e.use(g.pipeline(getenv("DAT_KERNEL") ? getenv("DAT_KERNEL") : "dfl_attn_qk"));
+              e.buf(0, q); e.buf(1, kv); e.buf(2, qn); e.buf(3, kn); e.buf(4, cs); e.buf(5, rk); e.buf(6, rv);
+              e.buf(7, po); e.buf(8, pml);
+              e.val(9, ap);
+              e.buf(10, gst);
+              e.dispatch(n2, 8, 1, getenv("DAT_THREADS") ? uint32_t(atoi(getenv("DAT_THREADS"))) : 128u);
+            }
+            if (parts & 2) {
+              kp::DflAttnRed rp{n2, Pk, gpu ? 0u : lo, c2};
+              e.use(pr);
+              e.buf(0, po); e.buf(1, pml); e.buf(2, xh2); e.buf(3, xs2);
+              e.val(4, rp);
+              e.buf(5, gst);
+              e.dispatch(32, 8, 1, 128);
+            }
           };
           {
             auto e = g.begin();
