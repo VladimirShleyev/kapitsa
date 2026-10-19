@@ -126,9 +126,12 @@ struct V8Knobs {
   // 8192 conv / attention projections, 16384 ring commit. With NI_AB: the in-pipeline cost of those kernels.
   int skip = 0;
   int pad = 0;  // timing only: this many empty dispatches after every verify GEMM (the per-dispatch cost, with NI_AB)
+  int emu = -1;  // MMA-exact small-expert passes (NI_V8_MOE_EMU, see enc_moe8): -1 = the environment's, else 0-2
+  int split = -1;  // NI_V8_MOE_SPLIT: experts with 3..split rows as 2-row small tiles (-1 = the environment's)
 };
 V8Knobs& v8_knobs();
-// "key=value,..." over a copy of `base` (keys: cm, pair, kplan, gusplit, gdnsplit, prepu, skip, pad); unknown keys are fatal
+// "key=value,..." over a copy of `base` (keys: cm, pair, kplan, gusplit, gdnsplit, prepu, skip, pad, emu); unknown keys are
+// fatal
 V8Knobs v8_knobs_parse(const char* spec, V8Knobs base);
 
 class Qwen35 : public Model {
@@ -308,6 +311,8 @@ class Qwen35 : public Model {
   // passes for 1-2-row experts): a row's logits then depend only on the rows before it, not on how the
   // other rows route. A speculative sampler that needs p(. | prefix) exactly sets it (~3% slower verify).
   void set_verify_moe_exact(bool on) { v8_moe_exact_ = on; }
+  // dev (tools/bench_verify8): the last verify's MoE expert passes again with layer li's weights (timing only)
+  void moe8_replay(Encoder& e, int li, int mask);
   // The 8-row verify GEMMs, for other 8-row passes (the DFlash2 drafter). Inputs are X8 tables
   // (verify8.metal layout: half operands in fragment order + per-64 group sums), R <= 8 live rows.
   struct Seg8 {
@@ -539,7 +544,7 @@ class Qwen35 : public Model {
   bool v8_ready_ = false;
   Buffer v8g_, v8u_;  // split MLP: fp32 gate / up rows [8][I]
   Buffer v8cnt_;      // gdn_step_verify8s: per-head arrival counters (zero between dispatches)
-  Buffer v8t_, v8s_, v8tl_, v8sl_, v8h_, v8hs_, v8tiles_, v8nt_, v8slot_, v8args_, v8out_, v8sh_, v8ustat_, v8sm_, v8hsc_, v8xn_;
+  Buffer v8t_, v8s_, v8tl_, v8sl_, v8h_, v8hs_, v8tiles_, v8nt_, v8slot_, v8args_, v8out_, v8sh_, v8ustat_, v8sm_, v8hsc_, v8xn_, v8hse_;
 };
 
 } // namespace ni

@@ -788,6 +788,7 @@ struct Moe8PlanParams {
   uint small;   // experts with <= small rows take the scalar passes (0: none, max 2)
   uint sgu_gx, sdn_gx;
   uint rlim;    // 1: route only rows < min(R, rows[0]) (a drafter's dynamic verify depth; later rows are dropped)
+  uint split;   // experts with small < rows <= split become ceil(rows / 2) small tiles (>= small; MMA-exact passes)
 };
 
 [[kernel]] void moe8_plan(const device uint* ridx [[buffer(0)]], device uint* tiles [[buffer(1)]],
@@ -798,8 +799,8 @@ struct Moe8PlanParams {
                           uint tid [[thread_position_in_threadgroup]], uint ntg [[threads_per_threadgroup]],
                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
   threadgroup uint ids[64];
-  threadgroup uint cnt[2][32];
-  threadgroup uint total[2];
+  threadgroup uint cnt[3][32];
+  threadgroup uint total[3];
   const uint R = p.rlim ? min(p.R, rows_lim[0]) : p.R;
   const uint n = R * p.k;
   if (tid < n) ids[tid] = ridx[tid];
@@ -815,15 +816,19 @@ struct Moe8PlanParams {
         if (ids[t * p.k + j] == e) my[t] = j;
     rows += my[t] != 0xffffffffu ? 1u : 0u;
   }
-  const bool scal = rows > 0 && rows <= p.small, mma = rows > p.small;
+  // small tiles: 1 for rows <= small, ceil(rows / 2) for small < rows <= split (2 rows each, MMA-exact passes only)
+  const uint nsm = rows == 0 ? 0u : rows <= p.small ? 1u : rows <= p.split ? (rows + 1) / 2 : 0u;
+  const bool scal = nsm > 0, mma = rows > 0 && !scal;
   const uint pre_m = simd_prefix_exclusive_sum(mma ? 1u : 0u);
-  const uint pre_s = simd_prefix_exclusive_sum(scal ? 1u : 0u);
+  const uint pre_s = simd_prefix_exclusive_sum(nsm);
+  const uint used = simd_sum(rows > 0 ? 1u : 0u);  // distinct experts (stats)
   if (lane == 31) {
     cnt[0][sg] = pre_m + (mma ? 1u : 0u);
-    cnt[1][sg] = pre_s + (scal ? 1u : 0u);
+    cnt[1][sg] = pre_s + nsm;
+    cnt[2][sg] = used;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (tid < 2) {
+  if (tid < 3) {
     uint a = 0;
     for (uint i = 0; i < (ntg + 31) / 32; ++i) {
       const uint c = cnt[tid][i];
@@ -839,18 +844,18 @@ struct Moe8PlanParams {
     for (uint t = 0; t < 8; ++t) slot[u * 8 + t] = my[t];
   }
   if (scal) {
-    const uint si = cnt[1][sg] + pre_s;
-    sm[si] = e;
-    uint i = 0;
+    const uint s0 = cnt[1][sg] + pre_s;
+    for (uint q = 0; q < nsm; ++q) sm[s0 + q] = e;
+    uint i = 0;  // the expert's i-th row goes to tile s0 + i / 2, position i % 2
     for (uint t = 0; t < 8; ++t)
       if (my[t] != 0xffffffffu) {
-        sm[64 + 2 * si + i] = t;
-        sm[192 + 2 * si + i] = my[t];
+        sm[64 + 2 * s0 + i] = t;
+        sm[192 + 2 * s0 + i] = my[t];
         ++i;
       }
-    for (; i < 2; ++i) {
-      sm[64 + 2 * si + i] = 0xffffffffu;
-      sm[192 + 2 * si + i] = 0xffffffffu;
+    for (; i < 2 * nsm; ++i) {
+      sm[64 + 2 * s0 + i] = 0xffffffffu;
+      sm[192 + 2 * s0 + i] = 0xffffffffu;
     }
   }
   const uint U = total[0], S = total[1];
@@ -859,7 +864,7 @@ struct Moe8PlanParams {
     tiles[U] = 0xffffffffu;
     ntiles[0] = U + 1;
     ntiles[1] = S;
-    stats[p.layer] = U + S;
+    stats[p.layer] = total[2];
     args[0] = p.gu_gx; args[1] = U + 1; args[2] = 1;
     args[3] = p.dn_gx; args[4] = U + 1; args[5] = 1;
     args[6] = p.sgu_gx; args[7] = max(S, 1u); args[8] = 1;
@@ -1076,6 +1081,348 @@ NI_INLINE void v8s_dot2t(const device uint32_t* w, const device bfloat* scales, 
     out[(t0 * p.k + j0) * p.N + row0 + lane] = a0;
     if (two) out[(t1r * p.k + j1) * p.N + row0 + lane] = a1;
   }
+}
+
+// ---- MMA-exact scalar passes for experts used by 1-2 rows ----
+// A sampled (T > 0) verify needs row-independent MoE numerics: a row's expert outputs may not depend on which other
+// rows route to the same expert, so it cannot mix the scalar passes above (fp32 inputs, their own sums) with the MMA
+// tiles. These passes give the 1-2 rows of a small tile bitwise the values an 8-row MMA tile gives them, at about the
+// scalar passes' cost, so sampled verifies can split the experts as greedy ones do.
+// simdgroup_multiply_accumulate (half x half + float, 8x8x8) adds an output's 8 products (exact in fp32) to C one at a
+// time in k order, rounding to fp32 after each (tools/mma_probe: every one of 2^19 random outputs on the M5 Max;
+// mma_chain_check below re-checks it on the GPU at hand before these passes are used). A tile's 64-group of one
+// (output, row) is then a chain of 64 fp32 FMAs in the order of its 8 MMAs (m) and their k-slots (s):
+//   step 8 m + s adds code(k) * x[k],  k = 16 (s / 2) + 8 (m / 4) + (m % 4) + 4 (s % 2)
+// (word 2 (s / 2) + m / 4 of the group, nibble (m % 4) + 4 (s % 2)), followed by the tile kernel's group epilogue.
+// Lanes run one group's chains each (the gate/up pass: the 32 lanes are the 32 groups of a 2048-wide row, 1 KB
+// coalesced weight reads); the epilogue chains over the groups then run one per lane from threadgroup memory.
+NI_INLINE constexpr uint v8e_word(uint m, uint s) { return 2 * (s / 2) + m / 4; }
+NI_INLINE constexpr uint v8e_nib(uint m, uint s) { return (m % 4) + 4 * (s % 2); }
+NI_INLINE constexpr uint v8e_k(uint m, uint s) { return 8 * v8e_word(m, s) + v8e_nib(m, s); }
+
+struct Moe8eParams {
+  uint K, N;  // input width, output columns
+  uint w_stride, s_stride;
+  uint k;     // top-k (down: the output slots)
+};
+
+// The passes over tiles of up to RT rows. RT 2: moe8_plan's small tiles (experts with 3-4 rows become two of them:
+// 35B, 64 tokens teacher-forced, sampled-verify numerics: 10.81 ms per verify vs 11.05 with those experts on MMA tiles);
+// RT 4 compiles too (4 simdgroups per gate/up threadgroup for its threadgroup memory) but ran slower than the split
+// (11.98: too few threadgroups for the few such experts). Tile list (MT tiles at most): sm[s] = expert,
+// sm[MT + RT s + i] = row i, sm[MT + MT RT + RT s + i] = its top-k slot (0xffffffff past the tile's rows, which come
+// first). h and its group sums per tile row: hs[(RT s + i) * N], hsum[(RT s + i) * N / 64].
+NI_INLINE constexpr uint v8e_mt(uint rt) { return rt == 2 ? 64 : 32; }
+NI_INLINE constexpr uint v8e_lrt(uint rt) { return rt == 2 ? 1 : 2; }  // log2(RT)
+// the tile's rows (dead entries: row 0) and live row count
+template <uint RT>
+NI_INLINE uint v8e_tile_rows(const device uint* sm, uint s, thread uint (&t)[RT]) {
+  constexpr uint MT = v8e_mt(RT);
+  uint n = 0;
+  _Pragma("clang loop unroll(full)")
+  for (uint i = 0; i < RT; ++i) {
+    t[i] = sm[MT + RT * s + i];
+    n += t[i] != 0xffffffffu ? 1u : 0u;
+  }
+  _Pragma("clang loop unroll(full)")
+  for (uint i = 1; i < RT; ++i) t[i] = i < n ? t[i] : t[0];
+  return n;
+}
+
+// gate/up + SwiGLU: grid (N / 64, max(tiles, 1)) x 32 NSG threads; simdgroup sg owns columns 64 / NSG sg ..
+// (the tile kernel's column slices of 8), 2 per pass: gate and up rows of both = 4 weight rows, 4 RT chains per lane.
+template <uint RT, uint NSG>
+NI_INLINE void moe8e_gu_t(const device uint32_t* Wg, const device ushort* Sg, const device ushort* Bg,
+                          const device uint32_t* Wu, const device ushort* Su, const device ushort* Bu,
+                          const device half* table, const device float* sums, device float* hs, device float* hsum,
+                          constant Moe8eParams& p, const device uint* sm, const device uint* ntiles, uint2 tg, uint tid,
+                          uint sg, uint lane, threadgroup vec<half, RT>* xa, threadgroup vec<half, RT>* xb,
+                          threadgroup float* dots, threadgroup float* hv, threadgroup float* red,
+                          threadgroup float* tsx) {
+  constexpr uint CPS = 64 / NSG, P = CPS / 2, LRT = v8e_lrt(RT);
+  constexpr uint gpr = 32, wpr = 256;  // K == 2048: lane = group
+  if (tg.y >= ntiles[RT == 2 ? 1 : 2]) return;
+  const uint e = sm[tg.y];
+  uint t[RT];
+  const uint nr = v8e_tile_rows<RT>(sm, tg.y, t);
+  if (tid < 32)
+    _Pragma("clang loop unroll(full)")
+    for (uint r = 0; r < RT; ++r) tsx[r * 32 + tid] = sums[tid * kV8 + t[r]];
+  for (uint i = tid; i < 32 * 32; i += 32 * NSG) {  // [m * 4 + slot pair j][group]: steps 2j (xa), 2j + 1 (xb)
+    const uint sp = i / 32, g = i % 32, m = sp / 4, j = sp % 4, ka = v8e_k(m, 2 * j), kb = v8e_k(m, 2 * j + 1);
+    vec<half, RT> a, b;
+    _Pragma("clang loop unroll(full)")
+    for (uint r = 0; r < RT; ++r) {
+      a[r] = table[v8_tab(g, ka, t[r])];
+      b[r] = table[v8_tab(g, kb, t[r])];
+    }
+    xa[i] = a;
+    xb[i] = b;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const device uint32_t* G = Wg + e * p.w_stride;
+  const device uint32_t* U = Wu + e * p.w_stride;
+  const device ushort *Gs = Sg + e * p.s_stride, *Gb = Bg + e * p.s_stride;
+  const device ushort *Us = Su + e * p.s_stride, *Ub = Bu + e * p.s_stride;
+  threadgroup float* dt = dots + sg * (2 * 2 * RT * 32);
+  // epilogue lane: (column, gate/up, row, k-slice of the tile kernel's 2-way K split)
+  const uint eslice = lane & 1, etrow = (lane >> 1) & (RT - 1), emat = (lane >> (1 + LRT)) & 1,
+             ecol = (lane >> (2 + LRT)) & 1;
+  for (uint pp = 0; pp < P; ++pp) {
+    const uint c0 = tg.x * 64 + sg * CPS + pp * 2;
+    uint4 w[4][2];  // gate c0, gate c0 + 1, up c0, up c0 + 1: this lane's group
+    _Pragma("clang loop unroll(full)")
+    for (int r = 0; r < 4; ++r) {
+      const device uint4* src = (const device uint4*)((r < 2 ? G : U) + (c0 + (r & 1)) * wpr + lane * 8);
+      w[r][0] = src[0];
+      w[r][1] = src[1];
+    }
+    // the epilogue lane's 16 scales and biases, requested ahead of the chains
+    const uint en = c0 + ecol;
+    const device uint4* esp = (const device uint4*)((emat ? Us : Gs) + en * gpr + eslice * 16);
+    const device uint4* ebp = (const device uint4*)((emat ? Ub : Gb) + en * gpr + eslice * 16);
+    const uint4 es0 = esp[0], es1 = esp[1], eb0 = ebp[0], eb1 = ebp[1];
+    float d[4][RT];
+    _Pragma("clang loop unroll(full)")
+    for (int r = 0; r < 4; ++r)
+      _Pragma("clang loop unroll(full)")
+      for (uint q = 0; q < RT; ++q) d[r][q] = 0.0f;
+    // MMAs 0-3 take the group's even words, 4-7 the odd ones; a code pair (one shift + AND) is slots 2j, 2j + 1
+    // (a rolled loop: the fully unrolled 32 steps made 3x the code and ran slower)
+    for (uint mh = 0; mh < 2; ++mh) {
+      uint4 wv[4];
+      _Pragma("clang loop unroll(full)")
+      for (int r = 0; r < 4; ++r)
+        wv[r] = mh ? uint4(w[r][0].y, w[r][0].w, w[r][1].y, w[r][1].w) : uint4(w[r][0].x, w[r][0].z, w[r][1].x, w[r][1].z);
+      for (uint m4 = 0; m4 < 4; ++m4) {
+        const uint m = mh * 4 + m4, sh = 4 * m4;
+        _Pragma("clang loop unroll(full)")
+        for (uint j = 0; j < 4; ++j) {
+          const vec<half, RT> x0 = xa[(m * 4 + j) * 32 + lane], x1 = xb[(m * 4 + j) * 32 + lane];
+          _Pragma("clang loop unroll(full)")
+          for (int r = 0; r < 4; ++r) {
+            const half2 c = as_type<half2>((wv[r][j] >> sh) & 0x000F000Fu);
+            _Pragma("clang loop unroll(full)")
+            for (uint q = 0; q < RT; ++q) d[r][q] = fma(float(c.x), float(x0[q]), d[r][q]);
+            _Pragma("clang loop unroll(full)")
+            for (uint q = 0; q < RT; ++q) d[r][q] = fma(float(c.y), float(x1[q]), d[r][q]);
+          }
+        }
+      }
+    }
+    _Pragma("clang loop unroll(full)")
+    for (int r = 0; r < 4; ++r)
+      _Pragma("clang loop unroll(full)")
+      for (uint q = 0; q < RT; ++q) dt[(((r & 1) * 2 + (r >> 1)) * RT + q) * 32 + lane] = d[r][q];
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    {
+      const threadgroup float* dd = dt + ((ecol * 2 + emat) * RT + etrow) * 32 + eslice * 16;
+      const threadgroup float* sx = tsx + etrow * 32 + eslice * 16;
+      float acc = 0.0f;
+      _Pragma("clang loop unroll(full)")
+      for (uint i = 0; i < 16; ++i) {
+        const uint sw = (i < 8 ? es0 : es1)[(i % 8) / 2], bw = (i < 8 ? eb0 : eb1)[(i % 8) / 2];
+        const ushort sb = ushort(i & 1 ? sw >> 16 : sw & 0xffffu), bb = ushort(i & 1 ? bw >> 16 : bw & 0xffffu);
+        acc = fma(dd[i], v8_bf(sb) * kV8Sub, acc);
+        acc = fma(sx[i], v8_bf(bb), acc);
+      }
+      acc += simd_shuffle_xor(acc, 1u);  // the k-slices' sum (v8_reduce)
+      const float o = simd_shuffle_xor(acc, 1u << (1 + LRT));
+      const half h = half(silu(emat ? o : acc) * (emat ? acc : o));
+      if (lane < 8 * RT && emat == 0 && eslice == 0) {
+        hv[(sg * CPS + pp * 2 + ecol) * RT + etrow] = float(h);
+        if (etrow < nr) hs[(RT * tg.y + etrow) * p.N + en] = float(h);
+      }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  {  // group sums of h: lane = (column fm of an 8-column slice, (slice, row) combo): the tile kernel's butterfly
+    const uint2 rc = v8_lane(lane);
+    const uint fm = rc.x, cl = rc.y >> 1;
+    constexpr uint NC = CPS / 8 * RT;  // (slice, row) combos of this simdgroup
+    _Pragma("clang loop unroll(full)")
+    for (uint c0 = 0; c0 < NC; c0 += 4) {
+      const uint c = c0 + cl, ci = c / RT, trow = c % RT;
+      float ps = c < NC ? hv[(sg * CPS + ci * 8 + fm) * RT + trow] : 0.0f;
+      ps += simd_shuffle_xor(ps, 2u);
+      ps += simd_shuffle_xor(ps, 4u);
+      ps += simd_shuffle_xor(ps, 16u);
+      if (fm == 0 && c < NC) red[(sg * (CPS / 8) + ci) * kV8 + trow] = ps;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0 && lane < RT) {
+    float s = red[lane];
+    for (uint i = 1; i < 8; ++i) s += red[i * kV8 + lane];
+    if (lane < nr) hsum[(RT * tg.y + lane) * (p.N / 64) + tg.x] = s;
+  }
+}
+#define NI_MOE8E_GU_T(NAME, RT, NSG)                                                                            \
+  [[kernel]] void NAME(const device uint32_t* Wg [[buffer(0)]], const device ushort* Sg [[buffer(1)]],          \
+                       const device ushort* Bg [[buffer(2)]], const device uint32_t* Wu [[buffer(3)]],          \
+                       const device ushort* Su [[buffer(4)]], const device ushort* Bu [[buffer(5)]],            \
+                       const device half* table [[buffer(6)]], const device float* sums [[buffer(7)]],          \
+                       device float* hs [[buffer(8)]], device float* hsum [[buffer(9)]],                        \
+                       constant Moe8eParams& p [[buffer(10)]], const device uint* sm [[buffer(11)]],            \
+                       const device uint* ntiles [[buffer(12)]], uint2 tg [[threadgroup_position_in_grid]],     \
+                       uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],    \
+                       uint lane [[thread_index_in_simdgroup]]) {                                               \
+    threadgroup vec<half, RT> xa[32 * 32], xb[32 * 32];                                                         \
+    threadgroup float dots[NSG * 2 * 2 * RT * 32];                                                              \
+    threadgroup float hv[64 * RT];                                                                              \
+    threadgroup float red[8 * kV8];                                                                             \
+    threadgroup float tsx[RT * 32];                                                                             \
+    moe8e_gu_t<RT, NSG>(Wg, Sg, Bg, Wu, Su, Bu, table, sums, hs, hsum, p, sm, ntiles, tg, tid, sg, lane, xa, xb, dots, \
+                        hv, red, tsx);                                                                          \
+  }
+NI_MOE8E_GU_T(moe8e_gu_r2, 2, 8)
+
+// down (K == 512): grid (N / 128, max(tiles, 1)) x 128 threads; lane = (column c of 4, group g of 8), columns
+// n0 + 4 i + c (i < 4) per pass (4 RT chains), two passes of 16 columns per simdgroup. Codes as 1024 + q (the down
+// tile's CM 0 operands), inputs h from moe8e_gu_t; writes out[(t * k + slot) * N] as moe8_down does.
+template <uint RT>
+NI_INLINE void moe8e_down_t(const device uint32_t* W, const device ushort* S, const device ushort* B,
+                            const device float* hs, const device float* hsum, device float* out,
+                            constant Moe8eParams& p, const device uint* sm, const device uint* ntiles, uint2 tg,
+                            uint tid, uint sg, uint lane, threadgroup vec<half, RT>* xa, threadgroup vec<half, RT>* xb,
+                            threadgroup float* dots, threadgroup float* tsx) {
+  constexpr uint MT = v8e_mt(RT), gpr = 8, wpr = 64, NSG = 4;
+  if (tg.y >= ntiles[RT == 2 ? 1 : 2]) return;
+  const uint e = sm[tg.y];
+  uint t[RT], jj[RT];
+  const uint nr = v8e_tile_rows<RT>(sm, tg.y, t);
+  _Pragma("clang loop unroll(full)")
+  for (uint i = 0; i < RT; ++i) jj[i] = sm[MT + MT * RT + RT * tg.y + i];
+  if (tid < 8)
+    _Pragma("clang loop unroll(full)")
+    for (uint r = 0; r < RT; ++r) tsx[r * 8 + tid] = hsum[(RT * tg.y + (r < nr ? r : 0)) * gpr + tid];
+  for (uint i = tid; i < 32 * 8; i += 32 * NSG) {
+    const uint sp = i / 8, g = i % 8, m = sp / 4, j = sp % 4;
+    const uint ka = 64 * g + v8e_k(m, 2 * j), kb = 64 * g + v8e_k(m, 2 * j + 1);
+    vec<half, RT> a, b;
+    _Pragma("clang loop unroll(full)")
+    for (uint r = 0; r < RT; ++r) {
+      const device float* hr = hs + (RT * tg.y + (r < nr ? r : 0)) * p.K;
+      a[r] = half(hr[ka]);
+      b[r] = half(hr[kb]);
+    }
+    xa[i] = a;
+    xb[i] = b;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const device uint32_t* Wb = W + e * p.w_stride;
+  const device ushort* Sb = S + e * p.s_stride;
+  const device ushort* Bb = B + e * p.s_stride;
+  const uint c4 = lane >> 3, g = lane & 7;
+  threadgroup float* dt = dots + sg * (16 * RT * 8);
+  for (uint pp = 0; pp < 2; ++pp) {
+    const uint n0 = tg.x * 128 + sg * 32 + pp * 16;
+    uint4 w[4][2];
+    _Pragma("clang loop unroll(full)")
+    for (int c = 0; c < 4; ++c) {
+      const device uint4* src = (const device uint4*)(Wb + (n0 + 4 * c + c4) * wpr + g * 8);
+      w[c][0] = src[0];
+      w[c][1] = src[1];
+    }
+    const uint en = n0 + (lane >> 1);  // the epilogue lane's column: its 8 scales and biases, requested ahead
+    const uint4 es = *(const device uint4*)(Sb + en * gpr), eb = *(const device uint4*)(Bb + en * gpr);
+    float d[4][RT];
+    _Pragma("clang loop unroll(full)")
+    for (int c = 0; c < 4; ++c)
+      _Pragma("clang loop unroll(full)")
+      for (uint q = 0; q < RT; ++q) d[c][q] = 0.0f;
+    for (uint mh = 0; mh < 2; ++mh) {
+      uint4 wv[4];
+      _Pragma("clang loop unroll(full)")
+      for (int c = 0; c < 4; ++c)
+        wv[c] = mh ? uint4(w[c][0].y, w[c][0].w, w[c][1].y, w[c][1].w) : uint4(w[c][0].x, w[c][0].z, w[c][1].x, w[c][1].z);
+      for (uint m4 = 0; m4 < 4; ++m4) {
+        const uint m = mh * 4 + m4, sh = 4 * m4;
+        _Pragma("clang loop unroll(full)")
+        for (uint j = 0; j < 4; ++j) {
+          const vec<half, RT> x0 = xa[(m * 4 + j) * 8 + g], x1 = xb[(m * 4 + j) * 8 + g];
+          _Pragma("clang loop unroll(full)")
+          for (int c = 0; c < 4; ++c) {
+            const half2 a = as_type<half2>(((wv[c][j] >> sh) & 0x000F000Fu) | 0x64006400u);
+            _Pragma("clang loop unroll(full)")
+            for (uint q = 0; q < RT; ++q) d[c][q] = fma(float(a.x), float(x0[q]), d[c][q]);
+            _Pragma("clang loop unroll(full)")
+            for (uint q = 0; q < RT; ++q) d[c][q] = fma(float(a.y), float(x1[q]), d[c][q]);
+          }
+        }
+      }
+    }
+    _Pragma("clang loop unroll(full)")
+    for (int c = 0; c < 4; ++c)
+      _Pragma("clang loop unroll(full)")
+      for (uint q = 0; q < RT; ++q) dt[((4 * c + c4) * RT + q) * 8 + g] = d[c][q];
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    _Pragma("clang loop unroll(full)")
+    for (uint u = 0; u < RT / 2; ++u) {  // epilogue: lane = (column, row parity), rows lane & 1, + 2, ...
+      const uint col = lane >> 1, trow = (lane & 1) + 2 * u;
+      const threadgroup float* dd = dt + (col * RT + trow) * 8;
+      const threadgroup float* hsr = tsx + trow * 8;
+      float acc = 0.0f;
+      _Pragma("clang loop unroll(full)")
+      for (uint gi = 0; gi < gpr; ++gi) {
+        const uint sw = es[gi / 2], bw = eb[gi / 2];
+        const float s = v8_bf(ushort(gi & 1 ? sw >> 16 : sw & 0xffffu)), bi = v8_bf(ushort(gi & 1 ? bw >> 16 : bw & 0xffffu));
+        acc = fma(dd[gi], s, acc);
+        acc = fma(hsr[gi], fma(-1024.0f, s, bi), acc);
+      }
+      const uint tr = (lane & 1) ? t[1 + 2 * u] : t[2 * u], js = (lane & 1) ? jj[1 + 2 * u] : jj[2 * u];
+      if (trow < nr) out[(tr * p.k + js) * p.N + en] = acc;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}
+#define NI_MOE8E_DOWN_T(NAME, RT)                                                                               \
+  [[kernel]] void NAME(const device uint32_t* W [[buffer(0)]], const device ushort* S [[buffer(1)]],           \
+                       const device ushort* B [[buffer(2)]], const device float* hs [[buffer(3)]],             \
+                       const device float* hsum [[buffer(4)]], device float* out [[buffer(5)]],                \
+                       constant Moe8eParams& p [[buffer(6)]], const device uint* sm [[buffer(7)]],             \
+                       const device uint* ntiles [[buffer(8)]], uint2 tg [[threadgroup_position_in_grid]],     \
+                       uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],   \
+                       uint lane [[thread_index_in_simdgroup]]) {                                              \
+    threadgroup vec<half, RT> xa[32 * 8], xb[32 * 8];                                                          \
+    threadgroup float dots[4 * 16 * RT * 8];                                                                   \
+    threadgroup float tsx[RT * 8];                                                                             \
+    moe8e_down_t<RT>(W, S, B, hs, hsum, out, p, sm, ntiles, tg, tid, sg, lane, xa, xb, dots, tsx);             \
+  }
+NI_MOE8E_DOWN_T(moe8e_down_r2, 2)
+
+// GPU self-check of the MMA rounding the moe8e passes rely on: grid (64) x 32 threads; threadgroup i chains two
+// MMAs on pseudo-random operands (A: 4-bit codes as subnormal halves for even i, as 1024 + q for odd i; B: halves
+// over a wide exponent range; C: fp32) and compares each element with the 16-step fp32 FMA chain; mismatches are
+// counted into bad[0].
+NI_INLINE uint v8e_hash(uint x) {
+  x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+  return x;
+}
+NI_INLINE uint v8e_q(uint i, uint mm, uint r, uint c) { return v8e_hash(i * 977u + mm * 131u + r * 8u + c) & 15u; }
+NI_INLINE half v8e_a(uint i, uint q) { return (i & 1) ? half(1024.0h + half(q)) : as_type<half>(ushort(q)); }
+NI_INLINE float v8e_af(uint i, uint q) { return (i & 1) ? float(1024u + q) : float(q) * as_type<float>((127u - 24u) << 23); }
+NI_INLINE half v8e_b(uint i, uint mm, uint r, uint c) {
+  const uint h = v8e_hash(0x9e3779b9u ^ (i * 1543u + mm * 257u + r * 8u + c));
+  const float v = float(1024u + (h & 1023u)) * as_type<float>((127u - 10u - 14u + ((h >> 10) % 19u)) << 23);
+  return half((h >> 31) ? -v : v);
+}
+[[kernel]] void mma_chain_check(device atomic_uint* bad [[buffer(0)]], uint i [[threadgroup_position_in_grid]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+  const uint2 rc = v8_lane(lane);
+  const uint fm = rc.x, fn = rc.y;
+  float2 c = float2(as_type<float>((v8e_hash(i * 31u + lane) & 0x807fffffu) | 0x3c000000u),
+                    as_type<float>((v8e_hash(i * 37u + lane + 7u) & 0x807fffffu) | 0x3a800000u));
+  float2 ref = c;
+  for (uint mm = 0; mm < 2; ++mm) {
+    v8_mma(c, half2(v8e_a(i, v8e_q(i, mm, fm, fn)), v8e_a(i, v8e_q(i, mm, fm, fn + 1))),
+           half2(v8e_b(i, mm, fm, fn), v8e_b(i, mm, fm, fn + 1)));
+    for (uint e2 = 0; e2 < 2; ++e2)
+      for (uint kk = 0; kk < 8; ++kk) ref[e2] = fma(v8e_af(i, v8e_q(i, mm, fm, kk)), float(v8e_b(i, mm, kk, fn + e2)), ref[e2]);
+  }
+  const uint n = (as_type<uint>(c.x) != as_type<uint>(ref.x) ? 1u : 0u) + (as_type<uint>(c.y) != as_type<uint>(ref.y) ? 1u : 0u);
+  if (n) atomic_fetch_add_explicit(bad, n, memory_order_relaxed);
 }
 
 // ---- attention for R <= 8 rows sharing each K/V tile ----
