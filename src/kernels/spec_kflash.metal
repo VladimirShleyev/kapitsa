@@ -212,13 +212,14 @@ struct KfAttnParams {
 }
 
 // Candidate dot products of the front rows, one threadgroup per (row f, candidate k): the LM-head row e = E_out[c]
-// (c = C_{dep+1}[k]) against z_f and the acceptance head's two w_e rows, and its sum of squares ->
+// (c = C_{dep+1}[k], read from the drafter's draft head at the candidate's column: the target's LM head or its rows
+// copied to 4 / 8 bits) against z_f and the acceptance head's two w_e rows, and its sum of squares ->
 // cd[f][k] = (<z, e>, <w_e[0], e>, <w_e[1], e>, sum e^2). grid (8 rows, 32 candidates) x 256.
 struct KfCandParams {
   uint H, out_bits;
 };
 [[kernel]] void kf_cand(const device KFlashTree* t [[buffer(0)]], const device float* z [[buffer(1)]],
-                        const device int* cand_i [[buffer(2)]], const device uint32_t* OW [[buffer(3)]],
+                        const device int* cand_col [[buffer(2)]], const device uint32_t* OW [[buffer(3)]],
                         const device bfloat* OS [[buffer(4)]], const device bfloat* OB [[buffer(5)]],
                         const device float* we [[buffer(6)]], device float4* cd [[buffer(7)]],
                         constant KfCandParams& p [[buffer(8)]], uint2 tg [[threadgroup_position_in_grid]],
@@ -228,7 +229,7 @@ struct KfCandParams {
   const uint f = tg.x, k = tg.y, H = p.H, ntg = nsg * 32;
   if (f >= t->n_front) return;
   const uint node = t->front[f];
-  const uint c = uint(cand_i[uint(t->depth[node]) * kKfCand + k]);
+  const uint c = uint(cand_col[uint(t->depth[node]) * kKfCand + k]);
   const device float* zr = z + size_t(f) * H;
   float4 acc = float4(0.0f);
   for (uint i = 2 * tid; i < H; i += 2 * ntg) {
@@ -394,13 +395,14 @@ NI_INLINE float kf_wy_dot(const device float* wy, const device float* y, constan
                          const device float* wy [[buffer(10)]], device int* tokens [[buffer(11)]],
                          device float* qprob [[buffer(12)]], device int* walk_k [[buffer(13)]],
                          device float* walk_s [[buffer(14)]], constant KfSoftParams& p [[buffer(15)]],
+                         const device int* cand_col [[buffer(16)]],
                          uint f [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]]) {
   threadgroup float4 cdl[kKfCand];
   threadgroup float ay[1];
   if (f >= t->n_front) return;
   const uint node = t->front[f];
-  const uint c = uint(cand_i[uint(t->depth[node]) * kKfCand + sg]);
+  const uint c = uint(cand_col[uint(t->depth[node]) * kKfCand + sg]);
   const float4 acc = simd_sum(kf_dots8(OW, OS, OB, c, p.H, p.out_bits, z + size_t(f) * p.H, we, lane));
   if (lane == 0) cdl[sg] = acc;
   if (sg == 1) {
@@ -579,12 +581,16 @@ NI_INLINE void kf_simd_top32(thread float* v, thread uint* id, uint lane, thread
   }
 }
 // grid (nchunks, rows) x 256 over chunks of 2048: out[(r * nchunks + chunk) * 32 + q], ordered. has_id as dfl_top16
-// (0: the index, 1: src_id[r * ld + k], 2: src_id[k]).
+// (0: the index, 1: src_id[r * ld + k], 2: src_id[k]). The stages carry draft-head columns; the last one also writes
+// the token ids: map = 1 tok[o] = head_ids[oi[o]] (a reduced head: ids ascending with the column, so the order is the
+// same as by id), 2 tok[o] = oi[o] (the full head).
 [[kernel]] void kf_top32(const device float* src [[buffer(0)]], const device uint* src_id [[buffer(1)]],
                          device float* ov [[buffer(2)]], device uint* oi [[buffer(3)]],
                          constant DflTopParams& p [[buffer(4)]], constant uint& has_id [[buffer(5)]],
-                         uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+                         const device uint* head_ids [[buffer(6)]], device int* tok [[buffer(7)]],
+                         constant uint& map [[buffer(8)]], uint2 tg [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
   threadgroup float sv[8 * 32];
   threadgroup uint si[8 * 32];
   const uint r = tg.y, base = tg.x * 2048 + tid * 8;
@@ -615,6 +621,7 @@ NI_INLINE void kf_simd_top32(thread float* v, thread uint* id, uint lane, thread
   const size_t o = (size_t(r) * p.nchunks + tg.x) * 32 + lane;
   ov[o] = bv;
   oi[o] = bi;
+  if (map) tok[o] = map == 1 ? int(head_ids[bi]) : int(bi);
 }
 
 // ---- the decoder's 8-row GEMM: dfl_qmm8's bindings, math and K split, the loads issued up front ----

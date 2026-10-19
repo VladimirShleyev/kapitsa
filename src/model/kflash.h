@@ -80,20 +80,26 @@ class KFlash {
   // Once per drafting pass, before the steps: W_h h of the backbone's 8 block rows from its X8 table (xh / xs: the
   // half rows of its final normed hidden and their group sums, as its LM head read them).
   void encode_prep(Encoder& e, const Buffer& xh, const Buffer& xs);
-  // One decoder step over the tree's front (<= 8 nodes, read on the GPU): cand_i / cand_v = the top-32 ids / draft
-  // logits of block rows 1..7, [7][32]; ch_q = softmax(S / qtemp); ch_a = the acceptance head's row acc_row (0: greedy,
-  // 1: sampled; 1 when the checkpoint has one row). walk: the chain builder's step on front row 0 (KFlashWalk).
+  // One decoder step over the tree's front (<= 8 nodes, read on the GPU): cand_i / cand_col / cand_v = the top-32 token
+  // ids, their rows in the out head (set_out_head) and their draft logits, block rows 1..7, [7][32]; ch_q =
+  // softmax(S / qtemp); ch_a = the acceptance head's row acc_row (0: greedy, 1: sampled; 0 when the checkpoint has
+  // one row). walk: the chain builder's step on front row 0 (KFlashWalk).
   // ind: every dispatch indirect from the step's argument block (kSlots x MTLDispatchThreadgroupsIndirectArguments,
   // written by kf_jac: zero threadgroups once the chain is complete).
-  void encode_step(Encoder& e, const Buffer& cand_i, const Buffer& cand_v, float qtemp, int acc_row,
-                   const KFlashWalk* walk = nullptr, const Buffer* ind = nullptr);
+  void encode_step(Encoder& e, const Buffer& cand_i, const Buffer& cand_col, const Buffer& cand_v, float qtemp,
+                   int acc_row, const KFlashWalk* walk = nullptr, const Buffer* ind = nullptr);
+  // The table the candidates' E_out rows come from, indexed by cand_col: the drafter's draft head (the target's LM head,
+  // its reduced rows, or their 8-bit copy for heads in other formats; 4 / 8-bit group 64). Default: the target's LM
+  // head with cand_col = token ids (4 / 8-bit heads only).
+  void set_out_head(const QLinear* head) { out_head_ = head; }
   // The chain walk as speculative passes (kf_jac): the first pass scores the backbone's top-1 chain (all rows in one
   // step), every later pass the chain below the first position where the walk left the previous guess; passes after
   // the chain is complete are skipped (indirect dispatches of zero threadgroups). passes = maxdep: always the
   // sequential walk's chain and outputs, bitwise; fewer: the positions still open after the last pass draw from that
   // pass's (stale-branch) rows, which keeps the acceptance exact.
   void encode_chain(Encoder& e, const Buffer& tokens, uint32_t Pk, const Buffer& gst, const Buffer& cand_i,
-                    const Buffer& cand_v, float qtemp, int acc_row, const KFlashWalk& walk, int passes);
+                    const Buffer& cand_col, const Buffer& cand_v, float qtemp, int acc_row, const KFlashWalk& walk,
+                    int passes);
   static constexpr int kSlots = 9;  // distinct dispatch shapes of a step (encode_step's indirect argument block)
   const QLinear* weight(const std::string& name) const {
     auto it = named_.find(name);
@@ -123,6 +129,7 @@ class KFlash {
     QLinear qkv, o, gate, up, down;
   };
   int acc_rows_ = 0;  // acceptance-head rows in the checkpoint (0: none)
+  const QLinear* out_head_ = nullptr;
   void load_config(const std::string& dir);
   const Tensor* own(const Tensor& t, const char* label);
   QLinear quantize(const std::vector<std::vector<const Tensor*>>& rows, const char* label);

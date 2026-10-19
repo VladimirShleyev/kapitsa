@@ -191,12 +191,13 @@ QLinear KFlash::quantize(const std::vector<std::vector<const Tensor*>>& blocks, 
 KFlash::KFlash(Qwen35& target, const std::string& dir) : tg_(target), dir_(dir) {
   const double t0 = now_ms();
   load_config(dir);
+  // the target's embedding rows (node tokens) in any format the engine runs; the candidates' LM-head rows come from a
+  // 4 / 8-bit table (set_out_head: DFlash2's draft head, which is one for every target format)
   const QLinear& E = tg_.embed_table();
   const QLinear& O = tg_.lm_head();
-  for (const QLinear* t : {&E, &O})
-    if (!(t->q4() || t->q8()) || t->K != uint32_t(cfg_.H))
-      fatal("KFlash: the target's embedding and LM head must be 4- or 8-bit group 64 (have %s / %s)",
-            format_name(E.bits, E.gs).c_str(), format_name(O.bits, O.gs).c_str());
+  if (!(E.q4() || E.q8() || format_supported(E.bits, E.gs)) || E.K != uint32_t(cfg_.H))
+    fatal("KFlash: the target's embedding format (%s) is not supported", format_name(E.bits, E.gs).c_str());
+  if ((O.q4() || O.q8()) && O.K == uint32_t(cfg_.H)) out_head_ = &O;
   const int64_t d = cfg_.d, H = cfg_.H, I = cfg_.I;
   {
     WeightStore w;  // bf16 checkpoint, released after quantization
@@ -411,11 +412,13 @@ void KFlash::encode_prep(Encoder& e, const Buffer& xh, const Buffer& xs) {
   else dfl_enc_qmm8(e, {{&w_h_, A_, uint32_t(cfg_.d), 1.0f}}, xh, xs, H, H);
 }
 
-void KFlash::encode_step(Encoder& e, const Buffer& cand_i, const Buffer& cand_v, float qtemp, int acc_row,
-                          const KFlashWalk* walk, const Buffer* ind) {
+void KFlash::encode_step(Encoder& e, const Buffer& cand_i, const Buffer& cand_col, const Buffer& cand_v, float qtemp,
+                         int acc_row, const KFlashWalk* walk, const Buffer* ind) {
   const uint32_t d = uint32_t(cfg_.d), H = uint32_t(cfg_.H), I = uint32_t(cfg_.I), NL = uint32_t(cfg_.NL);
   const QLinear& E = tg_.embed_table();
-  const QLinear& O = tg_.lm_head();
+  if (!out_head_ || !(out_head_->q4() || out_head_->q8()) || out_head_->K != H)
+    fatal("KFlash: no 4 / 8-bit table for the candidates' LM-head rows (set_out_head)");
+  const QLinear& O = *out_head_;
   // slot: 0 = 8 rows, 1 = attention, 2 = candidates, 3..8 = the GEMMs (W_e, q|k|v, o, gate/up, down, W_out); the full
   // grid of each is recorded for kf_jac
   uint32_t* full = full_args_.as<uint32_t>();
@@ -435,7 +438,8 @@ void KFlash::encode_step(Encoder& e, const Buffer& cand_i, const Buffer& cand_v,
   };
   {  // input rows: X8 table of RMSNorm(E[tok]) * emb_norm; residual = W_h h_{j+1} + pos[j]
     kp::KfIn p{H, d, uint32_t(E.bits), uint32_t(E.gs), cfg_.eps};
-    e.use(kfpipe("kf_in"));
+    // 4 / 8-bit group 64 here; other formats on wfmt.metal's kf_in_<format> (the formats library)
+    e.use(kfpipe(E.q4() || E.q8() ? std::string("kf_in") : "kf_in_" + E.fmt()));
     e.buf(0, tree_); e.buf(1, A_); e.buf(2, E.w->buf); e.buf(3, E.s->buf); e.buf(4, E.b->buf);
     e.buf(5, emb_norm_->buf); e.buf(6, pos_->buf); e.buf(7, xin_h_); e.buf(8, xin_s_); e.buf(9, hres_);
     e.val(10, p);
@@ -485,6 +489,7 @@ void KFlash::encode_step(Encoder& e, const Buffer& cand_i, const Buffer& cand_v,
     e.buf(5, O.w->buf); e.buf(6, O.s->buf); e.buf(7, O.b->buf); e.buf(8, acc_we_); e.buf(9, lscale_);
     e.buf(10, acc_wy_); e.buf(11, w_tok); e.buf(12, w_q); e.buf(13, w_k); e.buf(14, w_s);
     e.val(15, sp);
+    e.buf(16, cand_col);
     if (ind) e.dispatch_indirect(*ind, 0, 1024);  // slot 0's 8 rows
     else e.dispatch(8, 1, 1, 1024);
     return;
@@ -492,7 +497,7 @@ void KFlash::encode_step(Encoder& e, const Buffer& cand_i, const Buffer& cand_v,
   {
     kp::KfCand p{H, uint32_t(O.bits)};
     e.use(kfpipe("kf_cand"));
-    e.buf(0, tree_); e.buf(1, z_); e.buf(2, cand_i); e.buf(3, O.w->buf); e.buf(4, O.s->buf); e.buf(5, O.b->buf);
+    e.buf(0, tree_); e.buf(1, z_); e.buf(2, cand_col); e.buf(3, O.w->buf); e.buf(4, O.s->buf); e.buf(5, O.b->buf);
     e.buf(6, acc_we_); e.buf(7, cd_);
     e.val(8, p);
     disp(2, 8, uint32_t(kCand), 256);
@@ -505,14 +510,15 @@ void KFlash::encode_step(Encoder& e, const Buffer& cand_i, const Buffer& cand_v,
 }
 
 void KFlash::encode_chain(Encoder& e, const Buffer& tokens, uint32_t Pk, const Buffer& gst, const Buffer& cand_i,
-                           const Buffer& cand_v, float qtemp, int acc_row, const KFlashWalk& walk, int passes) {
+                          const Buffer& cand_col, const Buffer& cand_v, float qtemp, int acc_row, const KFlashWalk& walk,
+                          int passes) {
   const int maxdep = walk.maxdep;
   passes = std::clamp(passes, 1, std::min(maxdep, 15));
   encode_root(e, tokens, Pk, gst, &cand_i, maxdep - 1);
   const size_t blk = size_t(kSlots) * 12;
   for (int i = 0; i < passes; ++i) {
     const Buffer ind = pass_args_.view(size_t(i) * blk, blk);
-    encode_step(e, cand_i, cand_v, qtemp, acc_row, nullptr, i == 0 ? nullptr : &ind);
+    encode_step(e, cand_i, cand_col, cand_v, qtemp, acc_row, nullptr, i == 0 ? nullptr : &ind);
     const kp::KfJac p{walk.temp, walk.seed, walk.qt ? 1u : 0u, uint32_t(maxdep), i + 1 == passes ? 1u : 0u,
                       uint32_t(kSlots)};
     e.use(kfpipe("kf_jac"));

@@ -202,6 +202,7 @@ class DFlash2 {
   void encode_draft_sel(Encoder& e, Seq& s, DFlashSeq& d, int P, const SamplingParams& sp, int sel);
   Buffer final_hidden_buf() const { return n_; }  // fp32 [8][H]: the decoder's h rows
   Buffer cand32_ids_buf() const { return c32_i_; }
+  Buffer cand32_cols_buf() const { return c32_col_; }  // their columns in the draft head (KFlash::set_out_head)
   Buffer cand32_vals_buf() const { return c32_v_; }
 
   // results of the last pass (host-visible after the command buffer completed); walk_cands() candidates per
@@ -320,7 +321,7 @@ class DFlash2 {
   std::map<std::string, Buffer> dbg_;
   // KFlash decoder (NI_KFLASH): top-32 per block row (ids / draft logits), its staging, the walk's q and scores
   std::unique_ptr<KFlash> kf_;
-  Buffer c32_i_, c32_v_, q32_, ws32_, t32a_v_, t32a_i_, t32b_v_, t32b_i_;
+  Buffer c32_i_, c32_col_, c32_v_, q32_, ws32_, t32a_v_, t32a_i_, t32b_v_, t32b_i_;
 };
 
 } // namespace ni

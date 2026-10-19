@@ -384,6 +384,53 @@ NI_INLINE void dfl_embed_normg_impl(const device uint32_t* W, const device bfloa
     dfl_embed_normg_impl<F>(W, S, B, tokens, h, nw, n, xh, xs, p, gst, r, tid, ntg, sg, nsg, lane, red);      \
   }
 
+// KFlash's decoder input (kf_in, spec_kflash.metal) over a target embedding table in format F: the X8 table of
+// RMSNorm(E[tok]) * emb_norm for the front rows and the residual start A[dep + 1] + pos[dep].
+template <int F>
+NI_INLINE void kf_ing_impl(const device KFlashTree* t, const device float* A, const device uint32_t* EW,
+                           const device bfloat* ES, const device bfloat* EB, const device bfloat* en,
+                           const device bfloat* pos, device half* xh, device float* xs, device float* hres,
+                           constant KfInParams& p, uint r, uint tid, uint ntg, uint sg, uint nsg, uint lane,
+                           threadgroup float* red) {
+  const uint H = p.H, d = p.d;
+  const bool live = r < t->n_front;
+  const uint node = live ? t->front[r] : 0u;
+  const uint dep = live ? uint(t->depth[node]) : 0u;
+  const uint tok = live ? uint(t->token[node]) : 0u;
+  float ss = 0.0f;
+  if (live)
+    for (uint g = sg; g < H / 64; g += nsg) {
+      const uint k = g * 64 + 2 * lane;
+      const float2 v = float2(wf_one<F>(EW, ES, EB, tok, k, H, p.emb_gs), wf_one<F>(EW, ES, EB, tok, k + 1, H, p.emb_gs));
+      ss += v.x * v.x + v.y * v.y;
+    }
+  ss = tg_sum(ss, red, tid, ntg);
+  const float inv = metal::precise::rsqrt(ss / float(H) + p.eps);
+  for (uint g = sg; g < H / 64; g += nsg) {
+    const uint k = g * 64 + 2 * lane;
+    float2 v = float2(0.0f);
+    if (live)
+      v = float2(wf_one<F>(EW, ES, EB, tok, k, H, p.emb_gs), wf_one<F>(EW, ES, EB, tok, k + 1, H, p.emb_gs)) * inv *
+          float2(float(en[k]), float(en[k + 1]));
+    dfl_put2(xh, xs, r, H, g, lane, v.x, v.y);
+  }
+  for (uint c = tid; c < d; c += ntg) hres[r * d + c] = live ? A[(dep + 1) * d + c] + float(pos[dep * d + c]) : 0.0f;
+}
+
+#define NI_KF_ING(NAME, F)                                                                                   \
+  [[kernel]] void NAME(const device KFlashTree* t [[buffer(0)]], const device float* A [[buffer(1)]],        \
+                       const device uint32_t* EW [[buffer(2)]], const device bfloat* ES [[buffer(3)]],         \
+                       const device bfloat* EB [[buffer(4)]], const device bfloat* en [[buffer(5)]],           \
+                       const device bfloat* pos [[buffer(6)]], device half* xh [[buffer(7)]],                \
+                       device float* xs [[buffer(8)]], device float* hres [[buffer(9)]],                     \
+                       constant KfInParams& p [[buffer(10)]], uint r [[threadgroup_position_in_grid]],       \
+                       uint tid [[thread_index_in_threadgroup]], uint ntg [[threads_per_threadgroup]],       \
+                       uint sg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]],  \
+                       uint lane [[thread_index_in_simdgroup]]) {                                            \
+    threadgroup float red[32];                                                                               \
+    kf_ing_impl<F>(t, A, EW, ES, EB, en, pos, xh, xs, hres, p, r, tid, ntg, sg, nsg, lane, red);              \
+  }
+
 // ---- per-row MoE (the verify.metal moe_*_rows layout) with any expert / shared-expert formats ----
 // gate/up grid: (row tiles over max(I, SI), k + 1 slots, R rows); xn [R, D]; h [R, k+1, Imax]; idx [R, k].
 template <int FE, int GE, int FS, int GSS>
@@ -1463,7 +1510,8 @@ NI_WF_NO8(NI_WF_DECODE)
 #define NI_WF_LOOKUP(SFX, F, GS)                                     \
   NI_MLPG(mlp_gate_up_##SFX, F, GS)                                  \
   NI_EMBEDG(embed_##SFX, F)                                          \
-  NI_DFL_EMBEDG(dfl_embed_norm_##SFX, F)
+  NI_DFL_EMBEDG(dfl_embed_norm_##SFX, F)                             \
+  NI_KF_ING(kf_in_##SFX, F)
 NI_WF_ALL(NI_WF_LOOKUP)
 
 #define NI_WF_PREFILL(SFX, F, GS)                                    \
