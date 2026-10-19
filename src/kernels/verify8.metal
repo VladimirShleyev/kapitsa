@@ -789,14 +789,17 @@ NI_QMM8_GU(qmm8_gu1k2b_b4, 2, 1, 2, 0)      // two groups per step
 NI_QMM8_GU(qmm8_gu1k2snb_b4, 2, 1, 2, 1)
 
 // ---- MoE for 8 rows ----
-// moe8_plan (one threadgroup, E threads): the distinct experts of the R rows' top-k (ascending ids).
-// Experts used by more than `small` rows become MMA tiles 0 .. U-1 (all 8 rows computed, the live
-// ones stored), the shared expert tile U; slot[u * 8 + t] = the top-k slot of row t that routes to
-// tile u's expert (0xffffffff: row t does not use it; the shared tile: slot k for t < R). Experts
-// used by 1 .. small (<= 2) rows become scalar tiles s (register-dequant matvecs over just those
-// rows, no padded MMA work): sm[s] = expert, sm[72 + 2s + i] = row, sm[216 + 2s + i] = slot
-// (0xffffffff past the tile's rows). ntiles = {U + 1, S}. Writes the indirect grids of the four
-// expert passes: {gu_gx, U + 1, 1}, {dn_gx, U + 1, 1}, {sgu_gx, max(S, 1), 1}, {sdn_gx, max(S, 1), 1}.
+// moe8_plan (one threadgroup, E threads; with topk, the router top-k first, one simdgroup per row): the distinct
+// experts of the R rows' top-k (ascending ids). Experts used by more than `split` rows become MMA tiles 0 .. U-1 (all 8
+// rows computed, the live ones stored), then the shared expert tile U (unless shs); slot[u * 8 + t] = the top-k slot
+// of row t that routes to tile u's expert (0xffffffff: row t does not use it; the shared tile: slot k for t < R).
+// Experts used by 1 .. small (<= 2) rows become one small tile s (the scalar passes: just those rows, no padded MMA
+// work), experts with small < rows <= split ceil(rows / 2) of them (2 rows each), and with shs the shared expert
+// ceil(R / 2) (expert 0xffffffff): sm[s] = expert, sm[72 + 2s + i] = row, sm[216 + 2s + i] = slot (0xffffffff past
+// the tile's rows). sep puts the split experts' and the shared expert's tiles in a second list sm2 (greedy verifies:
+// list A on moe8s2, list B on moe8e). ntiles = {MMA tiles, S (list A), S2 (list B)}. Writes the indirect grids of the
+// six expert passes: {gu_gx, max(ntiles[0], 1), 1}, {dn_gx, ..}, {sgu_gx, max(S, 1), 1}, {sdn_gx, ..},
+// {gu_gx, max(S2, 1), 1}, {edn_gx, ..}.
 constant constexpr uint kV8SM = 72;  // small tiles at most: 64 routed (row, expert) pairs + the shared expert's 4
 struct Moe8PlanParams {
   uint R, k, E;
@@ -1135,11 +1138,13 @@ NI_INLINE void v8s_dot2t(const device uint32_t* w, const device bfloat* scales, 
   }
 }
 
-// ---- MMA-exact scalar passes for experts used by 1-2 rows ----
+// ---- MMA-exact scalar passes (moe8e) for 2-row tiles ----
 // A sampled (T > 0) verify needs row-independent MoE numerics: a row's expert outputs may not depend on which other
 // rows route to the same expert, so it cannot mix the scalar passes above (fp32 inputs, their own sums) with the MMA
 // tiles. These passes give the 1-2 rows of a small tile bitwise the values an 8-row MMA tile gives them, at about the
-// scalar passes' cost, so sampled verifies can split the experts as greedy ones do.
+// scalar passes' cost, so sampled verifies run every expert as 2-row tiles (ceil(rows / 2) per expert, the shared
+// expert too: the tiles of one expert run side by side and its re-reads come from the caches; BENCH_REPLAY: 51 tiles
+// of 39 experts took what 39 distinct tiles take).
 // simdgroup_multiply_accumulate (half x half + float, 8x8x8) adds an output's 8 products (exact in fp32) to C one at a
 // time in k order, rounding to fp32 after each (tools/mma_probe: every one of 2^19 random outputs on the M5 Max;
 // mma_chain_check below re-checks it on the GPU at hand before these passes are used). A tile's 64-group of one
@@ -1158,10 +1163,13 @@ struct Moe8eParams {
   uint k;     // top-k (down: the output slots)
 };
 
-// The passes over tiles of up to RT rows. RT 2: moe8_plan's small tiles (experts with 3-4 rows become two of them:
-// 35B, 64 tokens teacher-forced, sampled-verify numerics: 10.81 ms per verify vs 11.05 with those experts on MMA tiles);
-// RT 4 compiles too (4 simdgroups per gate/up threadgroup for its threadgroup memory) but ran slower than the split
-// (11.98: too few threadgroups for the few such experts). Tile list (MT tiles at most): sm[s] = expert,
+// The passes over tiles of up to RT rows. RT 2: moe8_plan's small tiles. RT 4 compiles too (4 simdgroups per gate/up
+// threadgroup, for its threadgroup memory) but 4-row tiles ran slower than two 2-row tiles each (35B, 64 tokens
+// teacher-forced, sampled-verify numerics: 11.98 vs 10.81 ms per verify: too few threadgroups for the few such
+// experts). Measured and dropped for the 2-row passes: 4 or 16 simdgroups per gate/up threadgroup (+0.08, +2.1 ms
+// per verify), the next pass's weights requested before the current epilogue (+0.03 to +0.08), a persistent grid of
+// 120-320 threadgroups (+0.14 to +0.25), 8 simdgroups per down threadgroup (+0.1), 512-byte coalesced weight loads
+// with lane-pair swaps (+0.03). Tile list (MT tiles at most): sm[s] = expert,
 // sm[MT + RT s + i] = row i, sm[MT + MT RT + RT s + i] = its top-k slot (0xffffffff past the tile's rows, which come
 // first). h and its group sums per tile row: hs[(RT s + i) * N], hsum[(RT s + i) * N / 64].
 NI_INLINE constexpr uint v8e_mt(uint rt) { return rt == 2 ? kV8SM : 32; }
