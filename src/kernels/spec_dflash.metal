@@ -954,6 +954,120 @@ NI_INLINE void dfl_q8_run(const device uint32_t* const* W, const device bfloat* 
   }
 }
 
+// 4-bit, one fragment (RF 1), NM matrices sharing rows: dfl_q8_run with two groups per step (scale and bias
+// pairs in one 4-byte load each), the next step's weights / coefficients / sums loaded before this step's MMAs, and
+// the codes as half subnormals q * 2^-24 (the bare code bits: no OR / subtract per pair; the fp32 chain is the
+// 2^-24-scaled one, so with s * 2^24 in the epilogue the sums agree with dfl_q8_run's up to fast-math contraction).
+// Same group order and epilogue. bench_dfl (M5 Max, DRAM-bound rotation): 512 x 2048 5.7 -> 4.4 us, q|kv 6144 x 2048
+// 22.1 -> 20.7, down 2048 x 6144 24.8 -> 22.0, the reduced LM head 98304 x 2048 261 -> 254; in the decode loop the
+// 35B drafting pass -0.03 to -0.05 ms (NI_AB, 3 runs). Not for the fused gate/up (NM 2): slower there.
+NI_INLINE void dfl_codes_sn(uint2 w, thread half2* a) {
+  _Pragma("clang loop unroll(full)")
+  for (int f = 0; f < 8; ++f) a[f] = as_type<half2>(((f < 4 ? w.x : w.y) >> (4 * (f % 4))) & 0x000F000Fu);
+}
+NI_INLINE void dfl_xg(const device half* x0, const device half* x1, uint g, thread half2* b) {
+  const half4 c00 = *(const device half4*)(x0 + g * 64), c01 = *(const device half4*)(x0 + g * 64 + 8);
+  const half4 c10 = *(const device half4*)(x1 + g * 64), c11 = *(const device half4*)(x1 + g * 64 + 8);
+  _Pragma("clang loop unroll(full)")
+  for (int f = 0; f < 4; ++f) {
+    b[f] = half2(c00[f], c10[f]);
+    b[f + 4] = half2(c01[f], c11[f]);
+  }
+}
+NI_INLINE float2 dfl_mma8(thread const half2* a, thread const half2* b) {
+  simdgroup_float8x8 C = simdgroup_float8x8(0);
+  _Pragma("clang loop unroll(full)")
+  for (int f = 0; f < 8; ++f) {
+    simdgroup_half8x8 Am, Bm;
+    Am.thread_elements()[0] = a[f].x;
+    Am.thread_elements()[1] = a[f].y;
+    Bm.thread_elements()[0] = b[f].x;
+    Bm.thread_elements()[1] = b[f].y;
+    simdgroup_multiply_accumulate(C, Am, Bm, C);
+  }
+  return float2(C.thread_elements()[0], C.thread_elements()[1]);
+}
+template <int NM>
+NI_INLINE void dfl_q8_run4(const device uint32_t* const* W, const device bfloat* const* S, const device bfloat* const* B,
+                           uint row, uint K, const device half* X, uint x_ld, const device float* XS, uint g0, uint g1,
+                           uint lane, thread float2 (&acc)[NM][1]) {
+  const uint2 rc = dfl_lane_rc(lane);
+  const uint fm = rc.x, fn = rc.y, q = fn / 2;
+  const uint wpr = K / 8, gpr = K / 64;
+  const device half* x0 = X + fn * x_ld + 16 * (fm / 2) + 4 * (fm % 2);
+  const device half* x1 = x0 + x_ld;
+  const device uint32_t* wr[NM];
+  const device bfloat* sr[NM];
+  const device bfloat* br[NM];
+  _Pragma("clang loop unroll(full)")
+  for (int m = 0; m < NM; ++m) {
+    wr[m] = W[m] + size_t(row) * wpr + 2 * q;
+    sr[m] = S[m] + size_t(row) * gpr;
+    br[m] = B[m] + size_t(row) * gpr;
+    acc[m][0] = float2(0.0f);
+  }
+  constexpr float kSn = 16777216.0f;  // 2^24
+  uint g = g0;
+  if (gpr % 2 == 0 && g0 % 2 == 0 && g0 + 1 < g1) {  // pairs (4-byte scale / bias pairs need an even group)
+    uint2 wa[NM], wb[NM];
+    uint sp[NM], bp[NM];
+    float4 sxp;
+    _Pragma("clang loop unroll(full)")
+    for (int m = 0; m < NM; ++m) {
+      wa[m] = *(const device uint2*)(wr[m] + g * 8);
+      wb[m] = *(const device uint2*)(wr[m] + g * 8 + 8);
+      sp[m] = *(const device uint*)(sr[m] + g);
+      bp[m] = *(const device uint*)(br[m] + g);
+    }
+    sxp = float4(*(const device float2*)(XS + g * 8 + fn), *(const device float2*)(XS + g * 8 + 8 + fn));
+    for (; g + 1 < g1; g += 2) {
+      uint2 w0[NM], w1[NM];
+      uint su[NM], bu[NM];
+      const float4 sx = sxp;
+      _Pragma("clang loop unroll(full)")
+      for (int m = 0; m < NM; ++m) {
+        w0[m] = wa[m]; w1[m] = wb[m]; su[m] = sp[m]; bu[m] = bp[m];
+      }
+      if (g + 3 < g1) {
+        _Pragma("clang loop unroll(full)")
+        for (int m = 0; m < NM; ++m) {
+          wa[m] = *(const device uint2*)(wr[m] + (g + 2) * 8);
+          wb[m] = *(const device uint2*)(wr[m] + (g + 2) * 8 + 8);
+          sp[m] = *(const device uint*)(sr[m] + g + 2);
+          bp[m] = *(const device uint*)(br[m] + g + 2);
+        }
+        sxp = float4(*(const device float2*)(XS + (g + 2) * 8 + fn), *(const device float2*)(XS + (g + 2) * 8 + 8 + fn));
+      }
+      half2 b0[8], b1[8];
+      dfl_xg(x0, x1, g, b0);
+      dfl_xg(x0, x1, g + 1, b1);
+      _Pragma("clang loop unroll(full)")
+      for (int m = 0; m < NM; ++m) {
+        const float2 s2 = float2(as_type<bfloat2>(su[m])) * kSn, b2 = float2(as_type<bfloat2>(bu[m]));
+        half2 a[8];
+        dfl_codes_sn(w0[m], a);
+        const float2 c0 = dfl_mma8(a, b0);
+        dfl_codes_sn(w1[m], a);
+        const float2 c1 = dfl_mma8(a, b1);
+        acc[m][0] += s2.x * c0 + b2.x * sx.xy;
+        acc[m][0] += s2.y * c1 + b2.y * sx.zw;
+      }
+    }
+  }
+  for (; g < g1; ++g) {  // an odd count's last group (or an odd start)
+    half2 b0[8];
+    dfl_xg(x0, x1, g, b0);
+    const float2 sx = *(const device float2*)(XS + g * 8 + fn);
+    _Pragma("clang loop unroll(full)")
+    for (int m = 0; m < NM; ++m) {
+      half2 a[8];
+      dfl_codes_sn(*(const device uint2*)(wr[m] + g * 8), a);
+      const float2 c = dfl_mma8(a, b0);
+      acc[m][0] += (float(sr[m][g]) * kSn) * c + float(br[m][g]) * sx;
+    }
+  }
+}
+
 // grid: tg_begin[nseg] threadgroups x 256 (8 simdgroups = 8/ks row blocks of 8 * RF rows).
 template <int RF>
 NI_INLINE void dfl_qmm8_impl(const device uint32_t* const* Wv, const device bfloat* const* Sv,
@@ -977,8 +1091,17 @@ NI_INLINE void dfl_qmm8_impl(const device uint32_t* const* Wv, const device bflo
   const device bfloat* S[1] = {Sv[si]};
   const device bfloat* B[1] = {Bv[si]};
   float2 acc[1][RF];
-  if (p.bits[si] == 4) dfl_q8_run<4, 1, RF>(W, S, B, rows, p.K, X, p.x_ld, XS, g0, g1, lane, acc);
-  else dfl_q8_run<8, 1, RF>(W, S, B, rows, p.K, X, p.x_ld, XS, g0, g1, lane, acc);
+  if (p.bits[si] == 4) {
+    if (RF == 1) {
+      float2 a1[1][1];
+      dfl_q8_run4<1>(W, S, B, rows[0], p.K, X, p.x_ld, XS, g0, g1, lane, a1);
+      acc[0][0] = a1[0][0];
+    } else {
+      dfl_q8_run<4, 1, RF>(W, S, B, rows, p.K, X, p.x_ld, XS, g0, g1, lane, acc);
+    }
+  } else {
+    dfl_q8_run<8, 1, RF>(W, S, B, rows, p.K, X, p.x_ld, XS, g0, g1, lane, acc);
+  }
   if (ks > 1) {
     if (kslice)
       _Pragma("clang loop unroll(full)")
@@ -1051,7 +1174,7 @@ DFL_QMM8(dfl_qmm8_r2, 2)
   const device bfloat* S[1] = {S0};
   const device bfloat* B[1] = {B0};
   float2 acc[1][1];
-  if (p.bits[0] == 4) dfl_q8_run<4, 1, 1>(W, S, B, rows, p.K, X, p.x_ld, XS, g0, g1, lane, acc);
+  if (p.bits[0] == 4) dfl_q8_run4<1>(W, S, B, rows[0], p.K, X, p.x_ld, XS, g0, g1, lane, acc);
   else dfl_q8_run<8, 1, 1>(W, S, B, rows, p.K, X, p.x_ld, XS, g0, g1, lane, acc);
   if (ks > 1) {
     if (kslice) red[sg * 32 + lane] = acc[0][0];
@@ -1099,6 +1222,7 @@ NI_INLINE void dfl_qmm8_gu_impl(const device uint32_t* Wg, const device bfloat* 
   const device bfloat* S[2] = {Sg, Su};
   const device bfloat* B[2] = {Bg, Bu};
   float2 acc[2][1];
+  // (dfl_q8_run4's pairs / prefetch / subnormal codes measured slower here: 44.5 -> 45.2-49.1 us at 6144 x 2048)
   if (p.bits[0] == 4) dfl_q8_run<4, 2, 1>(W, S, B, rows, p.K, X, p.x_ld, XS, g0, g1, lane, acc);
   else dfl_q8_run<8, 2, 1>(W, S, B, rows, p.K, X, p.x_ld, XS, g0, g1, lane, acc);
   if (KS > 1) {
