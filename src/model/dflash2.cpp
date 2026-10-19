@@ -1132,10 +1132,19 @@ void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const S
   }
   uint32_t lo, chunk, nsplit;
   dfl_attn_plan(P, uint32_t(max_splits_), 0, &lo, &chunk, &nsplit, d.valid_lo);
-  if (gpu) {  // the kernels derive the plan from the GPU-side P: [max(P - 2047, valid_lo), P) in 256-key splits
+  if (gpu) {
+    // the kernels derive the plan from the GPU-side P: [max(P - 2047, valid_lo), P) in `chunk`-key splits. The grid
+    // covers the window the upper bound P allows. 64-key splits up to 1024 keys (more threadgroups for a short
+    // context: 35B decode at ~85-600 positions on the M5 Max, -0.13 ms GPU per cycle against 256-key splits; at
+    // ~2600 positions the two are within noise), 256 beyond (M4 Pro: 8 x 256 beat 32 x 64 at the full window).
     lo = uint32_t(std::max(d.valid_lo, 0));
-    chunk = kGpuChunk;
-    nsplit = (kCtxKeep + kGpuChunk - 1) / kGpuChunk;  // grid for the full window; empty splits exit
+    const uint32_t L = std::min<uint32_t>(uint32_t(std::max(P - int(lo), 1)), kCtxKeep);
+    static const uint32_t env = getenv("NI_DFLASH_GPU_CHUNK") ? uint32_t(atoi(getenv("NI_DFLASH_GPU_CHUNK"))) : 0;
+    chunk = env ? env : L <= 1024 ? 64u : kGpuChunk;
+    // (at most max_splits_ splits: the partials buffers; multiples of the attention kernels' 32-key tiles)
+    chunk = std::max(chunk, (L + uint32_t(max_splits_) - 1) / uint32_t(max_splits_));
+    chunk = (chunk + 31) / 32 * 32;
+    nsplit = (L + chunk - 1) / chunk;  // splits past the live window exit
   }
   const kp::DflConv cp{H, G, cfg_.eps};
   const int skip = v8_knobs().skip;  // timing only: 1024 MLP gate/up, 2048 MLP down, 4096 LM head, 8192 projections
