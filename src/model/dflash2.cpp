@@ -267,7 +267,7 @@ void dfl_quantize_cpu(const std::vector<const uint16_t*>& rowp, uint32_t K, int 
 // edge is exact, bias = edge; codes = min(round((w - bias) / scale), n_bins) in IEEE fp32 with
 // round-half-away; scale/bias stored as bf16 RNE). MLX's CPU backend rounds halves to even
 // instead (NI_DFLASH_QROUND=even reproduces that one).
-QLinear DFlash2::quantize(const std::vector<const Tensor*>& parts, const char* label) {
+QLinear DFlash2::quantize(const std::vector<const Tensor*>& parts, const char* label, const std::vector<uint32_t>& perm) {
   const uint32_t K = uint32_t(parts[0]->shape[1]);
   uint32_t N = 0;
   for (auto* t : parts) {
@@ -288,6 +288,10 @@ QLinear DFlash2::quantize(const std::vector<const Tensor*>& parts, const char* l
     uint32_t r = 0;
     for (auto* t : parts)
       for (int64_t i = 0; i < t->shape[0]; ++i) rowp[r++] = t->buf.as<uint16_t>() + size_t(i) * K;
+  }
+  if (!perm.empty()) {  // stored row i = source row perm[i]
+    std::vector<const uint16_t*> src = rowp;
+    for (uint32_t i = 0; i < N; ++i) rowp[i] = src[perm[i]];
   }
   dfl_quantize_cpu(rowp, K, bits, even, wq.as<uint32_t>(), sc.as<uint16_t>(), bi.as<uint16_t>());
   owned_bufs_.push_back(wq);
@@ -377,8 +381,13 @@ DFlash2::DFlash2(Qwen35& target, const std::string& dir, int bits) : tg_(target)
       if (!v1) {
         L.ac_base = own(expect(p + "attention_conv.base_kernel", {2, 2, H}), "dfl_conv");
         L.mc_base = own(expect(p + "mlp_conv.base_kernel", {2, 2, H}), "dfl_conv");
-        L.ac = quantize({&expect(p + "attention_conv.kernel_projection.weight", {G4, H})}, "dfl_ac");
-        L.mc = quantize({&expect(p + "mlp_conv.kernel_projection.weight", {G4, H})}, "dfl_mc");
+        // rows permuted for dfl_qmm8_cp: block b < H / 64 = stage 0's taps 0 and 1 of conv groups 4b .. 4b + 3
+        std::vector<uint32_t> perm(static_cast<size_t>(G4));
+        const uint32_t G = uint32_t(H / cfg_.conv_gs);
+        for (uint32_t i = 0; i < uint32_t(G4); ++i)
+          perm[i] = i >= 2 * G ? i : (i % 8 < 4 ? 4 * (i / 8) + i % 8 : G + 4 * (i / 8) + i % 8 - 4);
+        L.ac = quantize({&expect(p + "attention_conv.kernel_projection.weight", {G4, H})}, "dfl_ac", perm);
+        L.mc = quantize({&expect(p + "mlp_conv.kernel_projection.weight", {G4, H})}, "dfl_mc", perm);
       }
       L.q = quantize({&expect(p + "self_attn.q_proj.weight", {4096, H})}, "dfl_q");
       L.o = quantize({&expect(p + "self_attn.o_proj.weight", {H, 4096})}, "dfl_o");
@@ -437,6 +446,8 @@ void DFlash2::alloc_buffers() {
   n_ = g.alloc(8 * H * 4, "dfl_n");
   xh_ = g.alloc(8 * Kx * 2, "dfl_xh");
   xs_ = g.alloc(Kx / 64 * 8 * 4, "dfl_xs");
+  xh2_ = g.alloc(8 * H * 2, "dfl_xh2");
+  xs2_ = g.alloc(H / 64 * 8 * 4, "dfl_xs2");
   hh_ = g.alloc(8 * I * 2, "dfl_hh");
   hs_ = g.alloc(I / 64 * 8 * 4, "dfl_hs");
   dyn_ = g.alloc(8 * G4 * 4, "dfl_dyn");
@@ -490,7 +501,7 @@ void DFlash2::alloc_buffers() {
   kv8_ = g.alloc(8 * KV * 4, "dfl_kv8");
   cdbg_ = g.alloc(size_t(kCtxKeep) * H * 4, "dfl_c");
   memset(capt_.ptr(), 0, capt_.size);
-  for (Buffer* b : {&h_, &n_, &xh_, &xs_, &hh_, &hs_, &dyn_, &q_, &kv_, &Q_, &Kb_, &Vb_, &part_o_, &part_ml_, &u_,
+  for (Buffer* b : {&h_, &n_, &xh_, &xs_, &xh2_, &xs2_, &hh_, &hs_, &dyn_, &q_, &kv_, &Q_, &Kb_, &Vb_, &part_o_, &part_ml_, &u_,
                     &logits_, &sel_, &tk_v_, &tk_i_, &cand_v_, &cand_i_, &edges_, &walk_s_, &qprob_, &walk_k_, &capt_,
                     &y8_, &c8_, &kv8_, &cdbg_, &rope_cs_, &dist_id_, &dist_p_, &dist_keep_, &acc_, &kdyn_, &gst_})
     resident_ += b->size;
@@ -662,7 +673,7 @@ size_t DFlash2::plan_bytes(const std::string& dir, const Qwen35Config& target, s
   // alloc_buffers()
   const size_t nH = nT * H, Kx = std::max({nH, size_t(4096), H, I}), KV = NL * 2048, G4 = 4 * (H / std::max<size_t>(gs, 1)),
                ntg = (V + 2047) / 2048;
-  size_t b = 5 * 8 * H * 4 + 8 * Kx * 2 + Kx / 64 * 8 * 4 + 8 * I * 2 + I / 64 * 8 * 4 + 8 * G4 * 4 + 8 * 4096 * 4 +
+  size_t b = 5 * 8 * H * 4 + 8 * Kx * 2 + Kx / 64 * 8 * 4 + 8 * H * 2 + H / 64 * 8 * 4 + 8 * I * 2 + I / 64 * 8 * 4 + 8 * G4 * 4 + 8 * 4096 * 4 +
              8 * 2048 * 4 + 32 * 8 * 128 * 4 + 2 * 8 * 8 * 128 * 4 + 32 * (32 * 8 * 128 * 4 + 32 * 8 * 2 * 4) + 8 * V * 4 + 8 * kRank * 4 +
              2 * 7 * ntg * 16 * 4 + 8 * nH * 2 + 8 * KV * 4 + size_t(kCtxKeep) * H * 4 + (64 << 10);
   const char* v8 = getenv("NI_DFLASH_V8");
@@ -777,6 +788,19 @@ void DFlash2::dbg(Encoder& e, const std::string& name, const Buffer& src, size_t
   e.dispatch((n + 255) / 256, 1, 1, 256);
 }
 
+// K split (bench_qmm8 sweep, M4 Pro): no split once there are >= 1024 threadgroups (LM head) on its 20 GPU cores,
+// ~51 per core (Gpu::core_count); otherwise the largest split that leaves every simdgroup >= 8 groups of 64.
+static uint32_t dfl_qmm8_ks(uint32_t rbs_total, uint32_t K, int ks_req) {
+  static const int ks_env = getenv("NI_DFLASH_KS") ? atoi(getenv("NI_DFLASH_KS")) : 0;
+  static const uint32_t many = 1024u * uint32_t(std::max(1, Gpu::get().core_count())) / 20u;
+  uint32_t ks = 1;
+  if (ks_req > 0) ks = uint32_t(ks_req);
+  else if (ks_env > 0) ks = uint32_t(ks_env);
+  else if (rbs_total / 8 < many)
+    while (ks < 8 && (K / 64) / (ks * 2) >= 8) ks *= 2;
+  return ks;
+}
+
 void dfl_enc_qmm8(Encoder& e, const std::vector<DflSeg8>& segs, const Buffer& xh, const Buffer& xs, uint32_t K,
                   uint32_t x_ld, int ks_req, int rf_req) {
   if (segs.empty() || segs.size() > 4) fatal("enc_qmm8: 1-4 segments");
@@ -789,15 +813,7 @@ void dfl_enc_qmm8(Encoder& e, const std::vector<DflSeg8>& segs, const Buffer& xh
     if (s.L->K != K || s.L->gs != 64 || (s.L->bits != 4 && s.L->bits != 8)) fatal("enc_qmm8: K/group/bits mismatch");
     rbs_total += (s.L->N + 7) / 8;
   }
-  // K split (bench_qmm8 sweep, M4 Pro): no split once there are >= 1024 threadgroups (LM head) on its 20 GPU cores,
-  // ~51 per core (Gpu::core_count); otherwise the largest split that leaves every simdgroup >= 8 groups of 64.
-  static const int ks_env = getenv("NI_DFLASH_KS") ? atoi(getenv("NI_DFLASH_KS")) : 0;
-  static const uint32_t many = 1024u * uint32_t(std::max(1, Gpu::get().core_count())) / 20u;
-  uint32_t ks = 1;
-  if (ks_req > 0) ks = uint32_t(ks_req);
-  else if (ks_env > 0) ks = uint32_t(ks_env);
-  else if (rbs_total / 8 < many)
-    while (ks < 8 && (K / 64) / (ks * 2) >= 8) ks *= 2;
+  const uint32_t ks = dfl_qmm8_ks(rbs_total, K, ks_req);
   p.ks = ks;
   // NI_DFLASH_RF=2: 16 weight rows per simdgroup (the X gather shared by two fragments)
   static const int rf_env = getenv("NI_DFLASH_RF") ? atoi(getenv("NI_DFLASH_RF")) : 1;
@@ -855,6 +871,30 @@ void dfl_enc_qmm8_gu(Encoder& e, const QLinear& g, const QLinear& u, const Buffe
   e.buf(17, xs);
   e.val(18, p);
   e.dispatch(g.N / 64, 1, 1, 256 * ks);
+}
+
+// Conv projection L (rows permuted, see the constructor) + dfl_conv_prep: D -> dyn, the conv's output -> (xh2, xs2).
+void DFlash2::enc_qmm8_cp(Encoder& e, const QLinear& L, const Tensor* base, const Buffer& xh, const Buffer& xs) {
+  if (L.K != uint32_t(cfg_.H) || L.N % 8 || L.gs != 64) fatal("enc_qmm8_cp: shapes");
+  kp::DflQmm8 p{};
+  p.K = L.K;
+  p.nseg = 1;
+  p.x_ld = L.K;
+  p.ks = dfl_qmm8_ks(L.N / 8, L.K, 0);
+  p.N[0] = L.N;
+  p.bits[0] = uint32_t(L.bits);
+  p.y_ld[0] = L.N;
+  p.oscale[0] = 1.0f;
+  const uint32_t tg = (L.N / 8 + 8 / p.ks - 1) / (8 / p.ks);
+  p.tg_begin[1] = tg;
+  const kp::DflConv cp{uint32_t(cfg_.H), uint32_t(cfg_.H / cfg_.conv_gs), cfg_.eps};
+  e.use(dpipe("dfl_qmm8_cp"));
+  e.buf(0, L.w->buf); e.buf(1, L.s->buf); e.buf(2, L.b->buf); e.buf(3, dyn_);
+  e.buf(16, xh); e.buf(17, xs);
+  e.val(18, p);
+  e.buf(19, n_); e.buf(20, base->buf); e.buf(21, xh2_); e.buf(22, xs2_);
+  e.val(23, cp);
+  e.dispatch(tg, 1, 1, 256);
 }
 
 // Prefill-size GEMM (context commit of the prompt): the target's prefill kernels, half X rows.
@@ -932,7 +972,7 @@ void DFlash2::encode_prefill_commit(Encoder& e, DFlashSeq& d) {
       e.buf(0, pcap_, size_t(c0) * nH * 2); e.buf(1, xh_); e.buf(2, xs_);
       e.val(3, xp);
       e.buf(4, gst_);
-      e.dispatch(8, 1, 1, 256);
+      e.dispatch(8, (nH / 64 + 7) / 8, 1, 256);
       enc_qmm8(e, {{&fc_, y8_, H, 16.0f}}, xh_, xs_, nH, nH);
       kp::DflNorm np{H, cfg_.eps, 1.0f, 1u};
       e.use(dpipe("dfl_norm_x8"));
@@ -1054,11 +1094,12 @@ void DFlash2::enc_commit_from(Encoder& e, DFlashSeq& d, int m, const Buffer& src
   const uint32_t H = uint32_t(cfg_.H), nH = hook_vf_.ld;
   {
     kp::DflX8 p{nH, gpu ? 0xffffffffu : uint32_t(m), nH, 1.0f / 16.0f};
+    // one group per simdgroup: 8 x 32 threadgroups for the 35B's 8 captured layers (12.5 -> ~3 us isolated, vs 8)
     e.use(dpipe("dfl_x8_from_bf16"));
     e.buf(0, src); e.buf(1, xh_); e.buf(2, xs_);
     e.val(3, p);
     e.buf(4, gst_);
-    e.dispatch(8, 1, 1, 256);
+    e.dispatch(8, (nH / 64 + 7) / 8, 1, 256);
   }
   enc_qmm8(e, {{&fc_, y8_, H, 16.0f}}, xh_, xs_, nH, nH);
   {
@@ -1164,16 +1205,14 @@ void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const S
     const DLayer& Ly = layers_[l];
     const std::string sfx = "_" + std::to_string(l);
     dbg(e, "n" + sfx, n_, size_t(8) * H * 4);
-    if (!v1) {  // v1: the X8 table already holds the input norm's rows (dfl_embed_norm / the previous res_norm)
-      proj({{&Ly.ac, dyn_, 4 * G, 1.0f}}, H);
-      dbg(e, "D" + sfx, dyn_, size_t(8) * 4 * G * 4);
-      e.use(dpipe("dfl_conv_prep"));
-      e.buf(0, n_); e.buf(1, dyn_); e.buf(2, Ly.ac_base->buf); e.buf(3, xh_); e.buf(4, xs_);
-      e.val(5, cp);
-      e.dispatch(8, 1, 1, 256);
-    }
-    dbg(e, "a" + sfx, xh_, size_t(8) * H * 2);
-    proj({{&Ly.q, q_, 4096, 1.0f}, {&Ly.kv, kv_, 2048, 1.0f}}, H);
+    // non-v1: the attention conv's projection with dfl_conv_prep fused in (dfl_qmm8_cp) writes the q|kv input to the
+    // second X8 table; v1: the X8 table already holds the input norm's rows (dfl_embed_norm / the previous res_norm)
+    if (!v1 && !(skip & 8192)) enc_qmm8_cp(e, Ly.ac, Ly.ac_base, xh_, xs_);
+    dbg(e, "D" + sfx, dyn_, size_t(8) * 4 * G * 4);
+    const Buffer& ah = v1 ? xh_ : xh2_;
+    const Buffer& as = v1 ? xs_ : xs2_;
+    dbg(e, "a" + sfx, ah, size_t(8) * H * 2);
+    if (!(skip & 8192)) enc_qmm8(e, {{&Ly.q, q_, 4096, 1.0f}, {&Ly.kv, kv_, 2048, 1.0f}}, ah, as, H, H);
     // simdgroup-matrix attention by default (35B full window: 3.60 vs 4.52 ms per pass);
     // NI_DFLASH_ATTN=scalar selects the fp32 scalar kernel
     static const bool mma_env = !(getenv("NI_DFLASH_ATTN") && std::string(getenv("NI_DFLASH_ATTN")) == "scalar");
@@ -1230,18 +1269,14 @@ void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const S
     }
     dbg(e, "h_mid" + sfx, h_, size_t(8) * H * 4);
     dbg(e, "n2" + sfx, n_, size_t(8) * H * 4);
-    if (!v1) {
-      proj({{&Ly.mc, dyn_, 4 * G, 1.0f}}, H);
-      dbg(e, "D2" + sfx, dyn_, size_t(8) * 4 * G * 4);
-      e.use(dpipe("dfl_conv_prep"));
-      e.buf(0, n_); e.buf(1, dyn_); e.buf(2, Ly.mc_base->buf); e.buf(3, xh_); e.buf(4, xs_);
-      e.val(5, cp);
-      e.dispatch(8, 1, 1, 256);
-    }
-    dbg(e, "mm" + sfx, xh_, size_t(8) * H * 2);
+    if (!v1 && !(skip & 8192)) enc_qmm8_cp(e, Ly.mc, Ly.mc_base, xh_, xs_);  // the MLP conv, likewise
+    dbg(e, "D2" + sfx, dyn_, size_t(8) * 4 * G * 4);
+    const Buffer& mh = v1 ? xh_ : xh2_;
+    const Buffer& ms = v1 ? xs_ : xs2_;
+    dbg(e, "mm" + sfx, mh, size_t(8) * H * 2);
     if (v8_) {  // the target's verify GEMMs (same math; the sums layout is shared, only the table permutes)
-      enc_to_v8(e, xh_, H, v8t_);
-      if (!(skip & 1024)) tg_.enc_gu8(e, Ly.gate, Ly.up, v8t_, xs_, v8h_, v8hs_);
+      enc_to_v8(e, mh, H, v8t_);
+      if (!(skip & 1024)) tg_.enc_gu8(e, Ly.gate, Ly.up, v8t_, ms, v8h_, v8hs_);
       if (debug_) {
         kp::DflPerm pp{I};
         e.use(dpipe("dfl_v8_to_x8"));
@@ -1252,7 +1287,7 @@ void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const S
       dbg(e, "hgu" + sfx, hh_, size_t(8) * I * 2);
       if (!(skip & 2048)) tg_.enc_qmm8(e, {{&Ly.down, u_, H, false}}, 8, v8h_, v8hs_);
     } else {
-      if (!(skip & 1024)) enc_qmm8_gu(e, Ly.gate, Ly.up, xh_, xs_);
+      if (!(skip & 1024)) enc_qmm8_gu(e, Ly.gate, Ly.up, mh, ms);
       dbg(e, "hgu" + sfx, hh_, size_t(8) * I * 2);
       if (!(skip & 2048)) enc_qmm8(e, {{&Ly.down, u_, H, 1.0f}}, hh_, hs_, I, I);
     }

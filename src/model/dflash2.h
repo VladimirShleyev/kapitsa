@@ -227,7 +227,7 @@ class DFlash2 {
 
   void load_config(const std::string& dir);
   const Tensor* own(const Tensor& t, const char* label);
-  QLinear quantize(const std::vector<const Tensor*>& parts, const char* label);
+  QLinear quantize(const std::vector<const Tensor*>& parts, const char* label, const std::vector<uint32_t>& perm = {});
   QLinear row_view(const QLinear& src, uint32_t r0, uint32_t n);
   void alloc_buffers();
 
@@ -261,7 +261,7 @@ class DFlash2 {
   int pf_n_ = 0, pf_rows_ = 0;
 
   // pass buffers (8 rows)
-  Buffer h_, n_, xh_, xs_, hh_, hs_, dyn_, q_, kv_, Q_, Kb_, Vb_, part_o_, part_ml_, u_;
+  Buffer h_, n_, xh_, xs_, xh2_, xs2_, hh_, hs_, dyn_, q_, kv_, Q_, Kb_, Vb_, part_o_, part_ml_, u_;
   Buffer logits_, sel_, tk_v_, tk_i_, cand_v_, cand_i_, edges_, walk_s_, qprob_, walk_k_, rope_cs_;
   // acceptance: target distributions of the verify rows, result {a, token}
   Buffer dist_id_, dist_p_, dist_keep_, acc_, kdyn_, gst_;
@@ -287,6 +287,7 @@ class DFlash2 {
   const QLinear& draft_head() const { return head_n_ ? head_sub_ : tg_.lm_head(); }
   uint32_t draft_vocab() const { return head_n_ ? head_n_ : uint32_t(cfg_.vocab); }
   void enc_to_v8(Encoder& e, const Buffer& xh, uint32_t K, const Buffer& table);
+  void enc_qmm8_cp(Encoder& e, const QLinear& L, const Tensor* base, const Buffer& xh, const Buffer& xs);
   // context commit
   Buffer capt_, y8_, c8_, kv8_, cdbg_;
   Buffer pcap_, xph_, yph_, cph_, kvph_;

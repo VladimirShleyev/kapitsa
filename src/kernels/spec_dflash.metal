@@ -813,13 +813,16 @@ struct DflX8Params {
   uint K, m, src_ld;
   float scale;
 };
+// grid (8 rows, column blocks) x 256: block y converts groups y * 8 + sg, then every 8 * blocks.
 [[kernel]] void dfl_x8_from_bf16(const device bfloat* src [[buffer(0)]], device half* xh [[buffer(1)]],
                                  device float* xs [[buffer(2)]], constant DflX8Params& p [[buffer(3)]],
                                  const device uint* gst [[buffer(4)]],
-                                 uint r [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
-                                 uint nsg [[simdgroups_per_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+                                 uint2 tg [[threadgroup_position_in_grid]], uint2 ntgs [[threadgroups_per_grid]],
+                                 uint sg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
   const uint m = p.m == kDflGpu ? gst[1] : p.m;
-  for (uint g = sg; g < p.K / 64; g += nsg) {
+  const uint r = tg.x;
+  for (uint g = tg.y * nsg + sg; g < p.K / 64; g += nsg * ntgs.y) {
     const uint c = g * 64 + 2 * lane;
     float2 v = float2(0.0f);
     if (r < m) v = float2(*(const device bfloat2*)(src + size_t(r) * p.src_ld + c)) * p.scale;
@@ -1019,6 +1022,63 @@ NI_INLINE void dfl_qmm8_impl(const device uint32_t* const* Wv, const device bflo
 
 DFL_QMM8(dfl_qmm8, 1)
 DFL_QMM8(dfl_qmm8_r2, 2)
+
+// Conv projection + dfl_conv_prep in one dispatch. The projection's rows are stored permuted (DFlash2 constructor):
+// row block b < H / 64 holds D columns [4b, 4b + 4) of stage 0 tap 0 and the same 4 groups of tap 1, i.e. every
+// coefficient the 64 inputs of X8 group b need, so the simdgroup that finishes block b writes
+//   a[r] = (b00 + D[r,0,g]) x[r] + (b01 + D[r,1,g]) x[r-1]
+// for those 64 inputs and all 8 rows (dfl_conv_prep's math) into a second X8 table (the first is this GEMM's input).
+// Blocks >= H / 64 are the stage-1 columns 2G.. in order. D is written in the unpermuted order.
+// grid / threads as dfl_qmm8 (one segment, RF 1).
+[[kernel]] void dfl_qmm8_cp(const device uint32_t* W0 [[buffer(0)]], const device bfloat* S0 [[buffer(1)]],
+                            const device bfloat* B0 [[buffer(2)]], device float* D [[buffer(3)]],
+                            const device half* X [[buffer(16)]], const device float* XS [[buffer(17)]],
+                            constant DflQmm8Params& p [[buffer(18)]], const device float* x [[buffer(19)]],
+                            const device bfloat* base [[buffer(20)]], device half* xh2 [[buffer(21)]],
+                            device float* xs2 [[buffer(22)]], constant DflConvParams& cp [[buffer(23)]],
+                            uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float2 red[8 * 32];
+  threadgroup float dd[8][8][8];  // [row block in the threadgroup][weight row][token row]
+  const uint ks = p.ks, rbs = 8 / ks;
+  const uint rbl = sg / ks, rb = tg * rbs + rbl, kslice = sg % ks;
+  const uint N = p.N[0], gpr = p.K / 64;
+  const uint2 rc = dfl_lane_rc(lane);
+  const uint n = rb * 8 + rc.x;
+  const uint rows[1] = {min(n, N - 1)};
+  const uint gper = (gpr + ks - 1) / ks, g0 = min(kslice * gper, gpr), g1 = min(g0 + gper, gpr);
+  const device uint32_t* W[1] = {W0};
+  const device bfloat* S[1] = {S0};
+  const device bfloat* B[1] = {B0};
+  float2 acc[1][1];
+  if (p.bits[0] == 4) dfl_q8_run<4, 1, 1>(W, S, B, rows, p.K, X, p.x_ld, XS, g0, g1, lane, acc);
+  else dfl_q8_run<8, 1, 1>(W, S, B, rows, p.K, X, p.x_ld, XS, g0, g1, lane, acc);
+  if (ks > 1) {
+    if (kslice) red[sg * 32 + lane] = acc[0][0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (kslice) return;
+    for (uint j = 1; j < ks; ++j) acc[0][0] += red[(sg + j) * 32 + lane];
+  }
+  if (n >= N) return;  // N is a multiple of 8: the whole simdgroup
+  const uint H = cp.H;
+  // D in the unpermuted column order (dfl_conv_fin_norm reads stage 1; the debug dumps all of it)
+  const uint col = rb >= H / 64 ? n : rc.x < 4 ? 4 * rb + rc.x : cp.G + 4 * rb + rc.x - 4;
+  D[rc.y * p.y_ld[0] + col] = acc[0][0].x;
+  D[(rc.y + 1) * p.y_ld[0] + col] = acc[0][0].y;
+  if (rb >= H / 64) return;
+  dd[rbl][rc.x][rc.y] = acc[0][0].x;
+  dd[rbl][rc.x][rc.y + 1] = acc[0][0].y;
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  const uint c = rb * 64 + 2 * lane, j = lane / 8;  // input pair c, c + 1; its conv group 4 rb + j
+  const float2 b0 = float2(base[c], base[c + 1]), b1 = float2(base[H + c], base[H + c + 1]);
+  for (uint r = 0; r < 8; ++r) {
+    const float d0 = dd[rbl][j][r], d1 = dd[rbl][4 + j][r];
+    const float2 xc = *(const device float2*)(x + r * H + c);
+    const float2 xp = r > 0 ? *(const device float2*)(x + (r - 1) * H + c) : float2(0.0f);
+    const float2 a = (b0 + d0) * xc + (b1 + d1) * xp;
+    dfl_put2(xh2, xs2, r, H, rb, lane, a.x, a.y);
+  }
+}
 
 // Gate/up + SwiGLU: H[8, N] = half(silu(X Wg^T) * (X Wu^T)) and HS[N/64][8] = sums of the half
 // values per 64 columns (the down projection's X8 table). A threadgroup owns 64 output columns:
