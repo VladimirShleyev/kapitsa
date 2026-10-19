@@ -11,7 +11,7 @@ from source, [CONTRIBUTING.md](../CONTRIBUTING.md); for how the engine works, [a
 | `kapitsa claude`, `kapitsa codex`, `kapitsa opencode`, `kapitsa pi` | Starts that coding agent on Kapitsa ([Coding agents](#coding-agents)). |
 | `kapitsa pull M... [--from DIR]...` | Downloads models without starting them. `--dry-run [--json]` shows what `M` resolves to and downloads nothing. |
 | `kapitsa list [--json]` | The downloaded models: size on disk, complete or not, MTP head and draft model. |
-| `kapitsa rm M...` | Deletes downloaded models. Folders outside the store are left alone. |
+| `kapitsa rm M...` | Deletes downloaded models and says how much space that gave back. Folders outside the store are left alone. |
 | `kapitsa import FILE.gguf [options]` | Converts a GGUF file into a model folder ([GGUF files](#gguf-files)). |
 | `kapitsa doctor [--model M]... [--json]` | This Mac and which models fit it ([Memory and `kapitsa doctor`](#memory-and-kapitsa-doctor)). |
 | `kapitsa bench [--model M] [--quick] [--submit]` | Benchmarks Kapitsa on this Mac with the published protocol, and adds the result to the community results when asked ([Benchmarking this Mac](#benchmarking-this-mac)). |
@@ -47,6 +47,7 @@ Those start the best model for this Mac, with the same output as before.
 | Name | Aliases | What it is | Download | Variants |
 | --- | --- | --- | ---: | --- |
 | `qwen3.5-4b` | `4b` | Qwen3.5, dense and small: for 16-24 GB Macs and simple tasks | 4.6 GB | `4bit` (default), `6bit`, `8bit`, `bf16` |
+| `qwen3.5-9b` | `9b` | Qwen3.5, dense: the 4B's bigger sibling, the most capable model for a 16 GB Mac | 9.0 GB | `4bit` (default) |
 | `qwen3.8-27b` | `27b` | Qwen3.8, dense: the strongest coder of the three Qwen models, slower to write | 20.2 GB | `4bit` (default), `5bit`, `6bit`, `8bit`, `bf16` |
 | `qwen3.6-35b-a3b` | `35b`, `qwen3.6-35b`, `35b-a3b` | Qwen3.6, mixture of experts with 3B parameters active per token: quick to reply and to read | 22.1 GB | `4bit` (default), `5bit`, `6bit`, `8bit`, `bf16` |
 | `qwen3.8-flash-next` | `flash-next`, `flash` | Qwen3.8-Flash-Next 180B-A7B: mixture of 512 experts with 4-stream hyper-connections, an n-gram embedding and sparse attention past 2K tokens; for 128 GB Macs | 105.9 GB | `4bit` |
@@ -71,7 +72,7 @@ see [Other models](#other-models)), a folder (a path starting with `/`, `~`, `./
 
 The first start of a model downloads it; later starts use the copy on disk, offline too. A catalog model that would not
 start on this Mac is refused before the download, naming one that fits. Without `--model`, `kapitsa serve` takes the
-first of `35b`, `27b` and `4b` that holds one conversation of 32K tokens (or of the `--context` given) within this
+first of `35b`, `27b`, `9b` and `4b` that holds one conversation of 32K tokens (or of the `--context` given) within this
 Mac's memory budget (a model not downloaded yet is planned from its file headers, a few hundred KB).
 
 The API calls the model by its name (`qwen3.5-4b`), as `name:variant` for a variant other than the default
@@ -82,13 +83,13 @@ request's `model` field is not checked.
 
 Each Qwen model comes in several precisions, its variants. Download sizes, companions included:
 
-| Variant | Weights | `4b` | `27b` | `35b` |
-| --- | --- | ---: | ---: | ---: |
-| `4bit` (default) | MLX affine 4-bit, group 64: the fastest | 4.6 GB | 20.2 GB | 22.1 GB |
-| `5bit` | MLX affine 5-bit, group 64 | - | 23.5 GB | 26.4 GB |
-| `6bit` | MLX affine 6-bit, group 64: the quality choice | 5.6 GB | 26.9 GB | 30.7 GB |
-| `8bit` | MLX affine 8-bit, group 64 | 6.7 GB | 33.6 GB | 39.4 GB |
-| `bf16` | unquantized, where it fits | 10.6 GB | 58.8 GB | 71.9 GB |
+| Variant | Weights | `4b` | `9b` | `27b` | `35b` |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `4bit` (default) | MLX affine 4-bit, group 64: the fastest | 4.6 GB | 9.0 GB | 20.2 GB | 22.1 GB |
+| `5bit` | MLX affine 5-bit, group 64 | - | - | 23.5 GB | 26.4 GB |
+| `6bit` | MLX affine 6-bit, group 64: the quality choice | 5.6 GB | - | 26.9 GB | 30.7 GB |
+| `8bit` | MLX affine 8-bit, group 64 | 6.7 GB | - | 33.6 GB | 39.4 GB |
+| `bf16` | unquantized, where it fits | 10.6 GB | - | 58.8 GB | 71.9 GB |
 
 Each step up stays closer to the original weights, decodes slower and needs more memory; `kapitsa doctor` shows which
 variants fit this Mac. Every variant keeps the model's MTP head and draft model, and pins its repo to a revision, so a
@@ -115,6 +116,18 @@ repos use the MTP head they contain, if any.
 A folder needs `config.json`, the `*.safetensors` weights and `tokenizer.json`, and may hold an MTP head in
 `mtp.safetensors`. The official Hugging Face checkpoints of the dense models run as well. A Qwen3.8-Flash-Next
 (`qwen4_exp`) folder also needs its `ple.safetensors` table.
+
+NVIDIA's dense Nemotron-H checkpoints run from a folder too (`kapitsa serve --model DIR`): Mamba-2, attention and dense
+MLP layers, no experts, as [Nemotron Nano 4B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16) (BF16) and
+[Nemotron Nano 9B v2](https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4) (NVFP4, with its attention, first
+and last layers and LM head left BF16; the head loads as 8-bit rows, `NI_NH_HEAD`). They have no draft model. The 4B
+decodes with prompt lookup: drafts from earlier in the conversation (up to 4 per cycle), verified in one pass, so the
+reply is the one plain decoding gives, 4-8% sooner on an M1 Pro. The 9B v2 decodes plainly, as prompt lookup measured
+within 2% either way on its NVFP4 weights there; `--spec N` sets the drafts per cycle for either, `--spec 0` turns
+prompt lookup off. The 9B v2's template turns thinking on and off with `/think` and `/no_think` in a message: the APIs'
+switches (`enable_thinking`, `reasoning_effort`, Anthropic's `thinking`) set that flag, and its
+`<TOOLCALL>[...]</TOOLCALL>` calls come back as tool calls. That template also drops a past turn's reasoning and its
+`<think>` tags, so a follow-up request reuses the cache up to the previous reply, not through it.
 
 Refused, with a message: other architectures, other quantizations (MLX's `mxfp4`, `nvfp4` and `mxfp8` modes among
 them; NVIDIA's own NVFP4 checkpoints of the catalog's Nemotron models are read as they are), mixture-of-experts
@@ -164,7 +177,13 @@ conversions. Inside, `.kapitsa/` holds the parts of files being downloaded and t
 - `HF_TOKEN`, or the token `hf auth login` saved, is sent for gated or private repos; `HF_ENDPOINT` points at a mirror.
 
 `kapitsa list` shows the store and the variants not downloaded yet; `kapitsa rm 35b:6bit` deletes a variant
-(`kapitsa rm 35b`: the default one, or the only one downloaded).
+(`kapitsa rm 35b`: the default one, or the only one downloaded). It says how much space it gave back: a model that is an APFS clone of
+another copy (Nace Agent's, a `--from` folder, the Hugging Face cache) frees nothing.
+
+When a download does not fit the disk (Kapitsa keeps 1 GB spare), `kapitsa serve`, `kapitsa pull`, `kapitsa bench`
+and the coding-agent commands, run in a terminal, list the other downloaded models with what deleting each would free:
+space selects, Enter deletes them and the download goes on once they free enough, Esc cancels. Elsewhere (the app,
+scripts) the error names the `kapitsa rm` commands that would make room.
 
 ## Server options
 
@@ -182,7 +201,7 @@ screen too), otherwise to stderr; Ctrl+C stops it.
 | `--context N` | `128k`, less where memory is tight | Context per conversation: tokens (`131072`), `k` or `m` of them (`128k`, `1m`), or `max`, the model's own limit ([Context](#context)). `--ctx N` works too. |
 | `--slots N` | `4` where memory allows, else `3` or `2` | Requests that run at once, each with its conversation's cache kept for follow-ups; more wait for a free slot, first come first served. |
 | `--dflash auto\|none\|DIR` | `auto` | Draft model: `auto` uses the one downloaded with the model, unless it would keep one `--context` conversation from fitting; `none` decodes without it (with the MTP head on Qwen); `DIR` names a drafter folder. |
-| `--spec N` | `1` on the 35B, `4` on the 27B and 4B | MTP draft depth when no draft model is used; `0` turns speculative decoding off. Dory with `--loop-kv per-loop`: drafts per cycle (by default 2 at 1-2 loops, 3 at 3-4; [speculative decoding](#dory-thinking-depth)). |
+| `--spec N` | `1` on the 35B, `4` on the 27B and 4B | MTP draft depth when no draft model is used; `0` turns speculative decoding off. Dory with `--loop-kv per-loop`: drafts per cycle (by default 2 at 1-2 loops, 3 at 3-4; [speculative decoding](#dory-thinking-depth)). Dense Nemotron-H (Nemotron Nano): prompt lookup's drafts per cycle (by default 4 with BF16 MLP layers, off with NVFP4). |
 | `--mem-budget GB` | macOS's recommended working set, a little less | GPU memory Kapitsa may hold ([Memory and `kapitsa doctor`](#memory-and-kapitsa-doctor)). |
 | `--prefill-chunk N` | `2048` (`1024` when memory is short) | Prompt tokens per prefill pass. |
 | `--loops N` | `2` | Dory: how many times its shared block runs per token, 1-4 ([thinking depth](#dory-thinking-depth)); requests may choose their own. |
@@ -370,10 +389,10 @@ tools and MCP servers work as usual:
 ## Images
 
 Every catalog model except `nemotron-3.5-lightning` and `nemotron-labs-dory1.0-4b` (text-only models) reads images, in
-every precision: `qwen3.5-4b`, `qwen3.6-35b-a3b`, `qwen3.8-27b`, `qwen3.8-flash-next`, `nemotron-3.5-bolt` and
-`nemotron-3.5-super-vl`. Their vision towers come with the download and load with the first image: about 0.67 GB of GPU
-memory for the 4B's, 0.9 GB for the 35B's, the 27B's and Flash-Next's (bf16 in every precision), 1.7 GB for Bolt's and
-for Super-VL's. On a model without one, such as Lightning, Dory or a text-only conversion, each image becomes a short
+every precision: `qwen3.5-4b`, `qwen3.5-9b`, `qwen3.6-35b-a3b`, `qwen3.8-27b`, `qwen3.8-flash-next`,
+`nemotron-3.5-bolt` and `nemotron-3.5-super-vl`. Their vision towers come with the download and load with the first
+image: about 0.67 GB of GPU memory for the 4B's, 0.9 GB for the 9B's, the 35B's, the 27B's and Flash-Next's (bf16 in
+every precision), 1.7 GB for Bolt's and for Super-VL's. On a model without one, such as Lightning, Dory or a text-only conversion, each image becomes a short
 note in the prompt, so agents that attach screenshots keep working.
 
 | API | Image part |
@@ -426,12 +445,12 @@ the same for programs (`starts`, `fits_full_context`, `kv_tokens_in_budget`, `de
 What fits, for the 4-bit variants at `--context 64k --slots 2`, with the tokens of KV cache that fit in all. macOS sets
 the working set at about 2/3 to 78% of the RAM, depending on its version, hence the ranges:
 
-| Mac RAM | Budget | `4b` | `27b` | `35b` |
-| --- | --- | --- | --- | --- |
-| 16 GB | 11.0-12.9 GB | yes (174K-225K) | no | no |
-| 24 GB | 16.5-19.3 GB | yes (323K-399K) | only at the larger budget (23K) | no |
-| 32 GB | 22.0-25.7 GB | yes (472K-572K) | yes (62K-80K) | yes (50K-153K) |
-| 48 GB | 33.0-38.6 GB | yes (770K-922K) | yes (184K-265K) | yes (475K-724K) |
+| Mac RAM | Budget | `4b` | `9b` | `27b` | `35b` |
+| --- | --- | --- | --- | --- | --- |
+| 16 GB | 11.0-12.9 GB | yes (174K-225K) | yes (89K-140K) | no | no |
+| 24 GB | 16.5-19.3 GB | yes (323K-399K) | yes (238K-314K) | only at the larger budget (23K) | no |
+| 32 GB | 22.0-25.7 GB | yes (472K-572K) | yes (387K-487K) | yes (62K-80K) | yes (50K-153K) |
+| 48 GB | 33.0-38.6 GB | yes (770K-922K) | yes (685K-837K) | yes (184K-265K) | yes (475K-724K) |
 
 On a 48 GB Mac the 35B also fits in 6-bit with a full conversation and its draft model, in 8-bit only with shorter ones.
 Flash-Next needs a 128 GB Mac: on 48 and 64 GB its weights alone exceed the budget, and on 96 GB (about 72 GB) its fixed
@@ -526,6 +545,9 @@ this Mac, on `127.0.0.1:8000`) in the background and at each login, restarting i
 | `NI_IMAGE_CACHE_MB` | `256` | GPU memory kept for the embeddings of recent images. |
 | `NI_NH_BF16` | off | Nemotron Super-VL: `1` keeps its BF16 latent projections in BF16 instead of 8-bit (exact; about 4% slower decoding). |
 | `NI_NH_ATTN_Q8` | off | Nemotron Lightning: `1` stores its BF16 attention projections in 8-bit (about 3% faster decoding, slightly less accurate). |
+| `NI_NH_HEAD` | `q8` with NVFP4 | Dense Nemotron-H models (Nemotron Nano): `bf16` keeps an NVFP4 checkpoint's BF16 LM head (the 9B v2's) BF16 instead of 8-bit rows; `q8` also runs a BF16 checkpoint's head as 8-bit rows. |
+| `NI_NH_NGRAM` | `4` with BF16, `0` with NVFP4 | Dense Nemotron-H models (Nemotron Nano): prompt lookup's drafts per cycle when `--spec` is not given; `0` decodes plainly. |
+| `NI_NH_FP4` | `l2` on M1 Macs, else `l0` | Dense Nemotron-H models: how NVFP4 codes are laid out for the GPU, as `NI_DORY_FP4`; both give the same outputs to the bit. |
 | `NI_DSPARK_DYN` | `0.2` | Nemotron Lightning's DSpark draft model: how many of its 7 drafts are verified, chosen per cycle as for `NI_LILI_DYN`; `0` verifies all 7. |
 | `NI_DSPARK_K` | `16` | Nemotron Lightning's DSpark draft model: the candidates per draft position its Markov head rescores (1-32). |
 | `NI_LILI_DYN` | `0.04` | Nemotron's LiLiCorr draft model: how many of its 7 drafts are verified is chosen per cycle, weighing their expected acceptance against each extra row's cost (this value, relative to a cycle's fixed cost); `0` verifies all 7. |

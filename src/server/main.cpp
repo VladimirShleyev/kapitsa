@@ -51,7 +51,7 @@
 #include <ctime>
 
 #ifndef KAPITSA_VERSION
-#define KAPITSA_VERSION "0.1.37"
+#define KAPITSA_VERSION "0.1.38"
 #endif
 #ifndef KAPITSA_GIT
 #define KAPITSA_GIT ""
@@ -166,7 +166,7 @@ static double to_gb(const std::string& opt, const std::string& v, const char* he
 // The order best_model tries the catalog in: the most capable model first (the catalog itself lists the models from
 // small to large, Qwen first, as the README and the picker show them); catalog models not named here come last.
 static std::vector<const hub::CatalogModel*> by_preference() {
-  static const char* const kOrder[] = {"qwen3.6-35b-a3b", "qwen3.8-27b", "qwen3.5-4b", "nemotron-3.5-bolt",
+  static const char* const kOrder[] = {"qwen3.6-35b-a3b", "qwen3.8-27b", "qwen3.5-9b", "qwen3.5-4b", "nemotron-3.5-bolt",
                                        "nemotron-3.5-super-vl", "nemotron-3.5-lightning"};
   std::vector<const hub::CatalogModel*> out;
   for (const char* n : kOrder)
@@ -684,7 +684,9 @@ static int serve(int argc, char** argv, int first) {
     for (const auto& n : notes) ui::note(n);
   }
   try {
-    opt.model_dir = hub::ensure(ref, hub::PullOptions{});
+    hub::PullOptions po;
+    if (ui::can_prompt(yes)) po.make_room = ui::make_room;  // out of disk space: which models to delete, asked
+    opt.model_dir = hub::ensure(ref, po);
   } catch (const hub::Stopped& e) {
     return stopped(e);
   } catch (const hub::Error& e) {
@@ -1049,6 +1051,7 @@ static int pull(int argc, char** argv) {
     }
   }
   if (models.empty()) usage_error("which model? e.g. kapitsa pull 35b", help);
+  if (!as_json && ui::can_prompt(false)) po.make_room = ui::make_room;  // out of disk space: which models to delete, asked
   EngineOptions eo;  // serve's defaults: one 32k conversation, the slots auto_slots picks (fit checks count 2)
   for (const auto& name : models) {
     hub::ModelRef ref;
@@ -1187,14 +1190,15 @@ static int rm(int argc, char** argv) {
     const std::string root = hub::models_dir() + "/";
     if (ref.dir.compare(0, root.size(), root) != 0 || ref.dir.size() <= root.size())
       return fail("refusing to delete " + ref.dir + " (not in " + root + ")");
-    uint64_t bytes = 0;
-    for (const auto& m : hub::installed())
-      if (m.dir == ref.dir) bytes = m.bytes;
+    // what it gives back: files cloned from another copy (Nace Agent's, the Hugging Face cache) free nothing
+    const uint64_t bytes = hub::freeable_bytes(ref.dir);
     std::error_code ec;
     std::filesystem::remove_all(ref.dir, ec);
     if (ec) return fail("Can't delete " + hub::tilde(ref.dir) + ": " + ec.message());
-    if (term::fancy()) ui::ok("Deleted " + term::bold(ref.name) + term::dim("  " + hub::fmt_bytes(bytes) + " freed"), true);
-    else printf("Deleted %s (%s).\n", ref.name.c_str(), hub::fmt_bytes(bytes).c_str());
+    const std::string freed = bytes < (1u << 20) ? "nothing freed: its files are shared with another copy"
+                                                 : hub::fmt_bytes(bytes) + " freed";
+    if (term::fancy()) ui::ok("Deleted " + term::bold(ref.name) + term::dim("  " + freed), true);
+    else printf("Deleted %s (%s).\n", ref.name.c_str(), freed.c_str());
   }
   return 0;
 }
