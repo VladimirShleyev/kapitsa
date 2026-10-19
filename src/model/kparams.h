@@ -276,6 +276,7 @@ struct X8Prep {
   float eps;
   uint32_t xn_ld, write_lo;
   uint32_t unroll;  // x8_prep2 norm: 4 independent sum-of-squares chains
+  uint32_t write_t;  // x8_prep2: also the T table (buffer 8) of qmm8t (src/kernels/tensor/verify8t.metal)
 };
 
 struct Qmm8 {
@@ -295,11 +296,15 @@ struct SwigluX8 {
 };
 
 struct Moe8Plan {
-  uint32_t R, k, E, gu_gx, dn_gx, layer, small, sgu_gx, sdn_gx, rlim;
+  uint32_t R, k, E, gu_gx, dn_gx, layer, small, sgu_gx, sdn_gx, rlim, split, shs, sep, edn_gx, topk;
 };
 
 struct Moe8s {
   uint32_t K, N, w_stride, s_stride, k, x_ld;
+};
+
+struct Moe8e {
+  uint32_t K, N, w_stride, s_stride, k;
 };
 
 struct Moe8Down {
@@ -308,6 +313,12 @@ struct Moe8Down {
 
 struct Moe8Combine {
   uint32_t N, k;
+};
+
+struct Moe8CombineX8 {
+  uint32_t N, k, R;
+  float eps;
+  uint32_t unroll, write_t;
 };
 
 } // namespace ni::kp

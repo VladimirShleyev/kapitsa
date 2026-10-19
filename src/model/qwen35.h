@@ -126,9 +126,19 @@ struct V8Knobs {
   // 8192 conv / attention projections, 16384 ring commit. With NI_AB: the in-pipeline cost of those kernels.
   int skip = 0;
   int pad = 0;  // timing only: this many empty dispatches after every verify GEMM (the per-dispatch cost, with NI_AB)
+  int tw = 1;   // the dense 4-bit verify GEMMs on the GPU's matrix units (qmm8t; Apple10 = M5 and macOS 26, else off)
+  // fused verify passes (verify8_fuse.metal, bitwise the passes they replace): 1 = MoE combine + the next norm's X8
+  // table (and qmm8t's T table with tw), 4 = GDN prep with the rows' norms reduced together (the MoE top-k + plan
+  // fusion is moe8_plan's own: tkp)
+  int fuse = 5;
+  int emu = -1;  // MMA-exact small-expert passes (NI_V8_MOE_EMU, see enc_moe8): -1 = the environment's, else 0-2
+  int tkp = -1;  // NI_V8_MOE_TOPKPLAN: the router top-k inside moe8_plan (-1 = the environment's)
+  int shs = -1;  // NI_V8_MOE_SHS: the shared expert as small tiles (with split 8; -1 = the environment's)
+  int split = -1;  // NI_V8_MOE_SPLIT: experts with 3..split rows as 2-row small tiles (-1 = the environment's)
 };
 V8Knobs& v8_knobs();
-// "key=value,..." over a copy of `base` (keys: cm, pair, kplan, gusplit, gdnsplit, prepu, skip, pad); unknown keys are fatal
+// "key=value,..." over a copy of `base` (keys: cm, pair, kplan, gusplit, gdnsplit, prepu, skip, pad, tw, fuse, emu, shs,
+// split, tkp); unknown keys are fatal
 V8Knobs v8_knobs_parse(const char* spec, V8Knobs base);
 
 class Qwen35 : public Model {
@@ -308,6 +318,8 @@ class Qwen35 : public Model {
   // passes for 1-2-row experts): a row's logits then depend only on the rows before it, not on how the
   // other rows route. A speculative sampler that needs p(. | prefix) exactly sets it (~3% slower verify).
   void set_verify_moe_exact(bool on) { v8_moe_exact_ = on; }
+  // dev (tools/bench_verify8): the last verify's MoE expert passes again with layer li's weights (timing only)
+  void moe8_replay(Encoder& e, int li, int mask);
   // The 8-row verify GEMMs, for other 8-row passes (the DFlash2 drafter). Inputs are X8 tables
   // (verify8.metal layout: half operands in fragment order + per-64 group sums), R <= 8 live rows.
   struct Seg8 {
@@ -316,9 +328,10 @@ class Qwen35 : public Model {
     uint32_t y_ld = 0;  // 0: N
     bool add = false;   // y += X W^T
   };
-  // y_i[R, N_i] = X W_i^T for up to 4 matrices sharing K and bits (x2: two-term hi+lo inputs)
+  // y_i[R, N_i] = X W_i^T for up to 4 matrices sharing K and bits (x2: two-term hi+lo inputs). tt: the same
+  // inputs as a T table (enc_x8 with tw), for qmm8t on the GPU's matrix units (V8Knobs::tw; 4-bit group 64)
   void enc_qmm8(Encoder& e, const std::vector<Seg8>& segs, int R, const Buffer& table, const Buffer& sums,
-                bool x2 = false);
+                bool x2 = false, const Buffer* tt = nullptr);
   // h = half(silu(X Wg^T) * (X Wu^T)) written as the down projection's X8 table h + sums hs (4-bit, N % 64 == 0)
   void enc_gu8(Encoder& e, const QLinear& gate, const QLinear& up, const Buffer& table, const Buffer& sums,
                const Buffer& h, const Buffer& hs);
@@ -474,12 +487,19 @@ class Qwen35 : public Model {
   // ---- 8-row verify path (qwen35_v8.cpp) ----
   void v8_alloc();
   void encode_verify8(Encoder& e, Seq& s, int pos, int R, const SamplingParams& sp, uint32_t step);
-  // x rows (fp32, x_ld floats apart) -> X8 table (+ group sums), optional RMSNorm, optional lo table
-  void enc_x8(Encoder& e, const Buffer& x, int R, int K, const Tensor* norm, bool lo = false, int x_ld = 0,
-              const Buffer* xn_out = nullptr);
-  void enc_attn8(Encoder& e, const Seq& s, const Layer& L, const Buffer& kc, const Buffer& vc, int cap, int pos, int R);
+  // x rows (fp32, x_ld floats apart) -> X8 table (+ group sums), optional RMSNorm, optional lo table.
+  // tw: also the T table v8tt_ of qmm8t when that path is on (v8_tw()); returns whether it was written.
+  bool enc_x8(Encoder& e, const Buffer& x, int R, int K, const Tensor* norm, bool lo = false, int x_ld = 0,
+              const Buffer* xn_out = nullptr, bool tw = false);
+  // the 8-row GEMMs on the matrix units (qmm8t, src/kernels/tensor/verify8t.metal): an M5 and V8Knobs::tw
+  bool v8_tw() const;
+  // table_ready: the layer's input-norm table is already written (by the previous layer's enc_moe8)
+  void enc_attn8(Encoder& e, const Seq& s, const Layer& L, const Buffer& kc, const Buffer& vc, int cap, int pos, int R,
+                 bool table_ready = false);
   void enc_mlp8(Encoder& e, const Layer& L, int R);
-  void enc_moe8(Encoder& e, const Layer& L, int R, int li);
+  // next_norm: the norm of what follows (the next layer's input norm, or the final norm); when given, the combine may
+  // also write that norm's X8 table (V8Knobs::fuse & 1; with v8_tw() also the T table). Returns whether it did.
+  bool enc_moe8(Encoder& e, const Layer& L, int R, int li, const Tensor* next_norm = nullptr);
 
   std::string dir_;
   std::string prefix_;
@@ -539,7 +559,8 @@ class Qwen35 : public Model {
   bool v8_ready_ = false;
   Buffer v8g_, v8u_;  // split MLP: fp32 gate / up rows [8][I]
   Buffer v8cnt_;      // gdn_step_verify8s: per-head arrival counters (zero between dispatches)
-  Buffer v8t_, v8s_, v8tl_, v8sl_, v8h_, v8hs_, v8tiles_, v8nt_, v8slot_, v8args_, v8out_, v8sh_, v8ustat_, v8sm_, v8hsc_, v8xn_;
+  Buffer v8tt_;  // T table (qmm8t's input layout)
+  Buffer v8t_, v8s_, v8tl_, v8sl_, v8h_, v8hs_, v8tiles_, v8nt_, v8slot_, v8args_, v8out_, v8sh_, v8ustat_, v8sm_, v8hsc_, v8xn_, v8hse_, v8sm2_, v8hsc2_, v8hse2_;
 };
 
 } // namespace ni
