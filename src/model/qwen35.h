@@ -123,8 +123,8 @@ struct V8Knobs {
   // timing only (wrong outputs): skip kernel groups of a dense verify / drafting pass. Verify: 1 GDN step, 2 attention
   // core, 4 GDN prep, 8 MLP down, 16 MLP gate/up, 32 GDN in_proj, 64 GDN out / attention o, 128 LM head + sampling,
   // 256 normed X8 preps, 512 attention q|k|v; drafter: 1024 MLP gate/up, 2048 MLP down, 4096 LM head,
-  // 8192 conv / attention projections, 16384 ring commit, 32768 attention. With NI_AB: the in-pipeline cost of those
-  // kernels.
+  // 8192 conv / attention projections, 16384 ring commit, 32768 attention, 262144 attention reduce. With NI_AB: the
+  // in-pipeline cost of those kernels.
   int skip = 0;
   int pad = 0;  // timing only: this many empty dispatches after every verify GEMM (the per-dispatch cost, with NI_AB)
   int dfl = 0;  // drafter experiments (DFlash2::encode_draft_impl): variant bits, A/B'd per cycle with NI_AB

@@ -906,7 +906,7 @@ NI_INLINE void dfl_codes(const device uint32_t* wrow, uint g, uint q, thread hal
 
 // acc[m][f] (tokens fn, fn+1 of weight row rows[f]) over groups [g0, g1) for NM matrices sharing
 // rows; RF fragments of 8 rows per simdgroup share each X gather.
-template <int BITS, int NM, int RF>
+template <int BITS, int NM, int RF, bool SN = false>  // SN (4-bit): subnormal codes, as dfl_q8_run4
 NI_INLINE void dfl_q8_run(const device uint32_t* const* W, const device bfloat* const* S, const device bfloat* const* B,
                           thread const uint* rows, uint K, const device half* X, uint x_ld, const device float* XS,
                           uint g0, uint g1, uint lane, thread float2 (&acc)[NM][RF]) {
@@ -936,7 +936,13 @@ NI_INLINE void dfl_q8_run(const device uint32_t* const* W, const device bfloat* 
       _Pragma("clang loop unroll(full)")
       for (int r = 0; r < RF; ++r) {
         half2 a[8];
-        dfl_codes<BITS>(W[m] + size_t(rows[r]) * wpr, g, q, a);
+        if (SN && BITS == 4) {
+          const uint2 w = *(const device uint2*)(W[m] + size_t(rows[r]) * wpr + g * 8 + 2 * q);
+          _Pragma("clang loop unroll(full)")
+          for (int f = 0; f < 8; ++f) a[f] = as_type<half2>(((f < 4 ? w.x : w.y) >> (4 * (f % 4))) & 0x000F000Fu);
+        } else {
+          dfl_codes<BITS>(W[m] + size_t(rows[r]) * wpr, g, q, a);
+        }
         simdgroup_float8x8 C = simdgroup_float8x8(0);
         _Pragma("clang loop unroll(full)")
         for (int f = 0; f < 8; ++f) {
@@ -947,7 +953,8 @@ NI_INLINE void dfl_q8_run(const device uint32_t* const* W, const device bfloat* 
           Bm.thread_elements()[1] = b[f].y;
           simdgroup_multiply_accumulate(C, Am, Bm, C);
         }
-        const float s = float(S[m][size_t(rows[r]) * gpr + g]), bb = float(B[m][size_t(rows[r]) * gpr + g]);
+        const float s = float(S[m][size_t(rows[r]) * gpr + g]) * (SN && BITS == 4 ? 16777216.0f : 1.0f),
+                    bb = float(B[m][size_t(rows[r]) * gpr + g]);
         acc[m][r].x += s * C.thread_elements()[0] + bb * sx.x;
         acc[m][r].y += s * C.thread_elements()[1] + bb * sx.y;
       }
@@ -1222,8 +1229,9 @@ NI_INLINE void dfl_qmm8_gu_impl(const device uint32_t* Wg, const device bfloat* 
   const device bfloat* S[2] = {Sg, Su};
   const device bfloat* B[2] = {Bg, Bu};
   float2 acc[2][1];
-  // (dfl_q8_run4's pairs / prefetch / subnormal codes measured slower here: 44.5 -> 45.2-49.1 us at 6144 x 2048)
-  if (p.bits[0] == 4) dfl_q8_run<4, 2, 1>(W, S, B, rows, p.K, X, p.x_ld, XS, g0, g1, lane, acc);
+  // subnormal codes only: dfl_q8_run4's pairs / prefetch measured slower here (6144 x 2048: 44.5 us; pairs +
+  // prefetch 49.1, pairs 45.2; subnormal codes 44.2)
+  if (p.bits[0] == 4) dfl_q8_run<4, 2, 1, true>(W, S, B, rows, p.K, X, p.x_ld, XS, g0, g1, lane, acc);
   else dfl_q8_run<8, 2, 1>(W, S, B, rows, p.K, X, p.x_ld, XS, g0, g1, lane, acc);
   if (KS > 1) {
     if (kslice) {

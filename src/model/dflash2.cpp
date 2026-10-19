@@ -1187,7 +1187,8 @@ void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const S
     nsplit = old_attn ? (kCtxKeep + kGpuChunk - 1) / kGpuChunk : splits;  // the grid; empty splits exit
   }
   const kp::DflConv cp{H, G, cfg_.eps};
-  // timing only: 1024 MLP gate/up, 2048 MLP down, 4096 LM head, 8192 projections, 32768 attention
+  // timing only: 1024 MLP gate/up, 2048 MLP down, 4096 LM head, 8192 projections, 32768 attention, 262144 its
+  // reduce (35B, 512 tokens: 0.04 ms per pass)
   const int skip = v8_knobs().skip;
   auto proj = [&](const std::vector<DflSeg8>& segs, uint32_t K) {  // conv / attention projections
     if (!(skip & 8192)) enc_qmm8(e, segs, xh_, xs_, K, K);
@@ -1248,12 +1249,14 @@ void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const S
         e.buf(8, gst_);
         e.dispatch(nsplit, 8, 1, 128);
       }
-      kp::DflAttnRed rp{nsplit, Pk, lo, chunk};
-      e.use(dpipe("dfl_attn_reduce"));
-      e.buf(0, part_o_); e.buf(1, part_ml_); e.buf(2, xh_); e.buf(3, xs_);
-      e.val(4, rp);
-      e.buf(5, gst_);
-      e.dispatch(32, 8, 1, 128);
+      if (!(skip & 262144)) {
+        kp::DflAttnRed rp{nsplit, Pk, lo, chunk};
+        e.use(dpipe("dfl_attn_reduce"));
+        e.buf(0, part_o_); e.buf(1, part_ml_); e.buf(2, xh_); e.buf(3, xs_);
+        e.val(4, rp);
+        e.buf(5, gst_);
+        e.dispatch(32, 8, 1, 128);
+      }
     }
     dbg(e, "o" + sfx, xh_, size_t(8) * 4096 * 2);
     proj({{&Ly.o, u_, H, 1.0f}}, 4096);
