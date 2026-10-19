@@ -1652,16 +1652,24 @@ void DFlash2::prewarm_pipelines() {
   Gpu& g = Gpu::get();
   // spec_dflash.metal (dfl_*), verify8.metal (qmm8*, x8_*, moe8*, attn8*, gdn_step_verify8) and the verify's
   // shared kernels; the prompt commit's prefill GEMMs
-  static const char* prefixes[] = {"dfl_", "kf_", "qmm8", "x8_", "moe8", "attn8", "gdn_step_verify8", "gdn_prep_verify",
+  static const char* prefixes[] = {"dfl_", "qmm8", "x8_", "moe8", "attn8", "gdn_step_verify8", "gdn_prep_verify",
                                    "attn_prep", "attn_rows_reduce", "topk_stage1_rows", "sample_stage2_rows",
                                    "qmm_b4_m64_n64", "qmm_b4_m32_n32", "qmm_b8_m64_n64", "qmm_b8_m32_n32", "copy_u32"};
+  // the KFlash decoder's kernels (spec_kflash.metal) only when it is on
+  const char* kf = getenv("NI_KFLASH");
+  const bool with_kf = kf && *kf && strcmp(kf, "0");
   std::vector<std::string> v;
-  for (const std::string& n : g.function_names())
+  for (const std::string& n : g.function_names()) {
+    if (with_kf && n.rfind("kf_", 0) == 0) {
+      v.push_back(n);
+      continue;
+    }
     for (const char* pre : prefixes)
       if (n.rfind(pre, 0) == 0) {
         v.push_back(n);
         break;
       }
+  }
   if (v.empty()) return;
   const unsigned nt = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
   std::vector<std::thread> th;

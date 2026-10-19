@@ -254,6 +254,7 @@ NI_INLINE float4 kf_dots8(const device uint32_t* W, const device bfloat* S, cons
                           uint bits, const device float* zr, const device float* we, uint lane) {
   float4 acc = float4(0.0f);
   const uint gpr = H / 64;
+  _Pragma("clang loop unroll_count(4)")
   for (uint k0 = 8 * lane; k0 < H; k0 += 256) {
     const float sc = float(S[size_t(c) * gpr + k0 / 64]), bi = float(B[size_t(c) * gpr + k0 / 64]);
     float e[8];
