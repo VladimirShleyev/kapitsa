@@ -450,6 +450,8 @@ void DFlash2::alloc_buffers() {
   xh2_ = g.alloc(16 * H * 2, "dfl_xh2");
   xs2_ = g.alloc(H / 64 * 8 * 4, "dfl_xs2");
   hh_ = g.alloc(16 * I * 2, "dfl_hh");
+  gu_g_ = g.alloc(8 * I * 4, "dfl_gu_g");  // the matrix-unit gate / up rows (fp32)
+  gu_u_ = g.alloc(8 * I * 4, "dfl_gu_u");
   hs_ = g.alloc(I / 64 * 8 * 4, "dfl_hs");
   dyn_ = g.alloc(8 * G4 * 4, "dfl_dyn");
   q_ = g.alloc(8 * 4096 * 4, "dfl_q");
@@ -502,7 +504,7 @@ void DFlash2::alloc_buffers() {
   kv8_ = g.alloc(8 * KV * 4, "dfl_kv8");
   cdbg_ = g.alloc(size_t(kCtxKeep) * H * 4, "dfl_c");
   memset(capt_.ptr(), 0, capt_.size);
-  for (Buffer* b : {&h_, &n_, &xh_, &xs_, &xh2_, &xs2_, &hh_, &hs_, &dyn_, &q_, &kv_, &Q_, &Kb_, &Vb_, &part_o_, &part_ml_, &u_,
+  for (Buffer* b : {&h_, &n_, &xh_, &xs_, &xh2_, &xs2_, &hh_, &gu_g_, &gu_u_, &hs_, &dyn_, &q_, &kv_, &Q_, &Kb_, &Vb_, &part_o_, &part_ml_, &u_,
                     &logits_, &sel_, &tk_v_, &tk_i_, &cand_v_, &cand_i_, &edges_, &walk_s_, &qprob_, &walk_k_, &capt_,
                     &y8_, &c8_, &kv8_, &cdbg_, &rope_cs_, &dist_id_, &dist_p_, &dist_keep_, &acc_, &kdyn_, &gst_})
     resident_ += b->size;
@@ -674,7 +676,7 @@ size_t DFlash2::plan_bytes(const std::string& dir, const Qwen35Config& target, s
   // alloc_buffers()
   const size_t nH = nT * H, Kx = std::max({nH, size_t(4096), H, I}), KV = NL * 2048, G4 = 4 * (H / std::max<size_t>(gs, 1)),
                ntg = (V + 2047) / 2048;
-  size_t b = 5 * 8 * H * 4 + 16 * Kx * 2 + Kx / 64 * 8 * 4 + 16 * H * 2 + H / 64 * 8 * 4 + 16 * I * 2 + I / 64 * 8 * 4 + 8 * G4 * 4 + 8 * 4096 * 4 +
+  size_t b = 5 * 8 * H * 4 + 2 * 8 * I * 4 + 16 * Kx * 2 + Kx / 64 * 8 * 4 + 16 * H * 2 + H / 64 * 8 * 4 + 16 * I * 2 + I / 64 * 8 * 4 + 8 * G4 * 4 + 8 * 4096 * 4 +
              8 * 2048 * 4 + 32 * 8 * 128 * 4 + 2 * 8 * 8 * 128 * 4 + 32 * (32 * 8 * 128 * 4 + 32 * 8 * 2 * 4) + 8 * V * 4 + 8 * kRank * 4 +
              2 * 7 * ntg * 16 * 4 + 8 * nH * 2 + 8 * KV * 4 + size_t(kCtxKeep) * H * 4 + (64 << 10);
   const char* v8 = getenv("NI_DFLASH_V8");
@@ -1360,7 +1362,18 @@ void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const S
       dbg(e, "hgu" + sfx, hh_, size_t(8) * I * 2);
       if (!(skip & 2048)) tg_.enc_qmm8(e, {{&Ly.down, u_, H, false}}, 8, v8h_, v8hs_);
     } else {
-      if (!(skip & 1024)) enc_qmm8_gu(e, Ly.gate, Ly.up, mh, ms);
+      if (skip & 1024) {
+      } else if (!(dk & 128) && tw_for({{&Ly.gate, gu_g_, I, 1.0f}, {&Ly.up, gu_u_, I, 1.0f}}, H)) {
+        // on the matrix units: gate and up as two segments of one qmm8t GEMM, then dfl_swiglu_x8 (35B drafting pass
+        // -0.046 to -0.066 ms against dfl_qmm8_gu, NI_AB=dfl=128, 3 runs; V8Knobs::dfl 128 keeps dfl_qmm8_gu)
+        enc_qmm8(e, {{&Ly.gate, gu_g_, I, 1.0f}, {&Ly.up, gu_u_, I, 1.0f}}, mh, ms, H, H);
+        e.use(dpipe("dfl_swiglu_x8"));
+        e.buf(0, gu_g_); e.buf(1, gu_u_); e.buf(2, hh_); e.buf(3, hs_);
+        e.val(4, I);
+        e.dispatch(8, (I / 64 + 7) / 8, 1, 256);
+      } else {
+        enc_qmm8_gu(e, Ly.gate, Ly.up, mh, ms);
+      }
       dbg(e, "hgu" + sfx, hh_, size_t(8) * I * 2);
       if (!(skip & 2048)) enc_qmm8(e, {{&Ly.down, u_, H, 1.0f}}, hh_, hs_, I, I);
     }

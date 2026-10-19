@@ -262,7 +262,7 @@ class DFlash2 {
   int pf_n_ = 0, pf_rows_ = 0;
 
   // pass buffers (8 rows)
-  Buffer h_, n_, xh_, xs_, xh2_, xs2_, hh_, hs_, dyn_, q_, kv_, Q_, Kb_, Vb_, part_o_, part_ml_, u_;
+  Buffer h_, n_, xh_, xs_, xh2_, xs2_, hh_, hs_, gu_g_, gu_u_, dyn_, q_, kv_, Q_, Kb_, Vb_, part_o_, part_ml_, u_;
   Buffer logits_, sel_, tk_v_, tk_i_, cand_v_, cand_i_, edges_, walk_s_, qprob_, walk_k_, rope_cs_;
   // acceptance: target distributions of the verify rows, result {a, token}
   Buffer dist_id_, dist_p_, dist_keep_, acc_, kdyn_, gst_;

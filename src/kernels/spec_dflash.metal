@@ -1222,6 +1222,22 @@ DFL_QMM8(dfl_qmm8_r2, 2)
   }
 }
 
+// SwiGLU of gate / up rows from a GEMM (fp32 [8][N] each, the matrix-unit path): H = half(silu(g) * u) as the
+// down projection's X8 table (+ T table) and its group sums, as dfl_qmm8_gu's epilogue. grid (8 rows, ceil(N / 512))
+// x 256: one 64-group per simdgroup.
+[[kernel]] void dfl_swiglu_x8(const device float* gy [[buffer(0)]], const device float* uy [[buffer(1)]],
+                              device half* xh [[buffer(2)]], device float* xs [[buffer(3)]],
+                              constant uint& N [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                              uint2 ntgs [[threadgroups_per_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                              uint nsg [[simdgroups_per_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  const uint r = tg.x;
+  for (uint g = tg.y * nsg + sg; g < N / 64; g += nsg * ntgs.y) {
+    const uint c = g * 64 + 2 * lane;
+    const float2 a = *(const device float2*)(gy + r * N + c), b = *(const device float2*)(uy + r * N + c);
+    dfl_put2(xh, xs, r, N, g, lane, silu(a.x) * b.x, silu(a.y) * b.y);
+  }
+}
+
 // Gate/up + SwiGLU: H[8, N] = half(silu(X Wg^T) * (X Wu^T)) and HS[N/64][8] = sums of the half
 // values per 64 columns (the down projection's X8 table). A threadgroup owns 64 output columns:
 // 8 row blocks x KS simdgroups splitting K (fixed-order sum). grid: N/64 threadgroups x 256*KS.
