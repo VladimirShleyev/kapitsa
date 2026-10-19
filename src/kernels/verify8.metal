@@ -811,6 +811,7 @@ struct Moe8PlanParams {
   uint sep;     // 1: the split experts' (and the shared expert's) tiles in list B (sm2, ntiles[2]: MMA-exact passes)
                 // while list A has the 1-2-row experts (greedy: moe8s2)
   uint edn_gx;  // grid x of list B's down pass
+  uint topk;    // 1: the router top-k first (topk256_row, one simdgroup per row; E == 256): no moe_topk256_rows pass
 };
 
 // n 2-row small tiles of expert e from s0 on (its rows in order; slots from my[t]) in tile list sm
@@ -829,11 +830,13 @@ NI_INLINE void v8_put_tiles(device uint* sm, uint s0, uint n, uint e, thread con
   }
 }
 
-[[kernel]] void moe8_plan(const device uint* ridx [[buffer(0)]], device uint* tiles [[buffer(1)]],
+[[kernel]] void moe8_plan(device uint* ridx [[buffer(0)]], device uint* tiles [[buffer(1)]],
                           device uint* ntiles [[buffer(2)]], device uint* slot [[buffer(3)]],
                           device uint* args [[buffer(4)]], constant Moe8PlanParams& p [[buffer(5)]],
                           device uint* stats [[buffer(6)]], device uint* sm [[buffer(7)]],
                           const device uint* rows_lim [[buffer(8)]], device uint* sm2 [[buffer(9)]],
+                          const device float* rlog [[buffer(10)]], const device float* slog [[buffer(11)]],
+                          device float* rwts [[buffer(12)]], constant TopkParams& tp [[buffer(13)]],
                           uint tid [[thread_position_in_threadgroup]], uint ntg [[threads_per_threadgroup]],
                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
   threadgroup uint ids[64];
@@ -841,7 +844,11 @@ NI_INLINE void v8_put_tiles(device uint* sm, uint s0, uint n, uint e, thread con
   threadgroup uint total[4];
   const uint R = p.rlim ? min(p.R, rows_lim[0]) : p.R;
   const uint n = R * p.k;
-  if (tid < n) ids[tid] = ridx[tid];
+  if (p.topk) {
+    if (sg < p.R) topk256_row(rlog, slog, ridx, rwts, tp, sg, lane, ids);
+  } else if (tid < n) {
+    ids[tid] = ridx[tid];
+  }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   // thread e: its slots per row (rows use each expert at most once)
   const uint e = tid;

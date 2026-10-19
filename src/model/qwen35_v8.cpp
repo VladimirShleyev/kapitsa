@@ -102,6 +102,7 @@ V8Knobs v8_knobs_parse(const char* spec, V8Knobs k) {
     else if (key == "emu") k.emu = v;
     else if (key == "split") k.split = v;
     else if (key == "shs") k.shs = v;
+    else if (key == "tkp") k.tkp = v;
     else fatal("knobs: unknown key '%s'", key.c_str());
     a = b + 1;
   }
@@ -575,10 +576,15 @@ void Qwen35::enc_moe8(Encoder& e, const Layer& L, int R, int li) {
   enc_x8(e, x_, R, D, L.post_norm, precise, 0, small && !emu ? &v8xn_ : nullptr);  // moe8s2 reads fp32 rows
   enc_qmm8(e, {{&L.router, rlog_, uint32_t(E)}, {&L.shared_gate, slog_, 1u}}, R, v8t_, v8s_, precise);
   kp::Topk tp{uint32_t(E), uint32_t(k), cfg_.norm_topk ? 1u : 0u};
-  e.use(pipe8(E == 256 && k <= 8 ? "moe_topk256_rows" : "moe_topk_rows"));
-  e.buf(0, rlog_); e.buf(1, slog_); e.buf(2, ridx_); e.buf(3, rwts_);
-  e.val(4, tp);
-  e.dispatch(R, 1, 1, 32);
+  // the router top-k inside moe8_plan (E == 256: its 8 simdgroups are the rows; the same topk256_row code)
+  static const bool topk_env = env_int("NI_V8_MOE_TOPKPLAN", 1) != 0;
+  const bool topk_in_plan = E == 256 && k <= 8 && (v8_knobs().tkp >= 0 ? v8_knobs().tkp != 0 : topk_env);
+  if (!topk_in_plan) {
+    e.use(pipe8(E == 256 && k <= 8 ? "moe_topk256_rows" : "moe_topk_rows"));
+    e.buf(0, rlog_); e.buf(1, slog_); e.buf(2, ridx_); e.buf(3, rwts_);
+    e.val(4, tp);
+    e.dispatch(R, 1, 1, 32);
+  }
   static const int dn_nf = env_int("NI_V8_MOE_NF", 2), dn_cs = 4;
   if (D % (8 * dn_nf * dn_cs)) fatal("moe8: hidden %d", D);
   // scalar passes: 8 simdgroups x 4 columns per threadgroup, inputs staged (hidden <= 2048)
@@ -586,13 +592,16 @@ void Qwen35::enc_moe8(Encoder& e, const Layer& L, int R, int li) {
   if (small && D > 2048) fatal("moe8s2: hidden %d > 2048", D);
   kp::Moe8Plan pp{uint32_t(R), uint32_t(k), uint32_t(E), I / 64, uint32_t(D / (8 * dn_nf * dn_cs)), uint32_t(li),
                   uint32_t(small), emu ? I / 64 : I / (SR * s_nsg), emu ? uint32_t(D) / 128 : uint32_t(D) / (SR * s_nsg),
-                  v8_rlim_ ? 1u : 0u, uint32_t(split), shs ? 1u : 0u, sep ? 1u : 0u, uint32_t(D) / 128};
+                  v8_rlim_ ? 1u : 0u, uint32_t(split), shs ? 1u : 0u, sep ? 1u : 0u, uint32_t(D) / 128,
+                  topk_in_plan ? 1u : 0u};
   e.use(pipe8("moe8_plan"));
   e.buf(0, ridx_); e.buf(1, v8tiles_); e.buf(2, v8nt_); e.buf(3, v8slot_); e.buf(4, v8args_);
   e.val(5, pp);
   e.buf(6, v8ustat_); e.buf(7, v8sm_);
   e.buf(8, v8_rlim_ ? *v8_rlim_ : v8nt_);
   e.buf(9, v8sm2_);
+  e.buf(10, rlog_); e.buf(11, slog_); e.buf(12, rwts_);
+  e.val(13, tp);
   e.dispatch(1, 1, 1, uint32_t(std::max(32, (E + 31) / 32 * 32)));
   // gate/up + SwiGLU per touched expert (+ the shared expert), one h table per tile; strides in the routed format's
   // words / scale groups
