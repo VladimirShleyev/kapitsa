@@ -4,11 +4,14 @@
 //   bench_tq probe <tq_probe_*>     operand / destination layouts of matmul2d's cooperative tensors, per lane
 //   bench_tq gnorm [Hv] [R]         gdn_gnorm_x8t's T table against its X8 table
 //   bench_tq stats <kernel> ...     code size, stack and GPRs (as ni_compile)
+//   bench_tq router [N] [K] [reps]  the MoE router's precise 8-bit GEMM (qmm8x2_b8_nf1) vs tw8x2 on the matrix units
 // Variants: tq = per-group matmul2d of device tensors (half inputs x uint4b codes); tw = codes as a uint8 cooperative
 // left operand, inputs a device tensor (= qmm8t), twp prefetching, tw{a1,a2,a3,a4} ablations (no matrix op;
-// cache-resident weights; loads only; weight loads only); tc / tcp = both operands cooperative (16 x 16 x 32 ops).
-// GDN in_proj 12352x2048 (us): qmm8snb nf1 ks8 34.9, tq 49.5, tw 31.0, tc 30.8, twa2 18.5 (the compute side),
-// twa3 27.4 (the loads: 518 GB/s, bench_bw's ceiling at this size).
+// cache-resident weights; loads only; weight loads only); twl = 32-bit offsets instead of row pointers (69 -> 59 GPRs);
+// tc / tcp{,2,3,4} = both operands cooperative (16 x 16 x 32 ops), prefetch depth (CS=<column blocks per threadgroup>).
+// GDN in_proj 12352x2048 (us): qmm8snb nf1 ks8 34.9, tq 49.5, tw 31.0, tc 30.8, twl 30.9, twa2 18.5 (the compute side),
+// twa3 27.4 (the loads: 518 GB/s, bench_bw's ceiling at this size). Deeper prefetch (tcp2-4: 120+ GPRs) and column
+// blocks instead of k-slices (cs 2-8) were slower on every 35B shape; router 257x2048: qmm8x2 5.4 us, tw8x2 4.6 (ks 16).
 #include "metal/gpu.h"
 #include "model/kparams.h"
 #include "util/bf16.h"
@@ -130,7 +133,7 @@ inline void tq_probe_body(device int* out, uint lane) {
 // Lane roles (probed): c = k chunk (lane & 1) | ((lane >> 3) & 1) << 1, r = (lane >> 1 & 3) | (lane >> 4 & 1) << 2.
 // k-slot (c, jblk, kk) <-> physical input 16 c + 8 (jblk >> 1) + 2 kk + (jblk & 1) of the group, so a lane's codes of a
 // weight row are 8 contiguous bytes and 4 slots of a jblk are one masked word.
-template <int NT, int PF, int ABL, int ST = 0, int SP = 0>
+template <int NT, int PF, int ABL, int ST = 0, int SP = 0, int LN = 0>
 inline void tw_body(const device uint* W, const device ushort* S, const device ushort* Bq, const device half* T,
                     const device float* sums, device float* Y, constant TqParams& p, threadgroup float* red, uint tg,
                     uint sg, uint lane) {
@@ -160,10 +163,17 @@ inline void tw_body(const device uint* W, const device ushort* S, const device u
   uint2 wn[NJ];
   ushort sn[NJ], bn[NJ];
   uint2 s4[NJ], b4[NJ];
+  const uint wo = (n0 + r) * wpr + 2 * c, so = (n0 + r) * gpr;  // LN: 32-bit offsets instead of NJ x 3 pointers
   auto load = [&](uint g) {
     const uint gw = ABL == 2 ? 0 : g;
     _Pragma("clang loop unroll(full)")
     for (int j = 0; j < NJ; ++j) {
+      if (LN) {
+        wn[j] = *(const device uint2*)(W + (wo + j * 8 * wpr + gw * 8));
+        sn[j] = S[so + j * 8 * gpr + gw];
+        bn[j] = Bq[so + j * 8 * gpr + gw];
+        continue;
+      }
       wn[j] = *(const device uint2*)(wp[j] + gw * 8);
       if (ABL == 4) { sn[j] = bn[j] = 0; continue; }
       if (SP) {
@@ -272,6 +282,93 @@ inline void tw_body(const device uint* W, const device ushort* S, const device u
     threadgroup float red[(MAXKS - 1) * (NT / 2) * 32];                                                          \
     tw_body<NT, PF, ABL, ##__VA_ARGS__>(W, S, Bq, T, sums, Y, p, red, tg, sg, lane);                               \
   }
+
+// tw8x2: the router's precise GEMM (8-bit codes, two-term inputs hi + lo) on the matrix units: codes as the uint8 left
+// operand (16 bytes per row and lane), two matmul2d per group (hi, lo T tables) into one destination.
+template <int NT>
+inline void tw8x2_body(const device uint* W, const device ushort* S, const device ushort* Bq, const device half* Th,
+                       const device half* Tl, const device float* sums, const device float* sums_lo, device float* Y,
+                       constant TqParams& p, threadgroup float* red, uint tg, uint sg, uint lane) {
+  const uint n0 = tg * NT, gpr = p.K / 64, wpr = p.K / 4, gper = (gpr + p.ks - 1) / p.ks;
+  const uint g0 = min(sg * gper, gpr), g1 = min(g0 + gper, gpr);
+  const uint c = (lane & 1) | (((lane >> 3) & 1) << 1), r = ((lane >> 1) & 3) | (((lane >> 4) & 1) << 2);
+  constexpr auto desc = matmul2d_descriptor(NT, 8, 64, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroup> op;
+  auto Lw = op.template get_left_input_cooperative_tensor<uint8_t, half, float>();
+  auto tH = tensor<device half, dextents<int32_t, 2>, tensor_inline>((device half*)Th, dextents<int32_t, 2>(p.K, 8));
+  auto tL = tensor<device half, dextents<int32_t, 2>, tensor_inline>((device half*)Tl, dextents<int32_t, 2>(p.K, 8));
+  auto Rx0 = tH.template slice<64, 8>(0, 0);
+  auto acc = op.template get_destination_cooperative_tensor<decltype(Lw), decltype(Rx0), float>();
+  _Pragma("clang loop unroll(full)")
+  for (uint16_t i = 0; i < acc.get_capacity(); ++i) acc[i] = 0.0f;
+  constexpr int NJ = NT / 8;
+  uint rows[NJ];
+  _Pragma("clang loop unroll(full)")
+  for (int j = 0; j < NJ; ++j) rows[j] = min(n0 + r + 8 * j, p.N - 1);
+  const uint t0 = 4 * (lane & 1);
+  for (uint g = g0; g < g1; ++g) {
+    uint4 w[NJ];
+    float sc[NJ], bc[NJ];
+    _Pragma("clang loop unroll(full)")
+    for (int j = 0; j < NJ; ++j) {
+      w[j] = *(const device uint4*)(W + rows[j] * wpr + g * 16 + 4 * c);
+      sc[j] = as_type<float>(uint(S[rows[j] * gpr + g]) << 16);
+      bc[j] = as_type<float>(uint(Bq[rows[j] * gpr + g]) << 16);
+    }
+    _Pragma("clang loop unroll(full)")
+    for (int j = 0; j < NJ; ++j)
+      _Pragma("clang loop unroll(full)")
+      for (int jb = 0; jb < 4; ++jb) {
+        // slot (c, jb, kk) = input 16 c + 8 (jb >> 1) + 2 kk + (jb & 1): byte 8 (jb >> 1) + 2 kk + (jb & 1) of the 16
+        const uint wa = w[j][2 * (jb >> 1)], wb = w[j][2 * (jb >> 1) + 1], sh = 8 * (jb & 1);
+        const int i = (j >> 1) * 32 + jb * 8 + (j & 1) * 4;
+        Lw[i] = uchar(wa >> sh);
+        Lw[i + 1] = uchar(wa >> (sh + 16));
+        Lw[i + 2] = uchar(wb >> sh);
+        Lw[i + 3] = uchar(wb >> (sh + 16));
+      }
+    auto sH = tH.template slice<64, 8>(g * 64, 0);
+    auto sL = tL.template slice<64, 8>(g * 64, 0);
+    auto d = op.template get_destination_cooperative_tensor<decltype(Lw), decltype(sH), float>();
+    _Pragma("clang loop unroll(full)")
+    for (uint16_t i = 0; i < d.get_capacity(); ++i) d[i] = 0.0f;
+    op.run(Lw, sH, d);
+    op.run(Lw, sL, d);
+    const float4 sx = *(const device float4*)(sums + g * 8 + t0) + *(const device float4*)(sums_lo + g * 8 + t0);
+    _Pragma("clang loop unroll(full)")
+    for (int j = 0; j < NJ; ++j)
+      _Pragma("clang loop unroll(full)")
+      for (int kk = 0; kk < 4; ++kk) acc[j * 4 + kk] = fma(sc[j], d[j * 4 + kk], fma(bc[j], sx[kk], acc[j * 4 + kk]));
+  }
+  if (p.ks > 1) {
+    constexpr uint cap = NT / 2;
+    if (sg)
+      _Pragma("clang loop unroll(full)")
+      for (uint i = 0; i < cap; ++i) red[((sg - 1) * cap + i) * 32 + lane] = acc[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg) return;
+    for (uint jj = 1; jj < p.ks; ++jj)
+      _Pragma("clang loop unroll(full)")
+      for (uint i = 0; i < cap; ++i) acc[i] += red[((jj - 1) * cap + i) * 32 + lane];
+  }
+  if ((lane >> 3) & 1) return;
+  _Pragma("clang loop unroll(full)")
+  for (int j = 0; j < NJ; ++j)
+    _Pragma("clang loop unroll(full)")
+    for (int kk = 0; kk < 4; ++kk) {
+      const uint t = t0 + kk, n = n0 + r + 8 * j;
+      if (t < p.R && n < p.N) Y[t * p.N + n] = acc[j * 4 + kk];
+    }
+}
+[[kernel]] void tw8x2_nt16(const device uint* W [[buffer(0)]], const device ushort* S [[buffer(1)]],
+                           const device ushort* Bq [[buffer(2)]], const device half* Th [[buffer(3)]],
+                           const device half* Tl [[buffer(4)]], const device float* sums [[buffer(5)]],
+                           const device float* sums_lo [[buffer(6)]], device float* Y [[buffer(7)]],
+                           constant TqParams& p [[buffer(8)]], uint tg [[threadgroup_position_in_grid]],
+                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float red[15 * 8 * 32];
+  tw8x2_body<16>(W, S, Bq, Th, Tl, sums, sums_lo, Y, p, red, tg, sg, lane);
+}
 TW(tw_nt16, 16, 0, 0)
 TW(tw_nt32, 32, 0, 0)
 TW(tw_nt64, 64, 0, 0)
@@ -289,6 +386,10 @@ TW(twpss_nt16, 16, 1, 0, 1, 1)
 TW(twpss_nt32, 32, 1, 0, 1, 1)
 TW(twssa1_nt16, 16, 0, 1, 1, 1)
 TW(twq_nt16, 16, 2, 0, 1)
+TW(twl_nt16, 16, 0, 0, 0, 0, 1)
+TW(twlp_nt16, 16, 1, 0, 0, 0, 1)
+TW(twl_nt32, 32, 0, 0, 0, 0, 1)
+TW(twlp_nt32, 32, 1, 0, 0, 0, 1)
 TWX(tw8_nt16, 16, 8, 0, 0)
 TWX(tw4_nt16, 16, 4, 0, 0)
 TW(twa3_nt16, 16, 0, 3, 1)
@@ -330,28 +431,24 @@ inline void tc_body(const device uint* W, const device ushort* S, const device u
   const uint t0 = 4 * (lane & 1);
   // this lane's input token r, chunk c
   const device uint4* tp = (const device uint4*)(T + (r * 4 + c) * 16);
-  uint2 wn[NJ];
-  ushort sn[NJ], bn[NJ];
-  uint4 xa, xb;
-  auto load = [&](uint g) {
+  struct Stage {
+    uint2 w[NJ];
+    ushort s[NJ], b[NJ];
+    uint4 xa, xb;
+    float4 sx;
+  };
+  auto load = [&](thread Stage& o, uint g) {
     _Pragma("clang loop unroll(full)")
     for (int j = 0; j < NJ; ++j) {
-      wn[j] = *(const device uint2*)(wp[j] + g * 8);
-      sn[j] = sp[j][g];
-      bn[j] = bp[j][g];
+      o.w[j] = *(const device uint2*)(wp[j] + g * 8);
+      o.s[j] = sp[j][g];
+      o.b[j] = bp[j][g];
     }
-    xa = tp[g * 64];
-    xb = tp[g * 64 + 1];
+    o.xa = tp[g * 64];
+    o.xb = tp[g * 64 + 1];
+    o.sx = *(const device float4*)(sums + g * 8 + t0);
   };
-  if (PF && g0 < g1) load(g0);
-  for (uint g = g0; g < g1; ++g) {
-    if (!PF) load(g);
-    uint2 w[NJ];
-    ushort sc[NJ], bc[NJ];
-    _Pragma("clang loop unroll(full)")
-    for (int j = 0; j < NJ; ++j) w[j] = wn[j], sc[j] = sn[j], bc[j] = bn[j];
-    const uint4 x0 = xa, x1 = xb;
-    if (PF && g + 1 < g1) load(g + 1);
+  auto compute = [&](thread const Stage& cur) {
     auto d = op.template get_destination_cooperative_tensor<decltype(Lw), decltype(Rx), float>();
     _Pragma("clang loop unroll(full)")
     for (uint16_t i = 0; i < d.get_capacity(); ++i) d[i] = 0.0f;
@@ -361,12 +458,11 @@ inline void tc_body(const device uint* W, const device ushort* S, const device u
       for (int j = 0; j < NJ; ++j)
         _Pragma("clang loop unroll(full)")
         for (int jj = 0; jj < 2; ++jj) {
-          const uint u = ((h ? w[j].y : w[j].x) >> (4 * jj)) & 0x0F0F0F0Fu;
+          const uint u = ((h ? cur.w[j].y : cur.w[j].x) >> (4 * jj)) & 0x0F0F0F0Fu;
           const int i = (j >> 1) * 16 + jj * 8 + (j & 1) * 4;
           Lw[i] = uchar(u); Lw[i + 1] = uchar(u >> 8); Lw[i + 2] = uchar(u >> 16); Lw[i + 3] = uchar(u >> 24);
         }
-      // right: elements jj * 8 + kk (token r), jj * 8 + 4 + kk padding (stay 0)
-      const uint4 xv = h ? x1 : x0;
+      const uint4 xv = h ? cur.xb : cur.xa;
       _Pragma("clang loop unroll(full)")
       for (int jj = 0; jj < 2; ++jj) {
         const half2 a = as_type<half2>(xv[2 * jj]), b = as_type<half2>(xv[2 * jj + 1]);
@@ -374,12 +470,34 @@ inline void tc_body(const device uint* W, const device ushort* S, const device u
       }
       op.run(Lw, Rx, d);
     }
-    const float4 sx = *(const device float4*)(sums + g * 8 + t0);
     _Pragma("clang loop unroll(full)")
     for (int j = 0; j < NJ; ++j) {
-      const float s = as_type<float>(uint(sc[j]) << 16), b = as_type<float>(uint(bc[j]) << 16);
+      const float s = as_type<float>(uint(cur.s[j]) << 16), b = as_type<float>(uint(cur.b[j]) << 16);
       _Pragma("clang loop unroll(full)")
-      for (int kk = 0; kk < 4; ++kk) acc[j * 4 + kk] = fma(s, d[j * 4 + kk], fma(b, sx[kk], acc[j * 4 + kk]));
+      for (int kk = 0; kk < 4; ++kk) acc[j * 4 + kk] = fma(s, d[j * 4 + kk], fma(b, cur.sx[kk], acc[j * 4 + kk]));
+    }
+  };
+  if (PF == 0) {
+    for (uint g = g0; g < g1; ++g) {
+      Stage cur;
+      load(cur, g);
+      compute(cur);
+    }
+  } else {
+    Stage st[PF > 0 ? PF : 1];
+    _Pragma("clang loop unroll(full)")
+    for (int q = 0; q < PF; ++q)
+      if (g0 + q < g1) load(st[q], g0 + q);
+    for (uint g = g0; g < g1; g += PF) {
+      _Pragma("clang loop unroll(full)")
+      for (int q = 0; q < PF; ++q) {
+        const uint gg = g + q;
+        if (gg < g1) {
+          const Stage cur = st[q];
+          if (gg + PF < g1) load(st[q], gg + PF);
+          compute(cur);
+        }
+      }
     }
   }
   if (p.ks > 1) {
@@ -413,6 +531,10 @@ inline void tc_body(const device uint* W, const device ushort* S, const device u
   }
 TC(tc_nt16, 16, 0, 16)
 TC(tcp_nt16, 16, 1, 16)
+TC(tcp2_nt16, 16, 2, 16)
+TC(tcp3_nt16, 16, 3, 16)
+TC(tcp4_nt16, 16, 4, 16)
+TC(tcp2_nt32, 32, 2, 8)
 TC(tc_nt32, 32, 0, 8)
 TC(tcp_nt32, 32, 1, 8)
 TQ(tq_nt16, 16)
@@ -491,6 +613,7 @@ void kernel_stats(const Bytes& b, long* text, long* stack, long* gprs) {
 struct QMat {
   Buffer w, s, b;
 };
+static int env_ks() { return getenv("KS") ? atoi(getenv("KS")) : 8; }
 
 static QMat make_mat(Gpu& g, uint32_t N, uint32_t K, std::mt19937& rng) {
   QMat m;
@@ -511,6 +634,115 @@ static QMat make_mat(Gpu& g, uint32_t N, uint32_t K, std::mt19937& rng) {
 }
 
 int main(int argc, char** argv) {
+  if (!strcmp(argv[1], "router")) {  // bench_tq router [N=257] [K=2048] [reps=20]: qmm8x2_b8_nf1 vs tw8x2
+    const uint32_t N = argc > 2 ? atoi(argv[2]) : 257, K = argc > 3 ? atoi(argv[3]) : 2048;
+    const int reps = argc > 4 ? atoi(argv[4]) : 20;
+    Gpu& g = Gpu::get();
+    std::string src = kSrc;
+    src.replace(src.find("NI_TQ_KERNELS"), 13, kKern);
+    g.compile_extra("tq", strdup(src.c_str()), true);
+    std::mt19937 rng(5);
+    const size_t mbytes = size_t(N) * K + size_t(N) * K / 64 * 4;
+    const int copies = std::clamp(int(1.0e9 / mbytes), 1, 400);
+    std::vector<QMat> mats;
+    for (int i = 0; i < copies; ++i) {
+      QMat m;
+      m.w = g.alloc(size_t(N) * K, "w", false);
+      m.s = g.alloc(size_t(N) * K / 64 * 2, "s", false);
+      m.b = g.alloc(size_t(N) * K / 64 * 2, "b", false);
+      for (size_t q = 0; q < size_t(N) * K / 4; ++q) m.w.as<uint32_t>()[q] = rng();
+      std::uniform_real_distribution<float> d(-0.02f, 0.02f);
+      for (size_t q = 0; q < size_t(N) * K / 64; ++q) {
+        m.s.as<uint16_t>()[q] = f32_to_bf16(std::fabs(d(rng)) * 0.02f + 1e-5f);
+        m.b.as<uint16_t>()[q] = f32_to_bf16(d(rng));
+      }
+      mats.push_back(m);
+    }
+    Buffer x = g.alloc(size_t(8) * K * 4), tab = g.alloc(size_t(K) * 16), sm = g.alloc(size_t(K) / 64 * 32);
+    Buffer tlo = g.alloc(size_t(K) * 16), slo = g.alloc(size_t(K) / 64 * 32), th = g.alloc(size_t(K) * 16), tl = g.alloc(size_t(K) * 16);
+    Buffer y = g.alloc(size_t(8) * N * 4), y2 = g.alloc(size_t(8) * N * 4);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (size_t i = 0; i < size_t(8) * K; ++i) x.as<float>()[i] = nd(rng);
+    {
+      auto e = g.begin();
+      e->use(g.pipeline("x8_prep2"));
+      kp::X8Prep pp{K, 8, K, 0, 0, 1e-6f, K, 1u, 0u, 1u};
+      e->buf(0, x); e->buf(1, x); e->buf(2, tab); e->buf(3, sm); e->buf(4, x);
+      e->val(5, pp);
+      e->buf(6, tlo); e->buf(7, slo); e->buf(8, th);
+      e->dispatch(K / 256, 1, 1, 256);
+      e->commit_and_wait();
+    }
+    // the lo T table (the same permutation)
+    for (uint32_t t = 0; t < 8; ++t)
+      for (uint32_t gi = 0; gi < K / 64; ++gi)
+        for (uint32_t sl = 0; sl < 64; ++sl) {
+          const uint32_t c = (sl >> 2) & 3, jb = (sl >> 4) & 3, kk = sl & 3, k = 16 * c + 8 * (jb >> 1) + 2 * kk + (jb & 1);
+          const float v = x.as<float>()[size_t(t) * K + gi * 64 + k], h = float(__fp16(v));
+          tl.as<__fp16>()[size_t(t) * K + gi * 64 + sl] = __fp16(v - h);
+        }
+    Pipeline pq = g.pipeline("qmm8x2_b8_nf1"), pt = g.pipeline("tw8x2_nt16");
+    const int ksq = 8, kst = env_ks();
+    auto enc_q = [&](Encoder& e, int i) {
+      kp::Qmm8 prm{};
+      prm.K = K; prm.R = 8; prm.nseg = 1; prm.ks = ksq; prm.N[0] = N; prm.y_ld[0] = N;
+      const uint32_t ntg = (N + 7) / 8;
+      prm.tg_begin[1] = ntg;
+      e.use(pq);
+      for (int sgi = 0; sgi < 4; ++sgi) {
+        e.buf(sgi * 4 + 0, mats[i].w); e.buf(sgi * 4 + 1, mats[i].s); e.buf(sgi * 4 + 2, mats[i].b); e.buf(sgi * 4 + 3, y);
+      }
+      e.buf(16, tab); e.buf(17, sm); e.val(18, prm); e.buf(19, tlo); e.buf(20, slo);
+      e.dispatch(ntg, 1, 1, 32 * ksq);
+    };
+    auto enc_t = [&](Encoder& e, int i) {
+      struct { uint32_t K, N, ks, R, cs; } prm{K, N, uint32_t(kst), 8, 1};
+      e.use(pt);
+      e.buf(0, mats[i].w); e.buf(1, mats[i].s); e.buf(2, mats[i].b); e.buf(3, th); e.buf(4, tl); e.buf(5, sm);
+      e.buf(6, slo); e.buf(7, y2); e.val(8, prm);
+      e.dispatch((N + 15) / 16, 1, 1, 32 * kst);
+    };
+    {
+      auto e = g.begin();
+      enc_q(*e, 0);
+      enc_t(*e, 0);
+      e->commit_and_wait();
+    }
+    // fp64 reference from x (hi + lo = x to ~22 bits)
+    double eq = 0, et = 0, rr = 0, mq = 0, mt = 0;
+    for (uint32_t t = 0; t < 8; ++t)
+      for (uint32_t n = 0; n < N; ++n) {
+        double acc = 0;
+        for (uint32_t gi = 0; gi < K / 64; ++gi) {
+          const double s_ = bf16_to_f32(mats[0].s.as<uint16_t>()[size_t(n) * (K / 64) + gi]);
+          const double b_ = bf16_to_f32(mats[0].b.as<uint16_t>()[size_t(n) * (K / 64) + gi]);
+          for (uint32_t k = 0; k < 64; ++k) {
+            const uint32_t kk = gi * 64 + k;
+            const float v = x.as<float>()[size_t(t) * K + kk], h = float(__fp16(v));
+            const double xv = double(h) + double(float(__fp16(v - h)));
+            acc += (s_ * mats[0].w.as<uint8_t>()[size_t(n) * K + kk] + b_) * xv;
+          }
+        }
+        rr += acc * acc;
+        const double dq = y.as<float>()[size_t(t) * N + n] - acc, dt = y2.as<float>()[size_t(t) * N + n] - acc;
+        eq += dq * dq; et += dt * dt; mq = std::max(mq, std::fabs(dq)); mt = std::max(mt, std::fabs(dt));
+      }
+    rr = std::sqrt(rr / (8.0 * N));
+    printf("router %ux%u: vs fp64 rms err / rms: qmm8x2 %.3e (max %.3e)  tw8x2 %.3e (max %.3e)\n", N, K,
+           std::sqrt(eq / (8.0 * N)) / rr, mq / rr, std::sqrt(et / (8.0 * N)) / rr, mt / rr);
+    std::vector<double> tq, tt;
+    auto run = [&](bool tens) {
+      auto e = g.begin();
+      for (int i = 0; i < copies; ++i) { if (tens) enc_t(*e, i); else enc_q(*e, i); }
+      e->commit_and_wait();
+      return e->gpu_ms() * 1000.0 / copies;
+    };
+    run(false); run(true);
+    for (int r = 0; r < reps; ++r) { tq.push_back(run(false)); tt.push_back(run(true)); }
+    std::sort(tq.begin(), tq.end()); std::sort(tt.begin(), tt.end());
+    printf("qmm8x2_b8_nf1 ks%d median %.2f us | tw8x2_nt16 ks%d median %.2f us\n", ksq, tq[tq.size() / 2], kst, tt[tt.size() / 2]);
+    return 0;
+  }
   if (argc < 3) {
     fprintf(stderr, "usage: bench_tq <N> <K> [reps] [variant]\n");
     return 1;
@@ -669,7 +901,7 @@ int main(int argc, char** argv) {
   for (int nt : {16, 32, 64})
     for (int ks : {1, 2, 4, 8})
       if ((K / 64) % ks == 0 && N % nt == 0 && (nt < 64 || ks <= 4)) add_t(nt, ks);
-  std::vector<std::string> pres = {"tw", "twp", "twa1", "twa2", "twpa1", "twpa2", "tws", "twss", "twpss", "twssa1"};
+  std::vector<std::string> pres = {"tw", "twp", "twl", "twlp", "tc", "tcp"};
   if (getenv("PRE")) {
     pres.clear();
     std::string e = getenv("PRE");
