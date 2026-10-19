@@ -16,10 +16,21 @@ constant constexpr uint kDflHeadDim = 128;
 constant constexpr uint kDflRing = 2048;  // ring slots = window; slot = position mod 2048
 constant constexpr uint kDflSaltWalk = 0x57A1C3E5u;  // uniform stream of the sampled walk (SPEC §8.2)
 
-// Group g (64 values) of row r: two values per lane -> half table + exact sum of the halfs.
+// The "T table" of the tensor-op GEMM qmm8t (src/kernels/tensor/verify8t.metal): the same 8 rows of halfs with each
+// 64-group permuted to the matrix units' k-slots (input i -> slot 4 (i / 16) + 16 jb + kk, jb = 2 ((i % 16) / 8) +
+// i % 2, kk = (i % 8) / 2), stored right after the row-major table (xh + 8 ld). Every X8 producer writes both.
+NI_INLINE uint dfl_tslot(uint i) {
+  const uint rem = i & 15u;
+  return 4u * (i >> 4) + 16u * ((((rem >> 3) << 1)) | (rem & 1u)) + ((rem & 7u) >> 1);
+}
+
+// Group g (64 values) of row r: two values per lane -> half table (+ its T table) + exact sum of the halfs.
 NI_INLINE void dfl_put2(device half* xh, device float* xs, uint r, uint ld, uint g, uint lane, float v0, float v1) {
   const half2 hv = half2(half(v0), half(v1));
   *(device half2*)(xh + r * ld + g * 64 + 2 * lane) = hv;
+  device half* t = xh + (8 + r) * ld + g * 64;
+  t[dfl_tslot(2 * lane)] = hv.x;
+  t[dfl_tslot(2 * lane + 1)] = hv.y;
   const float s = simd_sum(float(hv.x) + float(hv.y));
   if (lane == 0) xs[g * 8 + r] = s;
 }
@@ -768,6 +779,7 @@ struct DflAttnRedParams {
   }
   const half o = half(num / den);
   xh[r * 4096 + h * 128 + d] = o;
+  xh[(8 + r) * 4096 + h * 128 + (d & 64u) + dfl_tslot(d & 63u)] = o;  // T table
   const float sm = simd_sum(float(o));
   if (lane == 0) red[sg] = sm;
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1252,6 +1264,9 @@ NI_INLINE void dfl_qmm8_gu_impl(const device uint32_t* Wg, const device bfloat* 
     if (n < N) {
       Hh[rc.y * ld + n] = h0;
       Hh[(rc.y + 1) * ld + n] = h1;
+      const uint tn = (n & ~63u) + dfl_tslot(n & 63u);  // T table
+      Hh[(8 + rc.y) * ld + tn] = h0;
+      Hh[(9 + rc.y) * ld + tn] = h1;
       t = float2(float(h0), float(h1));
     }
     // sum over the 8 weight rows of the fragment (lane bits 1, 2, 4 select the row)

@@ -231,10 +231,11 @@ class DFlash2 {
   QLinear row_view(const QLinear& src, uint32_t r0, uint32_t n);
   void alloc_buffers();
 
+  // dfl_qmm8, or the target's tensor-op GEMM qmm8t (src/kernels/tensor/verify8t.metal) on the X8 table's T table
+  // when the target has it on (Qwen35::v8_tw) and every segment is 4-bit group 64 with oscale 1
   void enc_qmm8(Encoder& e, const std::vector<DflSeg8>& segs, const Buffer& xh, const Buffer& xs, uint32_t K,
-                uint32_t x_ld) {
-    dfl_enc_qmm8(e, segs, xh, xs, K, x_ld);
-  }
+                uint32_t x_ld);
+  bool tw_for(const std::vector<DflSeg8>& segs, uint32_t K) const;
   void enc_qmm8_gu(Encoder& e, const QLinear& g, const QLinear& u, const Buffer& xh, const Buffer& xs) {
     dfl_enc_qmm8_gu(e, g, u, xh, xs, hh_, hs_);
   }

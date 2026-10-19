@@ -44,7 +44,7 @@ int main(int argc, char** argv) {
   Buffer Q = g.alloc(size_t(HQ) * R * D * 4), Kb = g.alloc(size_t(HKV) * R * D * 4), Vb = g.alloc(size_t(HKV) * R * D * 4);
   Buffer rk = g.alloc(size_t(HKV) * W * D * 2), rv = g.alloc(size_t(HKV) * W * D * 2);
   Buffer po = g.alloc(size_t(S) * HQ * R * D * 4), pml = g.alloc(size_t(S) * HQ * R * 2 * 4);
-  Buffer xh = g.alloc(size_t(R) * 4096 * 2), xs = g.alloc(64 * 8 * 4);
+  Buffer xh = g.alloc(size_t(2 * R) * 4096 * 2), xs = g.alloc(64 * 8 * 4);
   for (size_t i = 0; i < size_t(HQ) * R * D; ++i) Q.as<float>()[i] = nd(rng) * 0.3f;
   for (size_t i = 0; i < size_t(HKV) * R * D; ++i) {
     Kb.as<float>()[i] = nd(rng);
@@ -147,7 +147,7 @@ int main(int argc, char** argv) {
   // GPU-planned (P from the drafter state, adaptive chunk), at 8 / 16 / 32 splits
   {
     Buffer q = g.alloc(size_t(R) * 4096 * 4), kv = g.alloc(size_t(R) * 2048 * 4), qn = g.alloc(128 * 2), kn = g.alloc(128 * 2);
-    Buffer inv = g.alloc(64 * 4), cs = g.alloc(8 * 64 * 8), gst = g.alloc(16), xh2 = g.alloc(size_t(R) * 4096 * 2),
+    Buffer inv = g.alloc(64 * 4), cs = g.alloc(8 * 64 * 8), gst = g.alloc(16), xh2 = g.alloc(size_t(2 * R) * 4096 * 2),
            xs2 = g.alloc(64 * 8 * 4);
     for (size_t i = 0; i < size_t(R) * 4096; ++i) q.as<float>()[i] = nd(rng) * 2.0f;
     for (size_t i = 0; i < size_t(R) * 2048; ++i) kv.as<float>()[i] = nd(rng) * 2.0f;

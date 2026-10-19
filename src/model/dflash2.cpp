@@ -23,6 +23,7 @@
 
 namespace ni {
 
+extern const char* const kTensorKernelSource;
 using json = nlohmann::json;
 
 // process physical footprint (what Activity Monitor / bench.py report), bytes
@@ -444,11 +445,11 @@ void DFlash2::alloc_buffers() {
   const size_t KV = size_t(cfg_.NL) * 2048;
   h_ = g.alloc(8 * H * 4, "dfl_h");
   n_ = g.alloc(8 * H * 4, "dfl_n");
-  xh_ = g.alloc(8 * Kx * 2, "dfl_xh");
+  xh_ = g.alloc(16 * Kx * 2, "dfl_xh");  // + the T table (dfl_put2)
   xs_ = g.alloc(Kx / 64 * 8 * 4, "dfl_xs");
-  xh2_ = g.alloc(8 * H * 2, "dfl_xh2");
+  xh2_ = g.alloc(16 * H * 2, "dfl_xh2");
   xs2_ = g.alloc(H / 64 * 8 * 4, "dfl_xs2");
-  hh_ = g.alloc(8 * I * 2, "dfl_hh");
+  hh_ = g.alloc(16 * I * 2, "dfl_hh");
   hs_ = g.alloc(I / 64 * 8 * 4, "dfl_hs");
   dyn_ = g.alloc(8 * G4 * 4, "dfl_dyn");
   q_ = g.alloc(8 * 4096 * 4, "dfl_q");
@@ -673,7 +674,7 @@ size_t DFlash2::plan_bytes(const std::string& dir, const Qwen35Config& target, s
   // alloc_buffers()
   const size_t nH = nT * H, Kx = std::max({nH, size_t(4096), H, I}), KV = NL * 2048, G4 = 4 * (H / std::max<size_t>(gs, 1)),
                ntg = (V + 2047) / 2048;
-  size_t b = 5 * 8 * H * 4 + 8 * Kx * 2 + Kx / 64 * 8 * 4 + 8 * H * 2 + H / 64 * 8 * 4 + 8 * I * 2 + I / 64 * 8 * 4 + 8 * G4 * 4 + 8 * 4096 * 4 +
+  size_t b = 5 * 8 * H * 4 + 16 * Kx * 2 + Kx / 64 * 8 * 4 + 16 * H * 2 + H / 64 * 8 * 4 + 16 * I * 2 + I / 64 * 8 * 4 + 8 * G4 * 4 + 8 * 4096 * 4 +
              8 * 2048 * 4 + 32 * 8 * 128 * 4 + 2 * 8 * 8 * 128 * 4 + 32 * (32 * 8 * 128 * 4 + 32 * 8 * 2 * 4) + 8 * V * 4 + 8 * kRank * 4 +
              2 * 7 * ntg * 16 * 4 + 8 * nH * 2 + 8 * KV * 4 + size_t(kCtxKeep) * H * 4 + (64 << 10);
   const char* v8 = getenv("NI_DFLASH_V8");
@@ -873,6 +874,72 @@ void dfl_enc_qmm8_gu(Encoder& e, const QLinear& g, const QLinear& u, const Buffe
   e.dispatch(g.N / 64, 1, 1, 256 * ks);
 }
 
+// The matrix units through Metal 4 tensor_ops (qmm8t): Apple10 (M5) on macOS 26, the "tensor" library (compiled here
+// if the target has not yet), V8Knobs::tw on and V8Knobs::dfl bit 32 off (the drafter alone back on dfl_qmm8)
+static bool dfl_tw_supported() {
+  static const bool ok = [] {
+    if (Gpu::get().apple_family() < 10) return false;
+    if (__builtin_available(macOS 26.0, *)) {
+      Gpu::get().compile_extra("tensor", kTensorKernelSource, true);
+      return Gpu::get().pipeline("qmm8t_b4_nt16", false).pso != nullptr;
+    }
+    return false;
+  }();
+  return ok;
+}
+
+bool DFlash2::tw_for(const std::vector<DflSeg8>& segs, uint32_t K) const {
+  if (!dfl_tw_supported() || !v8_knobs().tw || (v8_knobs().dfl & 32) || K % 64) return false;
+  for (auto& sg : segs)
+    if (!sg.L->q4() || sg.L->gs != 64 || sg.L->K != K || sg.oscale != 1.0f) return false;
+  return !segs.empty() && segs.size() <= 4;
+}
+
+// The drafter's GEMMs on the matrix units: qmm8t with the target's tiling rule, except 32 rows per simdgroup also
+// for K > 4096 (bench_tq on the M5 Max, us: q|kv 6144x2048 17.7 vs dfl_qmm8 20.8, o 2048x4096 13.2 vs 15.5, down
+// 2048x6144 19.2 vs 22.0, commit k|v 12288x2048 31.2 vs 37.3, commit fc 2048x16384 46.6 vs 54.1, reduced LM head
+// 98304x2048 216.7 vs ~254).
+void DFlash2::enc_qmm8(Encoder& e, const std::vector<DflSeg8>& segs, const Buffer& xh, const Buffer& xs, uint32_t K,
+                       uint32_t x_ld) {
+  if (x_ld != K || !tw_for(segs, K)) {
+    dfl_enc_qmm8(e, segs, xh, xs, K, x_ld);
+    return;
+  }
+  uint32_t Ntot = 0;
+  for (auto& sg : segs) Ntot += sg.L->N;
+  const uint32_t gpr = K / 64;
+  const int nt = ((Ntot + 15) / 16 > 8192 || gpr > 64) ? 32 : 16;
+  uint32_t ks = gpr > 32 && gpr <= 64 ? 4 : 8;
+  while (ks > 1 && gpr < ks) ks /= 2;
+  const bool pf = nt == 32 || gpr > 32;
+  kp::Qmm8 p{};
+  p.K = K;
+  p.R = 8;
+  p.nseg = uint32_t(segs.size());
+  p.ks = ks;
+  uint32_t tg = 0;
+  e.use(dpipe(std::string(pf ? "qmm8tp" : "qmm8t") + "_b4_nt" + std::to_string(nt)));
+  for (size_t i = 0; i < 4; ++i) {
+    const DflSeg8& sg = segs[std::min(i, segs.size() - 1)];
+    if (i < segs.size()) {
+      p.N[i] = sg.L->N;
+      p.y_ld[i] = sg.y_ld;
+      p.add[i] = 0;
+      p.tg_begin[i] = tg;
+      tg += (sg.L->N + uint32_t(nt) - 1) / uint32_t(nt);
+    }
+    e.buf(int(i * 4 + 0), sg.L->w->buf);
+    e.buf(int(i * 4 + 1), sg.L->s->buf);
+    e.buf(int(i * 4 + 2), sg.L->b->buf);
+    e.buf(int(i * 4 + 3), sg.y);
+  }
+  p.tg_begin[segs.size()] = tg;
+  e.buf(16, xh, size_t(8) * K * 2);  // the T table after the 8 rows (dfl_put2)
+  e.buf(17, xs);
+  e.val(18, p);
+  e.dispatch(tg, 1, 1, 32 * ks);
+}
+
 // Conv projection L (rows permuted, see the constructor) + dfl_conv_prep: D -> dyn, the conv's output -> (xh2, xs2).
 void DFlash2::enc_qmm8_cp(Encoder& e, const QLinear& L, const Tensor* base, const Buffer& xh, const Buffer& xs) {
   if (L.K != uint32_t(cfg_.H) || L.N % 8 || L.gs != 64) fatal("enc_qmm8_cp: shapes");
@@ -973,8 +1040,10 @@ void DFlash2::encode_prefill_commit(Encoder& e, DFlashSeq& d) {
       e.val(3, xp);
       e.buf(4, gst_);
       e.dispatch(8, (nH / 64 + 7) / 8, 1, 256);
-      enc_qmm8(e, {{&fc_, y8_, H, 16.0f}}, xh_, xs_, nH, nH);
-      kp::DflNorm np{H, cfg_.eps, 1.0f, 1u};
+      // the captures' 1/16 is undone by the GEMM (oscale) or, on the matrix units, by the norm (exact either way)
+      const float fs = tw_for({{&fc_, y8_, H, 1.0f}}, nH) ? 16.0f : 1.0f;
+      enc_qmm8(e, {{&fc_, y8_, H, 16.0f / fs}}, xh_, xs_, nH, nH);
+      kp::DflNorm np{H, cfg_.eps, fs, 1u};
       e.use(dpipe("dfl_norm_x8"));
       e.buf(0, y8_); e.buf(1, hnorm_->buf); e.buf(2, c8_); e.buf(3, xh_); e.buf(4, xs_);
       e.val(5, np);
@@ -1101,9 +1170,10 @@ void DFlash2::enc_commit_from(Encoder& e, DFlashSeq& d, int m, const Buffer& src
     e.buf(4, gst_);
     e.dispatch(8, (nH / 64 + 7) / 8, 1, 256);
   }
-  enc_qmm8(e, {{&fc_, y8_, H, 16.0f}}, xh_, xs_, nH, nH);
+  const float fs = tw_for({{&fc_, y8_, H, 1.0f}}, nH) ? 16.0f : 1.0f;  // (see encode_prefill_commit)
+  enc_qmm8(e, {{&fc_, y8_, H, 16.0f / fs}}, xh_, xs_, nH, nH);
   {
-    kp::DflNorm p{H, cfg_.eps, 1.0f, 1u};
+    kp::DflNorm p{H, cfg_.eps, fs, 1u};
     e.use(dpipe("dfl_norm_x8"));
     e.buf(0, y8_); e.buf(1, hnorm_->buf); e.buf(2, cdbg_); e.buf(3, xh_); e.buf(4, xs_);
     e.val(5, p);
