@@ -1641,12 +1641,12 @@ struct DflAcceptParams {
   uint seed;
   uint dyn;  // 1: only the first kdyn[0] proposals were verified (dfl_depth)
 };
-[[kernel]] void dfl_accept(device int* tokens [[buffer(0)]], const device int* samp [[buffer(1)]],
-                           const device int* dist_id [[buffer(2)]], const device float* dist_p [[buffer(3)]],
-                           const device int* cand_i [[buffer(4)]], const device float* qprob [[buffer(5)]],
-                           const device int* walk_k [[buffer(6)]], device int* res [[buffer(7)]],
-                           constant DflAcceptParams& p [[buffer(8)]], const device uint* kdyn [[buffer(9)]],
-                           device uint* gst [[buffer(10)]], uint lane [[thread_index_in_simdgroup]]) {
+// NC: candidates per proposal of the walk (16: DFlash2's walk; 32: the DFlash3 decoder's, dfl_accept32).
+template <uint NC>
+NI_INLINE void dfl_accept_impl(device int* tokens, const device int* samp, const device int* dist_id,
+                               const device float* dist_p, const device int* cand_i, const device float* qprob,
+                               const device int* walk_k, device int* res, constant DflAcceptParams& p,
+                               const device uint* kdyn, device uint* gst, uint lane) {
   const uint K = p.dyn ? min(p.K, kdyn[0]) : p.K;
   if (p.temp <= 0.0f) {
     const bool stop = lane >= K || tokens[p.P + 1 + lane] != samp[lane];
@@ -1666,18 +1666,18 @@ struct DflAcceptParams {
   for (; a < K; ++a) {
     const int d = tokens[p.P + 1 + a];
     const float pd = simd_sum(dist_id[a * 32 + lane] == d ? dist_p[a * 32 + lane] : 0.0f);
-    const float qd = qprob[a * 16 + uint(walk_k[a])];
+    const float qd = qprob[a * NC + uint(walk_k[a])];
     const float u = dfl_uniform(p.seed, p.P + 1 + a, kDflSaltAcc);
     if (!(u * qd < pd)) break;
   }
   const int x = dist_id[a * 32 + lane];
   const float px = dist_p[a * 32 + lane];
   float w = px;
-  if (a < K) {  // residual max(0, p_a - q_a): q_a(x) from the walk's 16 candidates of proposal a
-    const int cid = lane < 16 ? cand_i[a * 16 + lane] : -2;
-    const float cq = lane < 16 ? qprob[a * 16 + lane] : 0.0f;
+  if (a < K) {  // residual max(0, p_a - q_a): q_a(x) from the walk's NC candidates of proposal a
+    const int cid = lane < NC ? cand_i[a * NC + lane] : -2;
+    const float cq = lane < NC ? qprob[a * NC + lane] : 0.0f;
     float qx = 0.0f;
-    for (ushort k = 0; k < 16; ++k) {
+    for (ushort k = 0; k < NC; ++k) {
       const int c = simd_shuffle(cid, k);
       const float cv = simd_shuffle(cq, k);
       if (c == x) qx = cv;
@@ -1700,6 +1700,17 @@ struct DflAcceptParams {
     gst[2] = p.P;
   }
 }
+#define DFL_ACCEPT(NAME, NC)                                                                                    \
+  [[kernel]] void NAME(device int* tokens [[buffer(0)]], const device int* samp [[buffer(1)]],                    \
+                       const device int* dist_id [[buffer(2)]], const device float* dist_p [[buffer(3)]],          \
+                       const device int* cand_i [[buffer(4)]], const device float* qprob [[buffer(5)]],            \
+                       const device int* walk_k [[buffer(6)]], device int* res [[buffer(7)]],                      \
+                       constant DflAcceptParams& p [[buffer(8)]], const device uint* kdyn [[buffer(9)]],           \
+                       device uint* gst [[buffer(10)]], uint lane [[thread_index_in_simdgroup]]) {                 \
+    dfl_accept_impl<NC>(tokens, samp, dist_id, dist_p, cand_i, qprob, walk_k, res, p, kdyn, gst, lane);          \
+  }
+DFL_ACCEPT(dfl_accept, 16)
+DFL_ACCEPT(dfl_accept32, 32)
 
 // Dynamic verify depth (MoE targets): stop verifying once the drafter is unlikely to have been right so far.
 //  T > 0: verify proposal p iff prod_{j <= p} s_j >= tau, s_j = sum_k softmax(S_j)_k^2 (the chance that two draws
@@ -1723,25 +1734,25 @@ struct DflDepthParams {
   float tau, temp;
   uint rule;
 };
-[[kernel]] void dfl_depth(const device float* walk_s [[buffer(0)]], const device int* walk_k [[buffer(1)]],
-                          const device float* qprob [[buffer(2)]], device uint* kdyn [[buffer(3)]],
-                          constant DflDepthParams& p [[buffer(4)]], uint lane [[thread_index_in_simdgroup]]) {
+template <uint NC>
+NI_INLINE void dfl_depth_impl(const device float* walk_s, const device int* walk_k, const device float* qprob,
+                              device uint* kdyn, constant DflDepthParams& p, uint lane) {
   const bool sampled = p.temp > 0.0f;
   float c = 1.0f;  // lane j < 7: the factor of proposal j
   if (lane < 7) {
     const int kj = walk_k[lane];
     if (sampled && p.rule == 2) {
-      c = qprob[lane * 16 + kj];
+      c = qprob[lane * NC + kj];
     } else {
       float mx = -INFINITY;
-      for (uint k = 0; k < 16; ++k) mx = max(mx, walk_s[lane * 16 + k]);
+      for (uint k = 0; k < NC; ++k) mx = max(mx, walk_s[lane * NC + k]);
       float z = 0.0f, z2 = 0.0f;
-      for (uint k = 0; k < 16; ++k) {
-        const float e = exp(walk_s[lane * 16 + k] - mx);
+      for (uint k = 0; k < NC; ++k) {
+        const float e = exp(walk_s[lane * NC + k] - mx);
         z += e;
         z2 += e * e;
       }
-      c = sampled && p.rule == 0 ? z2 / (z * z) : exp(walk_s[lane * 16 + kj] - mx) / z;
+      c = sampled && p.rule == 0 ? z2 / (z * z) : exp(walk_s[lane * NC + kj] - mx) / z;
     }
   }
   const float cum = sampled && p.rule == 2 ? simd_prefix_exclusive_product(c) : simd_prefix_inclusive_product(c);
@@ -1752,6 +1763,14 @@ struct DflDepthParams {
     kdyn[1] = k + 1;
   }
 }
+#define DFL_DEPTH(NAME, NC)                                                                                     \
+  [[kernel]] void NAME(const device float* walk_s [[buffer(0)]], const device int* walk_k [[buffer(1)]],          \
+                       const device float* qprob [[buffer(2)]], device uint* kdyn [[buffer(3)]],                   \
+                       constant DflDepthParams& p [[buffer(4)]], uint lane [[thread_index_in_simdgroup]]) {        \
+    dfl_depth_impl<NC>(walk_s, walk_k, qprob, kdyn, p, lane);                                                    \
+  }
+DFL_DEPTH(dfl_depth, 16)
+DFL_DEPTH(dfl_depth32, 32)
 
 // ---- the verify GEMMs' input layout (verify8.metal "X8 table") ----
 // The drafter's tables are row-major half [8][K]; the 8-row verify GEMMs (qmm8pf, qmm8_gu*) read the

@@ -313,6 +313,7 @@ class Qwen35 : public Model {
   void set_capture(const CaptureHook* h) { cap_ = h; }
   const QLinear& embed_table() const { return embed_; }
   const QLinear& lm_head() const { return lm_head_; }
+  const std::string& model_dir() const { return dir_; }
   // Drafter's dynamic verify depth (DFlash2, MoE only): while set, the 8-row verify routes experts only
   // for rows < min(R, rows[0]) (uint read by the GPU); later rows' outputs are garbage and must not be used.
   void set_verify_row_limit(const Buffer* rows) { v8_rlim_ = rows; }

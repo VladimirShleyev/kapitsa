@@ -12,7 +12,11 @@
 //    dynamic verify depth (dfl_depth before dfl_accept): its exact T > 0 rules (0, and 2, the earlier one) must
 //    pass; the rule that also uses the proposal's own confidence (rule 1, not used by the engine at T > 0) must fail in the depth-sensitive
 //    regime (q = p at the first proposal, q = 0.9 / 0.1 vs p = 1/2 at the second: that rule emits 0.55 / 0.45).
+// 3. The DFlash3 decoder's sampled walk (d3_soft's chain step, src/kernels/spec_dflash3.metal) drawing every proposal on
+//    the GPU from its q over 32 candidates (scores S = log q here), then dfl_accept32 (and dfl_depth32 before it): the
+//    same joint-law test, with candidate lists of 32 from a larger universe (p's support partly outside them).
 #include "metal/gpu.h"
+#include "model/dflash3.h"
 #include "model/kparams.h"
 #include "util/log.h"
 
@@ -201,6 +205,51 @@ Dist q_of(const std::vector<int>& prefix, int regime, const Dist& p) {
     tot += w[i];
   }
   for (int i = 0; i < 16; ++i) q.p.push_back(w[i] / tot);
+  return q;
+}
+
+// q(.|prefix) over 32 distinct candidates from a universe of 40 (the decoder's top-32 lists): p's support (24 tokens)
+// partly outside them, candidates outside p's support
+constexpr int kV32 = 40;
+Dist q32_of(const std::vector<int>& prefix, int regime, const Dist& p) {
+  std::mt19937_64 r(key_of(prefix) ^ 0x3333);
+  Dist q;
+  std::vector<int> u(kV32);
+  for (int i = 0; i < kV32; ++i) u[i] = i;
+  std::shuffle(u.begin(), u.end(), r);
+  if (regime == kEqual) {  // q = p on p's support, the other candidates at 0
+    for (size_t i = 0; i < p.id.size(); ++i) {
+      q.id.push_back(p.id[i]);
+      q.p.push_back(p.p[i]);
+    }
+    for (int i = 0; i < kV32 && q.id.size() < 32; ++i)
+      if (std::find(q.id.begin(), q.id.end(), kBase + u[i]) == q.id.end()) {
+        q.id.push_back(kBase + u[i]);
+        q.p.push_back(0.0f);
+      }
+    return q;
+  }
+  if (regime == kDisjoint) {
+    for (int i = 0; i < kV32 && q.id.size() < 32; ++i)
+      if (std::find(p.id.begin(), p.id.end(), kBase + u[i]) == p.id.end()) q.id.push_back(kBase + u[i]);
+    while (q.id.size() < 32) q.id.push_back(kBase + kV32 + int(q.id.size()));  // outside the universe
+  } else {
+    for (int i = 0; i < 32; ++i) q.id.push_back(kBase + u[i]);
+  }
+  std::vector<float> w(32);
+  float tot = 0;
+  const bool point = regime == kPoint && r() % 2 == 0;
+  const bool flat = regime == kMixed && r() % 2 == 0;
+  for (int i = 0; i < 32; ++i) {
+    w[i] = point ? (i == 0 ? 1.0f : 0.0f) : flat ? 1.0f : std::pow(float((r() % 1000) + 1) / 1000.0f, 3.0f);
+    if (regime == kMixed && !flat && !point && r() % 4 == 0) w[i] = 0.0f;  // some candidates at q = 0
+    tot += w[i];
+  }
+  if (tot <= 0) {
+    w[0] = 1.0f;
+    tot = 1.0f;
+  }
+  for (int i = 0; i < 32; ++i) q.p.push_back(w[i] / tot);
   return q;
 }
 
@@ -462,6 +511,173 @@ int main(int argc, char** argv) {
            regime_name(cs.regime), cs.K, cs.temp, dyn, trials, mean_a / trials, st, dof, pv, st1, dof1, pv1,
            out + out1, ok ? "PASS" : "FAIL", expect_fail ? (ok ? " (biased rule NOT detected)" : " (biased rule detected, as expected)") : "");
     if (ok == expect_fail) ++fails;
+  }
+  // ---- 3. the DFlash3 decoder's sampled walk on the GPU + dfl_accept32 ----
+  {
+    struct Case3 {
+      int regime, K;
+      float temp;
+      float tau = 0.0f;
+      int rule = 0;
+    };
+    const std::vector<Case3> cases3 = {{kRandom, Kmain, 0.6f}, {kEqual, Kmain, 0.6f}, {kDisjoint, Kmain, 0.6f},
+                                       {kPoint, Kmain, 0.6f},  {kMixed, Kmain, 0.6f}, {kRandom, 1, 0.6f},
+                                       {kRandom, 7, 1.0f},     {kMixed, 7, 1.0f},     {kRandom, 3, 0.6f, 0.1f},
+                                       {kMixed, 7, 0.6f, 0.2f}, {kMixed, 7, 0.6f, 0.2f, 2}};
+    const int B3 = 1024;  // trials per batch (one D3Tree each)
+    const size_t TB = sizeof(D3Tree);
+    Buffer trees = g.alloc(size_t(B3) * TB), tok3 = g.alloc(size_t(B3) * 16 * 4), ci3 = g.alloc(size_t(B3) * 224 * 4);
+    Buffer cv3 = g.alloc(size_t(B3) * 224 * 4), q3 = g.alloc(size_t(B3) * 224 * 4), wk3 = g.alloc(size_t(B3) * 8 * 4);
+    Buffer ws3 = g.alloc(size_t(B3) * 224 * 4), did3 = g.alloc(size_t(B3) * 256 * 4), dp3 = g.alloc(size_t(B3) * 256 * 4);
+    Buffer res3 = g.alloc(size_t(B3) * 16), kd3 = g.alloc(size_t(B3) * 16), cd0 = g.alloc(8 * 32 * 16);
+    Buffer ls1 = g.alloc(16 * 4), dummy = g.alloc(4096);
+    memset(cd0.ptr(), 0, cd0.size);
+    memset(dummy.ptr(), 0, dummy.size);
+    for (int i = 0; i < 16; ++i) ls1.as<float>()[i] = 1.0f;
+    Pipeline soft = g.pipeline("d3_soft"), acc32 = g.pipeline("dfl_accept32"), dep32 = g.pipeline("dfl_depth32");
+    for (size_t ci = 0; ci < cases3.size(); ++ci) {
+      if (only >= 0 && int(ci + cases.size()) != only) continue;
+      const Case3& cs = cases3[ci];
+      std::map<long, long> obs, obs1;
+      long done = 0;
+      double mean_a = 0;
+      long walk_bad = 0;
+      while (done < trials) {
+        const int nb = int(std::min<long>(B3, trials - done));
+        std::vector<uint32_t> seeds(nb);
+        for (int i = 0; i < nb; ++i) seeds[i] = uint32_t(mix(uint64_t(done + i) + (uint64_t(ci + 100) << 40) + (salt << 48)));
+        // one cycle for trials `idx` anchored at P on their prefixes: the GPU walk draws K proposals, then the acceptance
+        auto cycle = [&](const std::vector<int>& idx, const std::vector<std::vector<int>>& prefix, uint32_t P,
+                         std::vector<std::vector<int>>* chain) {
+          const int n = int(idx.size());
+          for (int i = 0; i < n; ++i) {
+            D3Tree& T = *reinterpret_cast<D3Tree*>(trees.as<uint8_t>() + size_t(i) * TB);
+            T.n_nodes = 1;
+            T.n_front = 1;
+            T.front[0] = 0;
+            T.P = P;
+            T.parent[0] = -1;
+            T.token[0] = prefix[i].empty() ? 0 : prefix[i].back();
+            T.depth[0] = 0;
+            T.logp[0] = 0.0f;
+            int* tk = tok3.as<int>() + i * 16;
+            for (int j = 0; j < 16; ++j) tk[j] = 0;
+            tk[P] = T.token[0];
+            std::fill(did3.as<int>() + i * 256, did3.as<int>() + i * 256 + 256, -1);
+            std::fill(dp3.as<float>() + i * 256, dp3.as<float>() + i * 256 + 256, 0.0f);
+            (*chain)[i].clear();
+          }
+          for (int p = 0; p <= cs.K; ++p) {
+            // the target's p rows and, for p < K, the walk's candidates / log q given each trial's prefix so far
+            for (int i = 0; i < n; ++i) {
+              std::vector<int> pre = prefix[i];
+              pre.insert(pre.end(), (*chain)[i].begin(), (*chain)[i].end());
+              const Dist pd = p_of(pre, cs.regime);
+              for (size_t j = 0; j < pd.id.size(); ++j) {
+                did3.as<int>()[i * 256 + p * 32 + int(j)] = pd.id[j];
+                dp3.as<float>()[i * 256 + p * 32 + int(j)] = pd.p[j];
+              }
+              if (p == cs.K) continue;
+              const Dist qd = q32_of(pre, cs.regime, pd);
+              for (int k = 0; k < 32; ++k) {
+                ci3.as<int>()[i * 224 + p * 32 + k] = qd.id[k];
+                cv3.as<float>()[i * 224 + p * 32 + k] = qd.p[k] > 0 ? std::log(qd.p[k]) : -1e30f;
+              }
+            }
+            if (p == cs.K) break;
+            auto e = g.begin();
+            for (int i = 0; i < n; ++i) {
+              kp::D3Soft sp{0, 1024, 0, 0, 1.0f, 0.0f, 0.0f, cs.temp, seeds[idx[i]], 1u, uint32_t(cs.K), 1u};
+              e->use(soft);
+              e->buf(0, trees, size_t(i) * TB); e->buf(1, dummy); e->buf(2, ci3, size_t(i) * 224 * 4);
+              e->buf(3, cv3, size_t(i) * 224 * 4); e->buf(4, cd0); e->buf(5, ls1); e->buf(6, dummy);
+              e->buf(7, tok3, size_t(i) * 64); e->buf(8, q3, size_t(i) * 224 * 4); e->buf(9, wk3, size_t(i) * 32);
+              e->buf(10, ws3, size_t(i) * 224 * 4);
+              e->val(11, sp);
+              e->dispatch(1, 1, 1, 64);
+            }
+            e->commit_and_wait();
+            for (int i = 0; i < n; ++i) {
+              const int d = tok3.as<int>()[i * 16 + int(P) + 1 + p];
+              const int k = wk3.as<int>()[i * 8 + p];
+              // the walk drew a candidate of this row with q > 0 and wrote the q it drew from
+              if (k < 0 || k >= 32 || ci3.as<int>()[i * 224 + p * 32 + k] != d || !(q3.as<float>()[i * 224 + p * 32 + k] > 0))
+                ++walk_bad;
+              (*chain)[i].push_back(d);
+            }
+          }
+          auto e = g.begin();
+          for (int i = 0; i < n; ++i) {
+            if (cs.tau > 0) {
+              kp::DflDepth dpp{uint32_t(cs.K), cs.tau, cs.temp, uint32_t(cs.rule)};
+              e->use(dep32);
+              e->buf(0, ws3, size_t(i) * 224 * 4); e->buf(1, wk3, size_t(i) * 32); e->buf(2, q3, size_t(i) * 224 * 4);
+              e->buf(3, kd3, size_t(i) * 16);
+              e->val(4, dpp);
+              e->dispatch(1, 1, 1, 32);
+            }
+            kp::DflAccept ap{P, uint32_t(cs.K), cs.temp, seeds[idx[i]], cs.tau > 0 ? 1u : 0u};
+            e->use(acc32);
+            e->buf(0, tok3, size_t(i) * 64); e->buf(1, samp); e->buf(2, did3, size_t(i) * 1024); e->buf(3, dp3, size_t(i) * 1024);
+            e->buf(4, ci3, size_t(i) * 224 * 4); e->buf(5, q3, size_t(i) * 224 * 4); e->buf(6, wk3, size_t(i) * 32);
+            e->buf(7, res3, size_t(i) * 16);
+            e->val(8, ap);
+            e->buf(9, kd3, size_t(i) * 16);
+            e->buf(10, scratch);
+            e->dispatch(1, 1, 1, 32);
+          }
+          e->commit_and_wait();
+        };
+        std::vector<int> idx(nb);
+        for (int i = 0; i < nb; ++i) idx[i] = i;
+        std::vector<std::vector<int>> pre(nb), ch(nb);
+        cycle(idx, pre, 0, &ch);
+        std::vector<int> t1(nb), t2(nb, -1), second;
+        for (int i = 0; i < nb; ++i) {
+          const int a = res3.as<int>()[i * 4], y = res3.as<int>()[i * 4 + 1];
+          mean_a += a;
+          std::vector<int> em(ch[i].begin(), ch[i].begin() + a);
+          em.push_back(y);
+          t1[i] = em[0];
+          if (em.size() >= 2) t2[i] = em[1];
+          else second.push_back(i);
+        }
+        if (!second.empty()) {
+          std::vector<std::vector<int>> pre2(second.size()), ch2(second.size());
+          for (size_t j = 0; j < second.size(); ++j) pre2[j] = {t1[second[j]]};
+          cycle(second, pre2, 1, &ch2);
+          for (size_t j = 0; j < second.size(); ++j) {
+            const int a = res3.as<int>()[j * 4], y = res3.as<int>()[j * 4 + 1];
+            t2[second[j]] = a >= 1 ? ch2[j][0] : y;
+          }
+        }
+        for (int i = 0; i < nb; ++i) {
+          obs[long(t1[i]) * 100000 + t2[i]]++;
+          obs1[t1[i]]++;
+        }
+        done += nb;
+      }
+      std::map<long, double> ex, ex1;
+      const Dist p0 = p_of({}, cs.regime);
+      for (size_t i = 0; i < p0.id.size(); ++i) {
+        ex1[p0.id[i]] = p0.p[i];
+        const Dist p1 = p_of({p0.id[i]}, cs.regime);
+        for (size_t j = 0; j < p1.id.size(); ++j) ex[long(p0.id[i]) * 100000 + p1.id[j]] += double(p0.p[i]) * p1.p[j];
+      }
+      double st, pv, st1, pv1;
+      int dof, dof1;
+      long out, out1;
+      chi2(obs, ex, trials, &st, &dof, &pv, &out);
+      chi2(obs1, ex1, trials, &st1, &dof1, &pv1, &out1);
+      const bool ok = pv > 0.01 && pv1 > 0.01 && out == 0 && out1 == 0 && walk_bad == 0;
+      char dyn[64] = "";
+      if (cs.tau > 0) snprintf(dyn, sizeof dyn, ", depth tau %.2f rule %d", cs.tau, cs.rule);
+      printf("[S3 decoder walk] %-24s K=%d T=%.1f%s: %ld trials, mean a %.2f; joint chi2 %.1f (%d dof) p=%.3f; first "
+             "token chi2 %.1f (%d dof) p=%.3f; outside support %ld; walk draws off their q %ld: %s\n",
+             regime_name(cs.regime), cs.K, cs.temp, dyn, trials, mean_a / trials, st, dof, pv, st1, dof1, pv1,
+             out + out1, walk_bad, ok ? "PASS" : "FAIL");
+      if (!ok) ++fails;
+    }
   }
   printf(fails ? "FAILED: %d\n" : "ALL PASSED\n", fails);
   return fails ? 1 : 0;

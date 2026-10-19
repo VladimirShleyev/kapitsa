@@ -416,6 +416,28 @@ DFlash2::DFlash2(Qwen35& target, const std::string& dir, int bits) : tg_(target)
     else build_head(0, false);
   }
   Gpu::get().make_resident(owned_bufs_);
+  // DFlash3Turbo candidate decoder (opt-in NI_DFLASH3): replaces the selector walk of the single-stream cycles
+  if (const std::string d3dir = DFlash3::find(tg_.model_dir(), dir, tg_.config()); !d3dir.empty()) {
+    d3_ = std::make_unique<DFlash3>(tg_, d3dir);
+    Gpu& g = Gpu::get();
+    const size_t ntg = (size_t(draft_vocab()) + 2047) / 2048, ntg2 = (ntg * 32 + 2047) / 2048;
+    c32_i_ = g.alloc(7 * 32 * 4, "d3_cand_i");
+    c32_v_ = g.alloc(7 * 32 * 4, "d3_cand_v");
+    q32_ = g.alloc(7 * 32 * 4, "d3_qprob");
+    ws32_ = g.alloc(7 * 32 * 4, "d3_walk_s");
+    t32a_v_ = g.alloc(7 * ntg * 32 * 4, "d3_top_v");
+    t32a_i_ = g.alloc(7 * ntg * 32 * 4, "d3_top_i");
+    t32b_v_ = g.alloc(7 * ntg2 * 32 * 4, "d3_top_v");
+    t32b_i_ = g.alloc(7 * ntg2 * 32 * 4, "d3_top_i");
+    for (Buffer* b : {&c32_i_, &c32_v_, &q32_, &ws32_, &t32a_v_, &t32a_i_, &t32b_v_, &t32b_i_}) {
+      memset(b->ptr(), 0, b->size);
+      resident_ += b->size;
+    }
+    resident_ += d3_->resident_bytes();
+  } else if (const char* v = getenv("NI_DFLASH3"); v && *v && strcmp(v, "0")) {
+    logi("DFlash3: NI_DFLASH3=%s but no decoder (dflash3/ in %s or beside %s); drafting with DFlash2's walk", v,
+         tg_.model_dir().c_str(), dir.c_str());
+  }
   // Dynamic verify depth on MoE targets (default tau 0.5, NI_DFLASH_DYN=tau overrides, 0 = off): the expert
   // union, the 35B verify's main cost, shrinks with the rows (35B, 512 tokens: code +7%, prose +20% over
   // verifying all 7; tau 0.4-0.7 swept). Dense targets read every weight once whatever the row count, so
@@ -700,6 +722,8 @@ size_t DFlash2::plan_bytes(const std::string& dir, const Qwen35Config& target, s
     if (req > 0 && req < V) b += std::max(req, V - special0) * (head_row_bytes + 4);
   }
   b += size_t(4) << 20;  // the target's 8-row verify scratch (Qwen35::v8_alloc): ~1-3 MB
+  // the DFlash3 decoder (NI_DFLASH3): ~19 MB of 4-bit weights for d 1024 / 2 layers, ~2 MB of step buffers
+  if (const char* v3 = getenv("NI_DFLASH3"); v3 && *v3 && strcmp(v3, "0")) b += size_t(32) << 20;
   // begin_prefill(): the prompt captures and the 512-row context-commit buffers
   const size_t pf = size_t(kCtxKeep) * nH * 2 + 512 * nH * 2 + 512 * H * 4 + 512 * H * 2 + 512 * KV * 4;
   if (at_prefill) *at_prefill = pf;
@@ -821,8 +845,8 @@ static uint32_t dfl_qmm8_ks(uint32_t rbs_total, uint32_t K, int ks_req) {
   return ks;
 }
 
-void dfl_enc_qmm8(Encoder& e, const std::vector<DflSeg8>& segs, const Buffer& xh, const Buffer& xs, uint32_t K,
-                  uint32_t x_ld, int ks_req, int rf_req) {
+uint32_t dfl_enc_qmm8(Encoder& e, const std::vector<DflSeg8>& segs, const Buffer& xh, const Buffer& xs, uint32_t K,
+                      uint32_t x_ld, int ks_req, int rf_req, const Buffer* ind, size_t ind_off) {
   if (segs.empty() || segs.size() > 4) fatal("enc_qmm8: 1-4 segments");
   kp::DflQmm8 p{};
   p.old4 = dfl_old4() ? 1u : 0u;
@@ -861,11 +885,13 @@ void dfl_enc_qmm8(Encoder& e, const std::vector<DflSeg8>& segs, const Buffer& xh
   e.buf(16, xh);
   e.buf(17, xs);
   e.val(18, p);
-  e.dispatch(tg, 1, 1, 256);
+  if (ind) e.dispatch_indirect(*ind, ind_off, 256);
+  else e.dispatch(tg, 1, 1, 256);
+  return tg;
 }
 
-void dfl_enc_qmm8_gu(Encoder& e, const QLinear& g, const QLinear& u, const Buffer& xh, const Buffer& xs,
-                     const Buffer& hh, const Buffer& hs, int ks_req) {
+uint32_t dfl_enc_qmm8_gu(Encoder& e, const QLinear& g, const QLinear& u, const Buffer& xh, const Buffer& xs,
+                         const Buffer& hh, const Buffer& hs, int ks_req, const Buffer* ind, size_t ind_off) {
   if (g.N != u.N || g.K != u.K || g.bits != u.bits || g.N % 64) fatal("enc_qmm8_gu: shapes");
   // K split inside the 64-column threadgroup (8 row blocks x ks simdgroups); default: the largest
   // of 1/2/4 that keeps >= 8 groups per simdgroup (NI_DFLASH_GU_KS overrides)
@@ -892,7 +918,9 @@ void dfl_enc_qmm8_gu(Encoder& e, const QLinear& g, const QLinear& u, const Buffe
   e.buf(16, xh);
   e.buf(17, xs);
   e.val(18, p);
-  e.dispatch(g.N / 64, 1, 1, 256 * ks);
+  if (ind) e.dispatch_indirect(*ind, ind_off, 256 * ks);
+  else e.dispatch(g.N / 64, 1, 1, 256 * ks);
+  return g.N / 64;
 }
 
 // The matrix units through Metal 4 tensor_ops (qmm8t): Apple10 (M5) on macOS 26, the "tensor" library (compiled here
@@ -1231,7 +1259,37 @@ void DFlash2::encode_draft(Encoder& e, Seq& s, DFlashSeq& d, int P, const Sampli
   encode_draft_impl(e, s, d, P, sp, false);
 }
 
-void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const SamplingParams& sp, bool gpu) {
+void DFlash2::encode_draft_sel(Encoder& e, Seq& s, DFlashSeq& d, int P, const SamplingParams& sp, int sel) {
+  if (sel && !d3_) fatal("DFlash2::encode_draft_sel(%d): no DFlash3 decoder loaded (NI_DFLASH3)", sel);
+  encode_draft_impl(e, s, d, P, sp, false, sel);
+}
+
+// Top-32 of the draft logit rows 1..7, ordered (value desc, id asc) like dfl_top16: d3_top32 over chunks of 2048,
+// then over the chunks' top-32s until one chunk remains -> c32_v_ / c32_i_ [7][32].
+void DFlash2::enc_top32(Encoder& e, uint32_t Vd) {
+  Buffer src = logits_.view(size_t(Vd) * 4, size_t(7) * Vd * 4), sid = head_n_ ? head_ids_ : t32a_i_;
+  uint32_t n = Vd, has = head_n_ ? 2u : 0u;
+  bool to_a = true;
+  for (;;) {
+    const uint32_t chunks = (n + 2047) / 2048;
+    const Buffer& ov = chunks == 1 ? c32_v_ : to_a ? t32a_v_ : t32b_v_;
+    const Buffer& oi = chunks == 1 ? c32_i_ : to_a ? t32a_i_ : t32b_i_;
+    kp::DflTop p{n, n, chunks};
+    e.use(dpipe("d3_top32"));
+    e.buf(0, src); e.buf(1, sid); e.buf(2, ov); e.buf(3, oi);
+    e.val(4, p);
+    e.val(5, has);
+    e.dispatch(chunks, 7, 1, 256);
+    if (chunks == 1) break;
+    src = ov;
+    sid = oi;
+    has = 1;
+    n = chunks * 32;
+    to_a = !to_a;
+  }
+}
+
+void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const SamplingParams& sp, bool gpu, int sel) {
   // gpu: the anchor position comes from the drafter state (gst_); P is only its upper bound here
   if (!gpu && P != d.ctx) fatal("DFlash2 draft: anchor position %d but the ring holds %d positions", P, d.ctx);
   if (P + kB >= s.cap) fatal("DFlash2 draft: context full (%d)", s.cap);
@@ -1428,6 +1486,35 @@ void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const S
   } else {
     enc_qmm8(e, {{&head, logits_, Vd, 1.0f}, {&sel_w_, sel_, uint32_t(kRank), 1.0f}}, xh_, xs_, H, H);
   }
+  if (sel != 0) {  // DFlash3: the top-32 of each block row, then the decoder's chain walk (sel 2: the caller's steps)
+    if (!(skip & 4096)) enc_top32(e, Vd);
+    d3_->encode_prep(e, xh_, xs_);  // W_h h of the block rows from the LM head's input table
+    if (sel == 1) {
+      // the walk's q at T > 0 is softmax(S / (walk_tf_ T)) (walk_tf_ 0: the argmax chain with a one-hot q); at T = 0
+      // the children's q is softmax(S) (path probabilities); the acceptance head's greedy / sampled row by T
+      const bool sampled = sp.temperature > 0.0f;
+      const float tq = sampled && walk_tf_ > 0.0f ? sp.temperature * walk_tf_ : 1.0f;
+      D3WalkArgs w;
+      w.tokens = s.tok;
+      w.qprob = q32_;
+      w.walk_k = walk_k_;
+      w.walk_s = ws32_;
+      w.temp = sampled ? sp.temperature : 0.0f;
+      w.seed = sp.seed;
+      w.qt = walk_tf_ > 0.0f;
+      w.maxdep = kB - 1;
+      // NI_DFLASH3_PASSES: speculative passes of the chain walk (DFlash3::encode_chain; default 7 = the sequential
+      // walk's result, passes after the chain is complete skipped); 0 = one single-row decoder step per position
+      static const int passes = getenv("NI_DFLASH3_PASSES") ? atoi(getenv("NI_DFLASH3_PASSES")) : kB - 1;
+      if (passes > 0) {
+        d3_->encode_chain(e, s.tok, Pk, gst_, c32_i_, c32_v_, tq, sampled ? 1 : 0, w, passes);
+      } else {
+        d3_->encode_root(e, s.tok, Pk, gst_);
+        for (int j = 0; j < kB - 1; ++j) d3_->encode_step(e, c32_i_, c32_v_, tq, sampled ? 1 : 0, &w);
+      }
+    }
+    return;
+  }
   const uint32_t ntg = (Vd + 2047) / 2048;
   static const bool old_topk = getenv("NI_DFLASH_TOPK") && atoi(getenv("NI_DFLASH_TOPK")) == 0;
   if (old_topk) {  // reference path: 16 rounds of threadgroup argmax per stage
@@ -1499,9 +1586,10 @@ void DFlash2::encode_accept(Encoder& e, Seq& s, int P, int K, const SamplingPara
   const bool sampled = sp.temperature > 0;
   if (sampled) encode_dist(e, K + 1, sp);
   kp::DflAccept ap{uint32_t(P), uint32_t(K), sampled ? sp.temperature : 0.0f, sp.seed, dyn_tau_ > 0 ? 1u : 0u};
-  e.use(dpipe("dfl_accept"));
-  e.buf(0, s.tok); e.buf(1, tg_.verify_samples()); e.buf(2, dist_id_); e.buf(3, dist_p_); e.buf(4, cand_i_);
-  e.buf(5, qprob_); e.buf(6, walk_k_); e.buf(7, acc_);
+  // the single-stream cycles draft with the DFlash3 decoder when it is loaded: its walk has 32 candidates
+  e.use(dpipe(d3_ ? "dfl_accept32" : "dfl_accept"));
+  e.buf(0, s.tok); e.buf(1, tg_.verify_samples()); e.buf(2, dist_id_); e.buf(3, dist_p_); e.buf(4, d3_ ? c32_i_ : cand_i_);
+  e.buf(5, d3_ ? q32_ : qprob_); e.buf(6, walk_k_); e.buf(7, acc_);
   e.val(8, ap);
   e.buf(9, kdyn_);
   e.buf(10, gst_);
@@ -1510,7 +1598,7 @@ void DFlash2::encode_accept(Encoder& e, Seq& s, int P, int K, const SamplingPara
 
 void DFlash2::encode_cycle_draft(Encoder& e, Seq& s, DFlashSeq& d, int P, int m_prev, const SamplingParams& sp) {
   if (m_prev) encode_commit(e, d, m_prev);
-  encode_draft(e, s, d, P, sp);
+  encode_draft_impl(e, s, d, P, sp, false, d3_ ? 1 : 0);
 }
 
 void DFlash2::encode_cycle_verify(Encoder& e, Seq& s, int P, int K, const SamplingParams& sp) {
@@ -1518,8 +1606,8 @@ void DFlash2::encode_cycle_verify(Encoder& e, Seq& s, int P, int K, const Sampli
   if (dyn_tau_ > 0) {
     kp::DflDepth dp{uint32_t(K), sp.temperature > 0 ? dyn_tau_t_ : dyn_tau_, sp.temperature > 0 ? sp.temperature : 0.0f,
                     dyn_rule_};
-    e.use(dpipe("dfl_depth"));
-    e.buf(0, walk_s_); e.buf(1, walk_k_); e.buf(2, qprob_); e.buf(3, kdyn_);
+    e.use(dpipe(d3_ ? "dfl_depth32" : "dfl_depth"));
+    e.buf(0, d3_ ? ws32_ : walk_s_); e.buf(1, walk_k_); e.buf(2, d3_ ? q32_ : qprob_); e.buf(3, kdyn_);
     e.val(4, dp);
     e.dispatch(1, 1, 1, 32);
     tg_.set_verify_row_limit(&rows);
@@ -1544,7 +1632,7 @@ void DFlash2::gpu_state_reset(int P) {
 
 void DFlash2::encode_cycle_draft_gpu(Encoder& e, Seq& s, DFlashSeq& d, int P_max, const SamplingParams& sp) {
   encode_commit(e, d, -1);  // the rows the last acceptance kept (none after gpu_state_reset)
-  encode_draft_impl(e, s, d, P_max, sp, true);
+  encode_draft_impl(e, s, d, P_max, sp, true, d3_ ? 1 : 0);
 }
 
 void DFlash2::encode_cycle(Encoder& e, Seq& s, DFlashSeq& d, int P, int m_prev, int K, const SamplingParams& sp) {
@@ -1558,7 +1646,7 @@ void DFlash2::prewarm_pipelines() {
   Gpu& g = Gpu::get();
   // spec_dflash.metal (dfl_*), verify8.metal (qmm8*, x8_*, moe8*, attn8*, gdn_step_verify8) and the verify's
   // shared kernels; the prompt commit's prefill GEMMs
-  static const char* prefixes[] = {"dfl_", "qmm8", "x8_", "moe8", "attn8", "gdn_step_verify8", "gdn_prep_verify",
+  static const char* prefixes[] = {"dfl_", "d3_", "qmm8", "x8_", "moe8", "attn8", "gdn_step_verify8", "gdn_prep_verify",
                                    "attn_prep", "attn_rows_reduce", "topk_stage1_rows", "sample_stage2_rows",
                                    "qmm_b4_m64_n64", "qmm_b4_m32_n32", "qmm_b8_m64_n64", "qmm_b8_m32_n32", "copy_u32"};
   std::vector<std::string> v;

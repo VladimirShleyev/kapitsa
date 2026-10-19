@@ -403,7 +403,7 @@ int main(int argc, char** argv) {
     double ts = now_ms();
     int P = n, m_prev = 0, cycles = 0, emitted = 0;
     int div_at = -1, div_tok[2] = {0, 0}, div_row = 0, div_P = 0;
-    long verified_sum = 0;
+    long verified_sum = 0, d3_passes = 0;
     float div_logit[2] = {0, 0};
     std::vector<int> acc_hist(K + 1, 0), reached(K, 0), acc_pos(K, 0);
     double gpu_sum = 0, wall_sum = 0;
@@ -498,26 +498,27 @@ int main(int argc, char** argv) {
                 tk[P + 2], tk[P + 3], tk[P + 4], tk[P + 5], tk[P + 6], tk[P + 7], tk[P + 1 + a], wall, gms);
       if (conf) {
         fprintf(conf, "%d", a);
+        const int nc = dfl->walk_cands();  // 16 (DFlash2's walk) or 32 (the DFlash3 decoder's)
         for (int p = 0; p < 7; ++p) {
-          const float* S = dfl->walk_scores() + p * 16;
+          const float* S = dfl->walk_scores() + p * nc;
           float mx = S[0], z = 0;
-          for (int k = 1; k < 16; ++k) mx = std::max(mx, S[k]);
-          for (int k = 0; k < 16; ++k) z += std::exp(S[k] - mx);
+          for (int k = 1; k < nc; ++k) mx = std::max(mx, S[k]);
+          for (int k = 0; k < nc; ++k) z += std::exp(S[k] - mx);
           fprintf(conf, " %.4f", std::exp(S[dfl->walk_k()[p]] - mx) / z);
         }
         // sampled runs: the walk's q of each chosen proposal (what the T > 0 depth rule reads), and K verified
         if (sp.temperature > 0)
-          for (int p = 0; p < 7; ++p) fprintf(conf, " %.4f", dfl->qprob()[p * 16 + dfl->walk_k()[p]]);
+          for (int p = 0; p < 7; ++p) fprintf(conf, " %.4f", dfl->qprob()[p * nc + dfl->walk_k()[p]]);
         fprintf(conf, " | %d |", dfl->verified(K));
         // per proposal, features of its whole distribution (fixed before it is sampled, so a depth rule may
         // read them at T > 0): max and sum of squares of the softmax of S_p, then of the walk's q
         for (int p = 0; p < 7; ++p) {
-          const float* S = dfl->walk_scores() + p * 16;
+          const float* S = dfl->walk_scores() + p * nc;
           float mx = S[0], z = 0, cm = 0, c2 = 0, qm = 0, q2 = 0;
-          for (int k = 1; k < 16; ++k) mx = std::max(mx, S[k]);
-          for (int k = 0; k < 16; ++k) z += std::exp(S[k] - mx);
-          for (int k = 0; k < 16; ++k) {
-            const float c = std::exp(S[k] - mx) / z, q = dfl->qprob()[p * 16 + k];
+          for (int k = 1; k < nc; ++k) mx = std::max(mx, S[k]);
+          for (int k = 0; k < nc; ++k) z += std::exp(S[k] - mx);
+          for (int k = 0; k < nc; ++k) {
+            const float c = std::exp(S[k] - mx) / z, q = dfl->qprob()[p * nc + k];
             cm = std::max(cm, c); c2 += c * c; qm = std::max(qm, q); q2 += q * q;
           }
           fprintf(conf, " %.4f %.4f %.4f %.4f", cm, c2, qm, q2);
@@ -546,6 +547,9 @@ int main(int argc, char** argv) {
       }
       const int kv = dfl->verified(K);  // proposals this cycle verified
       verified_sum += kv;
+      // DFlash3 decoder: speculative passes the chain walk ran (the tree buffer is only still this cycle's when the
+      // next drafting half has not been committed behind the verify, i.e. not in mode 3)
+      if (dfl->d3() && mode != 3) d3_passes += dfl->d3()->tree_host().walk_passes;
       for (int i = 0; i <= std::min(a, kv - 1); ++i) {
         reached[i]++;
         if (i < a) acc_pos[i]++;
@@ -576,6 +580,8 @@ int main(int argc, char** argv) {
     for (int a = 0; a <= K; ++a) fprintf(stderr, " %d", acc_hist[a]);
     fprintf(stderr, "; %.2f proposals verified per cycle; acceptance by position", double(verified_sum) / std::max(cycles, 1));
     for (int i = 0; i < K; ++i) fprintf(stderr, " %.2f", reached[i] ? double(acc_pos[i]) / reached[i] : 0.0);
+    if (dfl->d3() && mode != 3)
+      fprintf(stderr, "; DFlash3 decoder: %.2f speculative passes per cycle", double(d3_passes) / std::max(cycles, 1));
     fprintf(stderr, "\n");
     if (getenv("NI_CYCLE_TRACE") && ntr)
       fprintf(stderr, "cycle trace (ms, mean of %d): host encodes the verify %.3f | GPU idle verify->draft %.3f, draft %.3f, "

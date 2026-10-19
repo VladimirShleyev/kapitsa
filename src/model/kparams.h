@@ -271,6 +271,37 @@ struct DflPerm {
   uint32_t K;
 };
 
+// ---- DFlash3 candidate decoder (src/kernels/spec_dflash3.metal) ----
+struct D3Root {
+  uint32_t P, spec;
+};
+
+struct D3Jac {
+  float temp;
+  uint32_t seed, qt, maxdep, last, nslot;
+};
+
+struct D3In {
+  uint32_t H, d, emb_bits, emb_gs;
+  float eps;
+};
+
+struct D3Attn {
+  uint32_t d, layer, nl;
+  float scale;
+};
+
+struct D3Cand {
+  uint32_t H, out_bits;
+};
+
+struct D3Soft {
+  uint32_t H, d, acc_row, has_acc;
+  float qtemp, wq, wb, temp;
+  uint32_t seed, qt, maxdep, walk;
+  uint32_t out_bits;
+};
+
 // ---- 8-row verify (src/kernels/verify8.metal) ----
 struct X8Prep {
   uint32_t K, R, x_ld, norm, write_xn;

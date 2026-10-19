@@ -4,6 +4,7 @@
 // encodes one drafting pass (anchor + 7 mask rows -> 7 proposals) into a command buffer.
 // Opt-in: nothing here is constructed unless a drafter directory is given.
 #pragma once
+#include "model/dflash3.h"
 #include "model/qwen35.h"
 
 #include <algorithm>
@@ -53,11 +54,13 @@ struct DflSeg8 {
   uint32_t y_ld;
   float oscale;
 };
-void dfl_enc_qmm8(Encoder& e, const std::vector<DflSeg8>& segs, const Buffer& xh, const Buffer& xs, uint32_t K,
-                  uint32_t x_ld, int ks = 0, int rf = 0);
-// Gate/up + SwiGLU (dfl_qmm8_gu): hh half [8][N] = silu(X Wg^T) * (X Wu^T), hs float [N/64][8].
-void dfl_enc_qmm8_gu(Encoder& e, const QLinear& g, const QLinear& u, const Buffer& xh, const Buffer& xs,
-                     const Buffer& hh, const Buffer& hs, int ks = 0);
+// ind: dispatch indirectly from the threadgroup counts at *ind + ind_off (MTLDispatchThreadgroupsIndirectArguments;
+// a GPU-side producer may zero them to skip the GEMM). Returns the threadgroup count of the direct dispatch.
+uint32_t dfl_enc_qmm8(Encoder& e, const std::vector<DflSeg8>& segs, const Buffer& xh, const Buffer& xs, uint32_t K,
+                      uint32_t x_ld, int ks = 0, int rf = 0, const Buffer* ind = nullptr, size_t ind_off = 0);
+// Gate/up + SwiGLU (dfl_qmm8_gu): hh half [8][N] = silu(X Wg^T) * (X Wu^T), hs float [N/64][8]. ind as dfl_enc_qmm8.
+uint32_t dfl_enc_qmm8_gu(Encoder& e, const QLinear& g, const QLinear& u, const Buffer& xh, const Buffer& xs,
+                         const Buffer& hh, const Buffer& hs, int ks = 0, const Buffer* ind = nullptr, size_t ind_off = 0);
 
 // MLX affine quantization (mx.quantize, group 64) of bf16 rows on the CPU: W uint32 [N][K*bits/32],
 // S/B bf16 [N][K/64]. even=false reproduces MLX's Metal kernel (IEEE fp32, round half away from
@@ -188,12 +191,27 @@ class DFlash2 {
   // sampled cycles verify with row-independent MoE numerics (Qwen35::set_verify_moe_exact)
   bool exact_moe() const { return exact_moe_; }
 
-  // results of the last pass (host-visible after the command buffer completed)
-  const int* cand_ids() const { return cand_i_.as<int>(); }       // [7][16]
-  const float* cand_vals() const { return cand_v_.as<float>(); }  // [7][16]
-  const float* qprob() const { return qprob_.as<float>(); }       // [7][16] (sampled walk)
-  const int* walk_k() const { return walk_k_.as<int>(); }         // [7]
-  const float* walk_scores() const { return walk_s_.as<float>(); }// [7][16]
+  // ---- DFlash3Turbo candidate decoder (NI_DFLASH3, off by default; internal/DFLASH3TURBO.md) ----
+  // When a decoder is loaded (DFlash3::find), the single-stream cycles (encode_cycle*, encode_cycle_draft_gpu) draft
+  // with it: the top-32 of each block row, then the decoder's chain walk (one decoder step per position) instead of the
+  // selector lattice and walk, and the acceptance and dynamic depth read its 32-candidate walk (dfl_accept32,
+  // dfl_depth32). The batched path (encode_draft, encode_save_walk, encode_accept_rows) keeps DFlash2's walk.
+  DFlash3* d3() const { return d3_.get(); }
+  // A drafting pass with an explicit selection: 0 = DFlash2's walk, 1 = the DFlash3 decoder's chain walk, 2 = the
+  // backbone and its top-32 only (decoder steps / tree builders follow; tests)
+  void encode_draft_sel(Encoder& e, Seq& s, DFlashSeq& d, int P, const SamplingParams& sp, int sel);
+  Buffer final_hidden_buf() const { return n_; }  // fp32 [8][H]: the decoder's h rows
+  Buffer cand32_ids_buf() const { return c32_i_; }
+  Buffer cand32_vals_buf() const { return c32_v_; }
+
+  // results of the last pass (host-visible after the command buffer completed); walk_cands() candidates per
+  // position: 16 (DFlash2's walk), 32 with the DFlash3 decoder (its top-32, walk scores and q)
+  int walk_cands() const { return d3_ ? 32 : 16; }
+  const int* cand_ids() const { return (d3_ ? c32_i_ : cand_i_).as<int>(); }       // [7][walk_cands()]
+  const float* cand_vals() const { return (d3_ ? c32_v_ : cand_v_).as<float>(); }  // [7][walk_cands()]
+  const float* qprob() const { return (d3_ ? q32_ : qprob_).as<float>(); }         // [7][walk_cands()] (sampled walk)
+  const int* walk_k() const { return walk_k_.as<int>(); }                          // [7]
+  const float* walk_scores() const { return (d3_ ? ws32_ : walk_s_).as<float>(); } // [7][walk_cands()]
   const float* edges() const { return edges_.as<float>(); }       // [7][16][16]
   const float* logits() const { return logits_.as<float>(); }     // [8][Vd] (row 0 unused; Vd = head_rows())
   uint32_t head_rows() const { return draft_vocab(); }             // draft logit columns (vocab or the reduced head)
@@ -243,7 +261,8 @@ class DFlash2 {
   void enc_commit_kv(Encoder& e, DFlashSeq& d, const Buffer& kv, int rows, int pos0);
   // encode_commit's projections of m rows of `src` (bf16 [8][n_slots * H]; the verify captures capt_ by default)
   void enc_commit_from(Encoder& e, DFlashSeq& d, int m, const Buffer& src);
-  void encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const SamplingParams& sp, bool gpu);
+  void encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const SamplingParams& sp, bool gpu, int sel = 0);
+  void enc_top32(Encoder& e, uint32_t Vd);  // top-32 of draft logit rows 1..7 -> c32_i_ / c32_v_
   void dbg(Encoder& e, const std::string& name, const Buffer& src, size_t bytes);
 
   Qwen35& tg_;
@@ -299,6 +318,9 @@ class DFlash2 {
   bool h0_set_ = false, debug_ = false;
   int attn_variant_ = 0, pf8_ = -1;
   std::map<std::string, Buffer> dbg_;
+  // DFlash3 decoder (NI_DFLASH3): top-32 per block row (ids / draft logits), its staging, the walk's q and scores
+  std::unique_ptr<DFlash3> d3_;
+  Buffer c32_i_, c32_v_, q32_, ws32_, t32a_v_, t32a_i_, t32b_v_, t32b_i_;
 };
 
 } // namespace ni
