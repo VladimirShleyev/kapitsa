@@ -12,7 +12,7 @@
 // reference (plain greedy), prints the target's logits of both tokens three ways (SPEC §12 G2): the
 // DFlash verify row that produced it, plain token-by-token decoding, one multi-row prefill of the prefix.
 // NI_CYCLE_TRACE=1 (DFlash2, double-buffered cycles): the mean host encode time of a verify, the GPU times of the
-// drafting half and the verify, the GPU idle time between them, and the host wake-up latency after a verify.
+// drafting half and the verify, the GPU idle times between them, and the host wake-up latency after a verify.
 // Prints generated ids, prompt/decode speeds; optionally dumps the logits of the first
 // generated position (raw float32) for comparison against a reference implementation.
 #include "metal/gpu.h"
@@ -428,7 +428,7 @@ int main(int argc, char** argv) {
     auto knobs_for = [&](int cycle) { v8_knobs() = (ab && (cycle & 1)) ? knob_b : knob_a; };
     knobs_for(0);
     std::unique_ptr<Encoder> next_draft;  // mode 3: the committed drafting half of the coming cycle
-    double tr[6] = {0, 0, 0, 0, 0, 0};
+    double tr[7] = {0, 0, 0, 0, 0, 0, 0}, prev_end = 0;
     int ntr = 0;
     if (mode == 3) {
       dfl->gpu_state_reset(P);  // the GPU is idle here
@@ -475,8 +475,10 @@ int main(int argc, char** argv) {
         tr[3] += e->gpu_end_host_ms() - e->gpu_start_host_ms();    // GPU: verify
         tr[4] += h0 - e->gpu_end_host_ms();                        // host wake-up after the verify
         tr[5] += e->gpu_start_host_ms() - t_commit;                // verify commit -> its GPU start
+        tr[6] += e1->gpu_start_host_ms() - prev_end;                // GPU idle: last verify end -> drafting half start
         ++ntr;
       }
+      prev_end = e->gpu_end_host_ms();
       const double wall = now_ms() - tc0;
       const double gms = e->gpu_ms() + (e1 ? e1->gpu_ms() : 0.0);
       gpu_sum += gms;
@@ -552,9 +554,9 @@ int main(int argc, char** argv) {
     for (int i = 0; i < K; ++i) fprintf(stderr, " %.2f", reached[i] ? double(acc_pos[i]) / reached[i] : 0.0);
     fprintf(stderr, "\n");
     if (getenv("NI_CYCLE_TRACE") && ntr)
-      fprintf(stderr, "cycle trace (ms, mean of %d): host encodes the verify %.3f | GPU draft %.3f, idle draft->verify %.3f, "
-              "verify %.3f | verify commit->start %.3f, host wake-up %.3f\n", ntr, tr[0] / ntr, tr[1] / ntr, tr[2] / ntr,
-              tr[3] / ntr, tr[5] / ntr, tr[4] / ntr);
+      fprintf(stderr, "cycle trace (ms, mean of %d): host encodes the verify %.3f | GPU idle verify->draft %.3f, draft %.3f, "
+              "idle draft->verify %.3f, verify %.3f | verify commit->start %.3f, host wake-up %.3f\n", ntr, tr[0] / ntr,
+              tr[6] / ntr, tr[1] / ntr, tr[2] / ntr, tr[3] / ntr, tr[5] / ntr, tr[4] / ntr);
     if (ab) {
       double med[2], mean[2];
       for (int k = 0; k < 2; ++k) {
