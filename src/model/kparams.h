@@ -308,7 +308,7 @@ struct Moe8Combine {
 struct Moe8CombineX8 {
   uint32_t N, k, R;
   float eps;
-  uint32_t unroll;
+  uint32_t unroll, write_t;
 };
 
 } // namespace ni::kp

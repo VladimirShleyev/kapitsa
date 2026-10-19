@@ -128,8 +128,7 @@ struct V8Knobs {
   int pad = 0;  // timing only: this many empty dispatches after every verify GEMM (the per-dispatch cost, with NI_AB)
   int tw = 1;   // the dense 4-bit verify GEMMs on the GPU's matrix units (qmm8t; Apple10 = M5 and macOS 26, else off)
   // fused verify passes (verify8_fuse.metal, bitwise the passes they replace): 1 = MoE combine + the next norm's X8
-  // table (not with tw: the combine does not write qmm8t's table), 2 = MoE top-k + plan, 4 = GDN prep with the rows'
-  // norms reduced together
+  // table (and qmm8t's T table with tw), 2 = MoE top-k + plan, 4 = GDN prep with the rows' norms reduced together
   int fuse = 7;
 };
 V8Knobs& v8_knobs();
@@ -492,7 +491,7 @@ class Qwen35 : public Model {
                  bool table_ready = false);
   void enc_mlp8(Encoder& e, const Layer& L, int R);
   // next_norm: the norm of what follows (the next layer's input norm, or the final norm); when given, the combine may
-  // also write that norm's X8 table (V8Knobs::fuse & 1). Returns whether it did.
+  // also write that norm's X8 table (V8Knobs::fuse & 1; with v8_tw() also the T table). Returns whether it did.
   bool enc_moe8(Encoder& e, const Layer& L, int R, int li, const Tensor* next_norm = nullptr);
 
   std::string dir_;

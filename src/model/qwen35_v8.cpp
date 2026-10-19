@@ -402,7 +402,7 @@ void Qwen35::enc_attn8(Encoder& e, const Seq& s, const Layer& L, const Buffer& k
                        int R, bool table_ready) {
   const int D = cfg_.hidden, HD = cfg_.hq * cfg_.head_dim;
   const int skip = v8_knobs().skip;
-  const bool tq = !table_ready && enc_x8(e, x_, R, D, L.in_norm, false, 0, nullptr, true);
+  const bool tq = table_ready ? v8_tw() : enc_x8(e, x_, R, D, L.in_norm, false, 0, nullptr, true);
   if (!(skip & 512)) enc_qmm8(e, {{&L.q, qg_}, {&L.k, kr_}, {&L.v, vr_}}, R, v8t_, v8s_, false, tq ? &v8tt_ : nullptr);
   if (skip & 2) {
     enc_qmm8(e, {{&L.o, x_, uint32_t(D), true}}, R, v8t_, v8s_);
@@ -600,12 +600,16 @@ bool Qwen35::enc_moe8(Encoder& e, const Layer& L, int R, int li, const Tensor* n
   // threadgroup per row, N / 4 threads; bitwise moe8_combine + x8_prep2)
   static const bool prep1 = env_int("NI_V8_PREP", 2) == 1;
   const V8Knobs& kn = v8_knobs();
-  if (next_norm && (kn.fuse & 1) && !(kn.skip & 256) && !prep1 && D % 256 == 0 && D <= 2048) {
-    kp::Moe8CombineX8 cp{uint32_t(D), uint32_t(k), uint32_t(R), cfg_.eps, kn.prepu ? 1u : 0u};
+  // with qmm8t on (v8_tw()), also its T table, so the next GEMMs find both tables written
+  const bool wt = v8_tw();
+  if (next_norm && (kn.fuse & 1) && !(kn.skip & 256) && !prep1 && D % 256 == 0 && D <= 2048 &&
+      (!wt || size_t(D) * 16 <= v8tt_.size)) {
+    kp::Moe8CombineX8 cp{uint32_t(D), uint32_t(k), uint32_t(R), cfg_.eps, kn.prepu ? 1u : 0u, wt ? 1u : 0u};
     e.use(pipe8("moe8_combine_x8"));
     e.buf(0, v8out_); e.buf(1, v8sh_); e.buf(2, rwts_); e.buf(3, x_);
     e.buf(4, next_norm->buf); e.buf(5, v8t_); e.buf(6, v8s_);
     e.val(7, cp);
+    e.buf(8, wt ? v8tt_ : v8t_);  // (unused unless write_t)
     e.dispatch(8, 1, 1, uint32_t(D / 4));
     return true;
   }
@@ -631,7 +635,7 @@ void Qwen35::encode_verify8(Encoder& e, Seq& s, int pos, int R, const SamplingPa
     const Layer& L = layers_[i];
     const int skip = v8_knobs().skip;
     if (L.linear) {
-      const bool ti = !table_ready && enc_x8(e, x_, R, D, L.in_norm, false, 0, nullptr, true);
+      const bool ti = table_ready ? v8_tw() : enc_x8(e, x_, R, D, L.in_norm, false, 0, nullptr, true);
       if (!(skip & 32))
         enc_qmm8(e, {{&L.qkv, qkv_}, {&L.z, zb_}, {&L.b, bb_}, {&L.a, ab_}}, R, v8t_, v8s_, false, ti ? &v8tt_ : nullptr);
       if (!(skip & 4)) {
@@ -682,12 +686,12 @@ void Qwen35::encode_verify8(Encoder& e, Seq& s, int pos, int R, const SamplingPa
     }
     table_ready = false;
     if (cfg_.moe)
-      table_ready = enc_moe8(e, L, R, i, v8_tw() ? nullptr : i + 1 < cfg_.layers ? layers_[i + 1].in_norm : final_norm_);
+      table_ready = enc_moe8(e, L, R, i, i + 1 < cfg_.layers ? layers_[i + 1].in_norm : final_norm_);
     else enc_mlp8(e, L, R);
     if (cap_) enc_capture(e, i, pos, R);  // block-drafter capture (DFlash2), off unless armed (reads x_ only)
   }
   s.n_pend = 0;  // folded by this verify; commit_rows() sets the new count
-  const bool tl = !table_ready && enc_x8(e, x_, R, D, final_norm_, false, 0, nullptr, true);
+  const bool tl = table_ready ? v8_tw() : enc_x8(e, x_, R, D, final_norm_, false, 0, nullptr, true);
   if (v8_knobs().skip & 128) return;
   enc_qmm8(e, {{&lm_head_, logits_}}, R, v8t_, v8s_, false, tl ? &v8tt_ : nullptr);
   const uint32_t V = uint32_t(cfg_.vocab), chunk = 2048, ntg = (V + chunk - 1) / chunk;

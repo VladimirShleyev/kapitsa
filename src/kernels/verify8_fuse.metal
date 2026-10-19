@@ -9,21 +9,24 @@
 // then x8_prep2's RMSNorm table of the new rows (its sum-of-squares order, its group-sum order). One threadgroup per
 // token row (the norm needs the whole row): the combined row is staged in threadgroup memory, simdgroup 0 forms the
 // row's norm, every thread then writes 8 consecutive inputs into the table (2-byte stores: a row is every other half
-// of the table's 16-byte lane runs). Rows t >= R get zeros. grid 8 x N / 4 threads (N <= 2048).
+// of the table's 16-byte lane runs). Rows t >= R get zeros. With write_t, also the row of qmm8t's T table (x8_prep2's
+// write_t; the halfs staged in threadgroup memory, 16-byte stores). grid 8 x N / 4 threads (N <= 2048).
 struct Moe8CombineX8Params {
   uint N, k;     // hidden, routed experts per row
   uint R;        // live rows
   float eps;
   uint unroll;   // x8_prep2's unroll (V8Knobs::prepu): 4 independent sum-of-squares chains
+  uint write_t;  // 1: also the T table (buffer 8)
 };
 [[kernel]] void moe8_combine_x8(const device float4* out [[buffer(0)]], const device float4* sh_out [[buffer(1)]],
                                 const device float* wts [[buffer(2)]], device float4* x [[buffer(3)]],
                                 const device bfloat* w [[buffer(4)]], device half* table [[buffer(5)]],
                                 device float* sums [[buffer(6)]], constant Moe8CombineX8Params& p [[buffer(7)]],
-                                uint t [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                                device half* table_t [[buffer(8)]], uint t [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                                 uint ntg [[threads_per_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                                 uint lane [[thread_index_in_simdgroup]]) {
   threadgroup float4 xs[512];
+  threadgroup half hs[2048];
   threadgroup float inv_s;
   const uint n4 = p.N / 4, K = p.N;
   const bool live = t < p.R;
@@ -84,6 +87,18 @@ struct Moe8CombineX8Params {
     const uint g = k0 / 64;
     if ((lane & 7) == 0) sums[g * kV8 + t] = sh;
     for (int i = 0; i < 8; ++i) table[v8_tab(g, (k0 % 64) + i, t)] = hv[i];
+  }
+  if (p.write_t) {  // slots 8q .. 8q + 7 of row t
+    if (on)
+      for (int i = 0; i < 8; ++i) hs[k0 + i] = hv[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (on) {
+      const uint gb = k0 & ~63u;
+      half o[8];
+      for (int i = 0; i < 8; ++i) o[i] = hs[gb + v8t_input_of_slot((k0 + i) & 63)];
+      *(device uint4*)(table_t + t * K + k0) = uint4(as_type<uint>(half2(o[0], o[1])), as_type<uint>(half2(o[2], o[3])),
+                                                    as_type<uint>(half2(o[4], o[5])), as_type<uint>(half2(o[6], o[7])));
+    }
   }
 }
 
