@@ -19,7 +19,7 @@ brew install nace-ai/tap/kapitsa
 kapitsa opencode --model 35b    # also: kapitsa claude, kapitsa codex, kapitsa pi
 ```
 
-<sub>On a 16-24 GB Mac use `--model 4b`. `kapitsa serve` starts the chat page and the
+<sub>On a 16-24 GB Mac use `--model 9b`, or `4b` for the quickest replies. `kapitsa serve` starts the chat page and the
 OpenAI and Anthropic APIs at http://127.0.0.1:8000. Kapitsa updates itself. [Usage guide](docs/usage.md)</sub>
 
 ## Benchmarks
@@ -84,6 +84,24 @@ OpenAI and Anthropic APIs at http://127.0.0.1:8000. Kapitsa updates itself. [Usa
 | --- | ---: | ---: | ---: | ---: |
 | Nemotron Dory1.0 4B<br><sub>NVFP4</sub> | 🟩&nbsp;<mark>**40&nbsp;tok/s**</mark> | —<br><sub>no support</sub> | 4 | 30 |
 
+### MacBook Pro (16-inch, 2026) · M5 Pro · 48 GB
+
+#### Qwen
+
+| Model | <mark>**Kapitsa**</mark> | <sub>oMLX</sub> | <sub>mlx‑serve</sub> | <sub>Ollama</sub> | <sub>MTPLX</sub> | <sub>LM&nbsp;Studio</sub> | <sub>llama.cpp</sub> | <sub>MLX</sub> | <sub>Rapid‑MLX</sub> |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Qwen3.5<br>4B<br><sub>4-bit</sub> | 🟩&nbsp;<mark>**179&nbsp;tok/s**</mark> | 113 | 163 | 134 | 113 | 89 | 93 | 101 | 112 |
+| Qwen3.8<br>27B<br><sub>4-bit</sub> | <mark>**61&nbsp;tok/s**</mark> | 51 | 🟩&nbsp;**71** | 40 | 41 | 17 | 30 | 32 | 35 |
+| Qwen3.6<br>35B‑A3B<br><sub>4-bit</sub> | 🟩&nbsp;<mark>**167&nbsp;tok/s**</mark> | 144 | 156 | 102 | 89 | 96 | 107 | 98 | 76 |
+
+#### Nemotron
+
+| Model | <mark>**Kapitsa**</mark> | <sub>oMLX</sub> | <sub>mlx‑serve</sub> | <sub>Ollama</sub> | <sub>MTPLX</sub> | <sub>LM&nbsp;Studio</sub> | <sub>llama.cpp</sub> | <sub>MLX</sub> |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Nemotron Dory1.0 4B<br><sub>NVFP4</sub> | 🟩&nbsp;<mark>**70&nbsp;tok/s**</mark> | —<br><sub>no support</sub> | —<br><sub>no support</sub> | —<br><sub>no support</sub> | —<br><sub>no support</sub> | —<br><sub>no support</sub> | 13 | 53 |
+| Nemotron 3.5 Lightning 30B‑A3B<br><sub>NVFP4</sub> | 🟩&nbsp;<mark>**136&nbsp;tok/s**</mark> | 124 | 115 | 92 | 101 | 72 | 101 | 94 |
+| Nemotron 3.5 Bolt 74B‑A9B<br><sub>2/4/8-bit mix</sub> | 🟩&nbsp;<mark>**79&nbsp;tok/s**</mark> | 39 | —<br><sub>no support</sub> | —<br><sub>no support</sub> | —<br><sub>no support</sub> | —<br><sub>no support</sub> | —<br><sub>no Metal support</sub> | 41 |
+
 <sub>Measure your Mac: `kapitsa bench --submit` adds it to the [community results](bench/community/RESULTS.md).</sub>
 
 ## Models
@@ -91,6 +109,7 @@ OpenAI and Anthropic APIs at http://127.0.0.1:8000. Kapitsa updates itself. [Usa
 | Model | Download | Speculation |
 | --- | --- | --- |
 | **Qwen3.5-4B** · `4b`<br><sub>dense</sub> | **4-bit · 4.6 GB**<br><sub>also 6-bit 5.6 · 8-bit 6.7 · bf16 10.6 GB</sub> | DFlash / MTP |
+| **Qwen3.5-9B** · `9b`<br><sub>dense</sub> | **4-bit · 9.0 GB** | DFlash / MTP |
 | **Qwen3.8-27B** · `27b`<br><sub>dense</sub> | **4-bit · 20.2 GB**<br><sub>also 5-bit 23.5 · 6-bit 26.9 · 8-bit 33.6 · bf16 58.8 GB</sub> | DFlash2 / MTP |
 | **Qwen3.6-35B-A3B** · `35b`<br><sub>MoE, 3B active</sub> | **4-bit · 22.1 GB**<br><sub>also 5-bit 26.4 · 6-bit 30.7 · 8-bit 39.4 · bf16 71.9 GB</sub> | DFlash2 / MTP |
 | **Qwen3.8-Flash-Next 180B-A7B** · `flash-next`<br><sub>MoE, 7B active; 128 GB Macs</sub> | **4-bit · 105.9 GB**<br><sub>4/6/8-bit MLX; its 32 GB n-gram table stays on the SSD</sub> | MTP |
@@ -99,7 +118,7 @@ OpenAI and Anthropic APIs at http://127.0.0.1:8000. Kapitsa updates itself. [Usa
 | **Nemotron 3.5 Bolt 74B-A9B** · `bolt`<br><sub>hybrid Mamba-2 MoE, 9B active</sub> | **NVIDIA 24 GB · 25.1 GB**<br><sub>2-bit experts, NVFP4, 8-bit</sub> | LiLiCorr |
 | **Nemotron 3.5 Super-VL 120B-A12B** · `super`<br><sub>hybrid Mamba-2 MoE, 12B active; 96 GB+ Macs</sub> | **NVIDIA NVFP4 · 76.4 GB**<br><sub>4-bit NVFP4 experts, FP8, BF16</sub> | LiLiCorr |
 
-<sub>Other precisions: `--model 35b:6bit`. All but Lightning and Dory read images. Memory: 16 GB for the 4B models, 32 GB
+<sub>Other precisions: `--model 35b:6bit` is five times closer to bf16 than the 4-bit default ([KL](docs/benchmarks.md#quality-qwen36-35b-a3b-against-bf16-2026-10-19)). All but Lightning and Dory read images. Memory: 16 GB for the 4B models, 32 GB
 for the 27B, 35B, Lightning and Bolt, 96 GB for Super-VL, 128 GB for Flash-Next. [Details](docs/usage.md#models-and-downloads)</sub>
 
 ## How it works
@@ -107,7 +126,7 @@ for the 27B, 35B, Lightning and Bolt, 96 GB for Super-VL, 128 GB for Flash-Next.
 <picture>
   <source media="(max-width: 600px)" srcset="docs/assets/how-it-works-narrow.svg">
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/how-it-works-dark.svg">
-  <img alt="How Kapitsa works. It guesses ahead, then checks in one go: a small draft model guesses the next few words, and the big model checks them all in one pass and keeps the ones it agrees with, so each pass writes several words. GPU: hand-written Metal code made for these models. Neural Engine: on the 4B, 27B and Nemotron 3.5 models it reads part of each prompt beside the GPU. Memory: each conversation keeps what it has read, so a follow-up only reads the new message; up to 4 run at once." src="docs/assets/how-it-works-light.svg">
+  <img alt="How Kapitsa works. It guesses ahead, then checks in one go: a small draft model guesses the next few words, and the big model checks them all in one pass and keeps the ones it agrees with, so each pass writes several words. GPU: hand-written Metal code made for these models. Neural Engine: on the 4B, 27B, Bolt and Super-VL it reads part of each prompt beside the GPU. Memory: each conversation keeps what it has read, so a follow-up only reads the new message; up to 4 run at once." src="docs/assets/how-it-works-light.svg">
 </picture>
 
 <sub>[Architecture](docs/architecture.md) · [Contributing](CONTRIBUTING.md) · [Press kit](docs/assets/brand/README.md) ·
