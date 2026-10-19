@@ -1357,7 +1357,7 @@ void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const S
       e.buf(0, cand_i_); e.buf(1, sel_); e.buf(2, cbA_->buf); e.buf(3, cbB_->buf); e.buf(4, s.tok); e.buf(5, edges_);
       e.val(6, Pk);
       e.buf(7, gst_);
-      e.dispatch(7, 1, 1, 256);
+      e.dispatch(7, 8, 1, 256);  // 8 threadgroups per position (7 x 1: +0.006 to +0.018 ms per pass)
     }
     kp::DflSelect p{Pk, sp.temperature, sp.seed, uint32_t(P + 1), sp.temperature * walk_tf_};
     e.use(dpipe("dfl_walk"));

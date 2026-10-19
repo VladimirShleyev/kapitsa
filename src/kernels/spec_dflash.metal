@@ -1411,20 +1411,22 @@ struct DflTopParams {
 
 // Edge lattice E[p][j][k] = sum_r A[pred_j][r] s_{p+1}[r] Bc[C_p[k]][r] (pred = anchor for p = 0,
 // C_{p-1}[j] otherwise; fp32 from the bf16 codebooks) -> edges [7][16][16] (NaN where p = 0, j > 0).
-// grid: 7 threadgroups (position p) x 256; one simdgroup per dot product of 256.
+// grid: (7 positions p, m) threadgroups x 256; one simdgroup per dot product of 256, threadgroup y takes every m-th
+// simdgroup's share (m 8: 4 dot products per simdgroup instead of 32; the codebook rows are DRAM reads).
 [[kernel]] void dfl_lattice(const device int* cand_i [[buffer(0)]], const device float* sel [[buffer(1)]],
                             const device bfloat* A [[buffer(2)]], const device bfloat* Bc [[buffer(3)]],
                             const device int* tokens [[buffer(4)]], device float* edges [[buffer(5)]],
                             constant uint& P [[buffer(6)]], const device uint* gst [[buffer(7)]],
-                            uint pp [[threadgroup_position_in_grid]],
+                            uint2 tg [[threadgroup_position_in_grid]], uint2 ntgs [[threadgroups_per_grid]],
                             uint sg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]],
                             uint lane [[thread_index_in_simdgroup]]) {
+  const uint pp = tg.x;
   const uint ntask = pp == 0 ? 16u : 256u;
-  if (pp == 0)
+  if (pp == 0 && tg.y == 0)
     for (uint i = 16 + sg * 32 + lane; i < 256; i += nsg * 32) edges[i] = as_type<float>(0x7fc00000u);
   const device float* s = sel + (pp + 1) * 256 + lane * 8;
   const float4 s0 = *(const device float4*)s, s1 = *(const device float4*)(s + 4);
-  for (uint t = sg; t < ntask; t += nsg) {
+  for (uint t = tg.y * nsg + sg; t < ntask; t += nsg * ntgs.y) {
     const uint j = t / 16, k = t % 16;
     const uint pred = pp == 0 ? uint(tokens[dfl_pos(P, gst)]) : uint(cand_i[(pp - 1) * 16 + j]);
     const uint succ = uint(cand_i[pp * 16 + k]);
