@@ -85,6 +85,7 @@ V8Knobs v8_knobs_parse(const char* spec, V8Knobs k) {
     else if (key == "prepu") k.prepu = v;
     else if (key == "skip") k.skip = v;
     else if (key == "pad") k.pad = v;
+    else if (key == "dfl") k.dfl = v;
     else fatal("knobs: unknown key '%s'", key.c_str());
     a = b + 1;
   }

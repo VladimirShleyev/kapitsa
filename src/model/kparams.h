@@ -198,6 +198,12 @@ struct DflAttn {
   float scale;
 };
 
+struct DflAttnQk {
+  uint32_t P, lo, chunk, nsplit;
+  float scale, eps;
+  uint32_t q_ld, kv_ld;
+};
+
 struct DflAttnRed {
   uint32_t nsplit;
   uint32_t P, lo, chunk;

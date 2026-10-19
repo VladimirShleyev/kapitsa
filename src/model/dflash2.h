@@ -290,7 +290,9 @@ class DFlash2 {
   // context commit
   Buffer capt_, y8_, c8_, kv8_, cdbg_;
   Buffer pcap_, xph_, yph_, cph_, kvph_;
-  int max_splits_ = 32;
+  int max_splits_ = 32;  // partial buffers (attention splits)
+  // context splits of the draft attention (NI_DFLASH_ATTN_SPLITS, <= max_splits_)
+  int attn_splits_ = std::clamp(getenv("NI_DFLASH_ATTN_SPLITS") ? atoi(getenv("NI_DFLASH_ATTN_SPLITS")) : 16, 1, 32);
   bool h0_set_ = false, debug_ = false;
   int attn_variant_ = 0, pf8_ = -1;
   std::map<std::string, Buffer> dbg_;

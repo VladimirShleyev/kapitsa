@@ -1076,12 +1076,12 @@ void DFlash2::enc_commit_from(Encoder& e, DFlashSeq& d, int m, const Buffer& src
 void dfl_attn_plan(int P, uint32_t max_splits, uint32_t min_chunk, uint32_t* lo, uint32_t* chunk, uint32_t* nsplit,
                    int valid_lo) {
   static const uint32_t env = getenv("NI_DFLASH_ATTN_CHUNK") ? uint32_t(atoi(getenv("NI_DFLASH_ATTN_CHUNK"))) : 0;
-  // 256-key splits: at the full window 8 splits x 8 kv heads beat 32 x 64 keys (smaller partials,
-  // cheaper reduce; dflash_attn_test, M4 Pro)
-  const uint32_t mc = std::max<uint32_t>(32, min_chunk ? min_chunk : env ? env : 256);
   *lo = P > DFlash2::kCtxKeep ? uint32_t(P - DFlash2::kCtxKeep) : 0u;
   if (valid_lo > 0 && uint32_t(valid_lo) > *lo) *lo = std::min(uint32_t(valid_lo), uint32_t(P));
   const uint32_t L = uint32_t(P) - *lo;
+  // min_chunk 0 (and no NI_DFLASH_ATTN_CHUNK): the smallest multiple of 32 keys that needs at most max_splits
+  // splits (dfl_attn_geom's plan for a GPU-side P)
+  const uint32_t mc = std::max<uint32_t>(32, min_chunk ? min_chunk : env ? env : ((L + max_splits - 1) / max_splits + 31) / 32 * 32);
   uint32_t ns = std::max<uint32_t>(1, std::min<uint32_t>(max_splits, (L + mc - 1) / mc));
   uint32_t ch = ((L + ns - 1) / ns + 31) / 32 * 32;
   if (ch == 0) ch = 32;
@@ -1130,15 +1130,24 @@ void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const S
     e.buf(3, gst_);
     e.dispatch(1, 1, 1, 512);
   }
+  // Draft attention: dfl_attn_qk (q / k norm + RoPE fused in) over at most attn_splits_ context splits of >= 32 keys.
+  // The previous dfl_qk_prep + dfl_attn_mma over 256-key splits ran 8 kv heads x 1-3 threadgroups at short contexts,
+  // most of the GPU idle (M5 Max, 35B, 512 tokens from an 85-token prompt: attention + reduce 0.24 -> 0.17 ms per
+  // drafting pass, the pass 1.48 -> 1.38 ms; 8 / 16 / 32 splits equal there). V8Knobs::dfl (NI_AB A/B): 1 = the
+  // previous attention, 2 / 4 = 8 / 32 splits.
+  const int dk = v8_knobs().dfl;
+  const bool old_attn = dk & 1;
+  const uint32_t splits = (dk & 2) ? 8u : (dk & 4) ? 32u : uint32_t(attn_splits_);
   uint32_t lo, chunk, nsplit;
-  dfl_attn_plan(P, uint32_t(max_splits_), 0, &lo, &chunk, &nsplit, d.valid_lo);
-  if (gpu) {  // the kernels derive the plan from the GPU-side P: [max(P - 2047, valid_lo), P) in 256-key splits
+  dfl_attn_plan(P, old_attn ? uint32_t(max_splits_) : splits, old_attn ? 256u : 0u, &lo, &chunk, &nsplit, d.valid_lo);
+  if (gpu) {  // the kernels derive the plan from the GPU-side P: [max(P - 2047, valid_lo), P)
     lo = uint32_t(std::max(d.valid_lo, 0));
-    chunk = kGpuChunk;
-    nsplit = (kCtxKeep + kGpuChunk - 1) / kGpuChunk;  // grid for the full window; empty splits exit
+    chunk = old_attn ? kGpuChunk : 0u;  // 0: dfl_attn_geom's plan (at most `nsplit` splits)
+    nsplit = old_attn ? (kCtxKeep + kGpuChunk - 1) / kGpuChunk : splits;  // the grid; empty splits exit
   }
   const kp::DflConv cp{H, G, cfg_.eps};
-  const int skip = v8_knobs().skip;  // timing only: 1024 MLP gate/up, 2048 MLP down, 4096 LM head, 8192 projections
+  // timing only: 1024 MLP gate/up, 2048 MLP down, 4096 LM head, 8192 projections, 32768 attention
+  const int skip = v8_knobs().skip;
   auto proj = [&](const std::vector<DflSeg8>& segs, uint32_t K) {  // conv / attention projections
     if (!(skip & 8192)) enc_qmm8(e, segs, xh_, xs_, K, K);
   };
@@ -1165,7 +1174,12 @@ void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const S
     }
     dbg(e, "a" + sfx, xh_, size_t(8) * H * 2);
     proj({{&Ly.q, q_, 4096, 1.0f}, {&Ly.kv, kv_, 2048, 1.0f}}, H);
-    {
+    // simdgroup-matrix attention by default (35B full window: 3.60 vs 4.52 ms per pass);
+    // NI_DFLASH_ATTN=scalar selects the fp32 scalar kernel
+    static const bool mma_env = !(getenv("NI_DFLASH_ATTN") && std::string(getenv("NI_DFLASH_ATTN")) == "scalar");
+    const bool mma = attn_variant_ ? attn_variant_ == 2 : mma_env;
+    const bool fused = mma && !old_attn && !debug_;  // debug_ keeps Q / Kb / Vb for the dumps
+    if (!fused) {
       kp::DflQk p{uint32_t(P), cfg_.eps, 4096, 2048};
       e.use(dpipe("dfl_qk_prep"));
       e.buf(0, q_); e.buf(1, kv_); e.buf(2, Ly.qn->buf); e.buf(3, Ly.kn->buf); e.buf(4, rope_cs_);
@@ -1176,19 +1190,25 @@ void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const S
     dbg(e, "q" + sfx, Q_, size_t(32) * 8 * 128 * 4);
     dbg(e, "kb" + sfx, Kb_, size_t(8) * 8 * 128 * 4);
     dbg(e, "vb" + sfx, Vb_, size_t(8) * 8 * 128 * 4);
-    {
+    if (!(skip & 32768)) {
       const size_t lstride = size_t(8) * kWin * 128 * 2;
-      kp::DflAttn p{Pk, lo, chunk, nsplit, 1.0f / std::sqrt(128.0f)};
-      // simdgroup-matrix attention by default (35B full window: 3.60 vs 4.52 ms per pass);
-      // NI_DFLASH_ATTN=scalar selects the fp32 scalar kernel
-      static const bool mma_env = !(getenv("NI_DFLASH_ATTN") && std::string(getenv("NI_DFLASH_ATTN")) == "scalar");
-      const bool mma = attn_variant_ ? attn_variant_ == 2 : mma_env;
-      e.use(dpipe(mma ? "dfl_attn_mma" : "dfl_attn"));
-      e.buf(0, Q_); e.buf(1, d.ring_k, l * lstride); e.buf(2, d.ring_v, l * lstride); e.buf(3, Kb_); e.buf(4, Vb_);
-      e.buf(5, part_o_); e.buf(6, part_ml_);
-      e.val(7, p);
-      e.buf(8, gst_);
-      e.dispatch(nsplit, 8, 1, 128);
+      if (fused) {
+        kp::DflAttnQk p{Pk, lo, chunk, nsplit, 1.0f / std::sqrt(128.0f), cfg_.eps, 4096, 2048};
+        e.use(dpipe("dfl_attn_qk"));
+        e.buf(0, q_); e.buf(1, kv_); e.buf(2, Ly.qn->buf); e.buf(3, Ly.kn->buf); e.buf(4, rope_cs_);
+        e.buf(5, d.ring_k, l * lstride); e.buf(6, d.ring_v, l * lstride); e.buf(7, part_o_); e.buf(8, part_ml_);
+        e.val(9, p);
+        e.buf(10, gst_);
+        e.dispatch(nsplit, 8, 1, 128);
+      } else {
+        kp::DflAttn p{Pk, lo, chunk, nsplit, 1.0f / std::sqrt(128.0f)};
+        e.use(dpipe(mma ? "dfl_attn_mma" : "dfl_attn"));
+        e.buf(0, Q_); e.buf(1, d.ring_k, l * lstride); e.buf(2, d.ring_v, l * lstride); e.buf(3, Kb_); e.buf(4, Vb_);
+        e.buf(5, part_o_); e.buf(6, part_ml_);
+        e.val(7, p);
+        e.buf(8, gst_);
+        e.dispatch(nsplit, 8, 1, 128);
+      }
       kp::DflAttnRed rp{nsplit, Pk, lo, chunk};
       e.use(dpipe("dfl_attn_reduce"));
       e.buf(0, part_o_); e.buf(1, part_ml_); e.buf(2, xh_); e.buf(3, xs_);
@@ -1232,9 +1252,9 @@ void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const S
       dbg(e, "hgu" + sfx, hh_, size_t(8) * I * 2);
       if (!(skip & 2048)) tg_.enc_qmm8(e, {{&Ly.down, u_, H, false}}, 8, v8h_, v8hs_);
     } else {
-      enc_qmm8_gu(e, Ly.gate, Ly.up, xh_, xs_);
+      if (!(skip & 1024)) enc_qmm8_gu(e, Ly.gate, Ly.up, xh_, xs_);
       dbg(e, "hgu" + sfx, hh_, size_t(8) * I * 2);
-      enc_qmm8(e, {{&Ly.down, u_, H, 1.0f}}, hh_, hs_, I, I);
+      if (!(skip & 2048)) enc_qmm8(e, {{&Ly.down, u_, H, 1.0f}}, hh_, hs_, I, I);
     }
     dbg(e, "f" + sfx, u_, size_t(8) * H * 4);
     const Tensor* next = l + 1 < NL ? layers_[l + 1].in_w : norm_;
