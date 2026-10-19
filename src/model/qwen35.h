@@ -127,6 +127,7 @@ struct V8Knobs {
   int skip = 0;
   int pad = 0;  // timing only: this many empty dispatches after every verify GEMM (the per-dispatch cost, with NI_AB)
   int emu = -1;  // MMA-exact small-expert passes (NI_V8_MOE_EMU, see enc_moe8): -1 = the environment's, else 0-2
+  int shs = -1;  // NI_V8_MOE_SHS: the shared expert as small tiles (with split 8; -1 = the environment's)
   int split = -1;  // NI_V8_MOE_SPLIT: experts with 3..split rows as 2-row small tiles (-1 = the environment's)
 };
 V8Knobs& v8_knobs();
@@ -544,7 +545,7 @@ class Qwen35 : public Model {
   bool v8_ready_ = false;
   Buffer v8g_, v8u_;  // split MLP: fp32 gate / up rows [8][I]
   Buffer v8cnt_;      // gdn_step_verify8s: per-head arrival counters (zero between dispatches)
-  Buffer v8t_, v8s_, v8tl_, v8sl_, v8h_, v8hs_, v8tiles_, v8nt_, v8slot_, v8args_, v8out_, v8sh_, v8ustat_, v8sm_, v8hsc_, v8xn_, v8hse_;
+  Buffer v8t_, v8s_, v8tl_, v8sl_, v8h_, v8hs_, v8tiles_, v8nt_, v8slot_, v8args_, v8out_, v8sh_, v8ustat_, v8sm_, v8hsc_, v8xn_, v8hse_, v8sm2_, v8hsc2_, v8hse2_;
 };
 
 } // namespace ni

@@ -64,6 +64,10 @@ int main(int argc, char** argv) {
   auto s = m.new_seq(cap);
   prefill(*s);
   for (int i = n; i <= n + n_tok; ++i) s->tokens()[i] = s1->tokens()[i];
+  if (Encoder::profiling()) {
+    fprintf(stderr, "==== (prefill and plain decode, ignore) ====\n");
+    Encoder::profile_report(1);
+  }
   const V8Knobs ka = v8_knobs();
   const bool ab = getenv("BENCH_AB") && *getenv("BENCH_AB");
   const V8Knobs kb = ab ? v8_knobs_parse(getenv("BENCH_AB"), ka) : ka;

@@ -777,9 +777,10 @@ NI_QMM8_GU(qmm8_gu1k2snb_b4, 2, 1, 2, 1)
 // ones stored), the shared expert tile U; slot[u * 8 + t] = the top-k slot of row t that routes to
 // tile u's expert (0xffffffff: row t does not use it; the shared tile: slot k for t < R). Experts
 // used by 1 .. small (<= 2) rows become scalar tiles s (register-dequant matvecs over just those
-// rows, no padded MMA work): sm[s] = expert, sm[64 + 2s + i] = row, sm[192 + 2s + i] = slot
+// rows, no padded MMA work): sm[s] = expert, sm[72 + 2s + i] = row, sm[216 + 2s + i] = slot
 // (0xffffffff past the tile's rows). ntiles = {U + 1, S}. Writes the indirect grids of the four
 // expert passes: {gu_gx, U + 1, 1}, {dn_gx, U + 1, 1}, {sgu_gx, max(S, 1), 1}, {sdn_gx, max(S, 1), 1}.
+constant constexpr uint kV8SM = 72;  // small tiles at most: 64 routed (row, expert) pairs + the shared expert's 4
 struct Moe8PlanParams {
   uint R, k, E;
   uint gu_gx;   // grid x of the gate/up pass (I / 64)
@@ -789,18 +790,38 @@ struct Moe8PlanParams {
   uint sgu_gx, sdn_gx;
   uint rlim;    // 1: route only rows < min(R, rows[0]) (a drafter's dynamic verify depth; later rows are dropped)
   uint split;   // experts with small < rows <= split become ceil(rows / 2) small tiles (>= small; MMA-exact passes)
+  uint shs;     // 1: the shared expert as ceil(R / 2) small tiles (expert 0xffffffff) after the routed ones, no MMA tile
+  uint sep;     // 1: the split experts' (and the shared expert's) tiles in list B (sm2, ntiles[2]: MMA-exact passes)
+                // while list A has the 1-2-row experts (greedy: moe8s2)
+  uint edn_gx;  // grid x of list B's down pass
 };
+
+// n 2-row small tiles of expert e from s0 on (its rows in order; slots from my[t]) in tile list sm
+NI_INLINE void v8_put_tiles(device uint* sm, uint s0, uint n, uint e, thread const uint (&my)[8]) {
+  for (uint q = 0; q < n; ++q) sm[s0 + q] = e;
+  uint i = 0;  // the expert's i-th row goes to tile s0 + i / 2, position i % 2
+  for (uint t = 0; t < 8; ++t)
+    if (my[t] != 0xffffffffu) {
+      sm[kV8SM + 2 * s0 + i] = t;
+      sm[3 * kV8SM + 2 * s0 + i] = my[t];
+      ++i;
+    }
+  for (; i < 2 * n; ++i) {
+    sm[kV8SM + 2 * s0 + i] = 0xffffffffu;
+    sm[3 * kV8SM + 2 * s0 + i] = 0xffffffffu;
+  }
+}
 
 [[kernel]] void moe8_plan(const device uint* ridx [[buffer(0)]], device uint* tiles [[buffer(1)]],
                           device uint* ntiles [[buffer(2)]], device uint* slot [[buffer(3)]],
                           device uint* args [[buffer(4)]], constant Moe8PlanParams& p [[buffer(5)]],
                           device uint* stats [[buffer(6)]], device uint* sm [[buffer(7)]],
-                          const device uint* rows_lim [[buffer(8)]],
+                          const device uint* rows_lim [[buffer(8)]], device uint* sm2 [[buffer(9)]],
                           uint tid [[thread_position_in_threadgroup]], uint ntg [[threads_per_threadgroup]],
                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
   threadgroup uint ids[64];
-  threadgroup uint cnt[3][32];
-  threadgroup uint total[3];
+  threadgroup uint cnt[4][32];
+  threadgroup uint total[4];
   const uint R = p.rlim ? min(p.R, rows_lim[0]) : p.R;
   const uint n = R * p.k;
   if (tid < n) ids[tid] = ridx[tid];
@@ -816,19 +837,24 @@ struct Moe8PlanParams {
         if (ids[t * p.k + j] == e) my[t] = j;
     rows += my[t] != 0xffffffffu ? 1u : 0u;
   }
-  // small tiles: 1 for rows <= small, ceil(rows / 2) for small < rows <= split (2 rows each, MMA-exact passes only)
-  const uint nsm = rows == 0 ? 0u : rows <= p.small ? 1u : rows <= p.split ? (rows + 1) / 2 : 0u;
-  const bool scal = nsm > 0, mma = rows > 0 && !scal;
+  // small tiles: 1 for rows <= small; ceil(rows / 2) for small < rows <= split (MMA-exact passes), in list A or (sep)
+  // list B; the rest MMA tiles
+  const bool spl = rows > p.small && rows <= p.split;
+  const uint na = rows > 0 && rows <= p.small ? 1u : spl && !p.sep ? (rows + 1) / 2 : 0u;
+  const uint nb = spl && p.sep ? (rows + 1) / 2 : 0u;
+  const bool mma = rows > 0 && na == 0 && nb == 0;
   const uint pre_m = simd_prefix_exclusive_sum(mma ? 1u : 0u);
-  const uint pre_s = simd_prefix_exclusive_sum(nsm);
+  const uint pre_a = simd_prefix_exclusive_sum(na);
+  const uint pre_b = simd_prefix_exclusive_sum(nb);
   const uint used = simd_sum(rows > 0 ? 1u : 0u);  // distinct experts (stats)
   if (lane == 31) {
     cnt[0][sg] = pre_m + (mma ? 1u : 0u);
-    cnt[1][sg] = pre_s + nsm;
-    cnt[2][sg] = used;
+    cnt[1][sg] = pre_a + na;
+    cnt[2][sg] = pre_b + nb;
+    cnt[3][sg] = used;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (tid < 3) {
+  if (tid < 4) {
     uint a = 0;
     for (uint i = 0; i < (ntg + 31) / 32; ++i) {
       const uint c = cnt[tid][i];
@@ -843,32 +869,34 @@ struct Moe8PlanParams {
     tiles[u] = e;
     for (uint t = 0; t < 8; ++t) slot[u * 8 + t] = my[t];
   }
-  if (scal) {
-    const uint s0 = cnt[1][sg] + pre_s;
-    for (uint q = 0; q < nsm; ++q) sm[s0 + q] = e;
-    uint i = 0;  // the expert's i-th row goes to tile s0 + i / 2, position i % 2
-    for (uint t = 0; t < 8; ++t)
-      if (my[t] != 0xffffffffu) {
-        sm[64 + 2 * s0 + i] = t;
-        sm[192 + 2 * s0 + i] = my[t];
-        ++i;
-      }
-    for (; i < 2 * nsm; ++i) {
-      sm[64 + 2 * s0 + i] = 0xffffffffu;
-      sm[192 + 2 * s0 + i] = 0xffffffffu;
+  if (na) v8_put_tiles(sm, cnt[1][sg] + pre_a, na, e, my);
+  if (nb) v8_put_tiles(sm2, cnt[2][sg] + pre_b, nb, e, my);
+  const uint U = total[0], nsh = p.shs ? (p.R + 1) / 2 : 0u;
+  const uint SA = total[1] + (p.shs && !p.sep ? nsh : 0u), SB = total[2] + (p.shs && p.sep ? nsh : 0u);
+  if (p.shs) {  // the shared expert: rows 0 .. R - 1 (its slot: k), expert 0xffffffff
+    device uint* l = p.sep ? sm2 : sm;
+    const uint s0 = p.sep ? total[2] : total[1];
+    if (tid < nsh) l[s0 + tid] = 0xffffffffu;
+    if (tid < 2 * nsh) {
+      l[kV8SM + 2 * s0 + tid] = tid < p.R ? tid : 0xffffffffu;
+      l[3 * kV8SM + 2 * s0 + tid] = tid < p.R ? p.k : 0xffffffffu;
     }
+  } else if (tid < 8) {
+    slot[U * 8 + tid] = tid < p.R ? p.k : 0xffffffffu;
   }
-  const uint U = total[0], S = total[1];
-  if (tid < 8) slot[U * 8 + tid] = tid < p.R ? p.k : 0xffffffffu;
   if (tid == 0) {
-    tiles[U] = 0xffffffffu;
-    ntiles[0] = U + 1;
-    ntiles[1] = S;
-    stats[p.layer] = total[2];
-    args[0] = p.gu_gx; args[1] = U + 1; args[2] = 1;
-    args[3] = p.dn_gx; args[4] = U + 1; args[5] = 1;
-    args[6] = p.sgu_gx; args[7] = max(S, 1u); args[8] = 1;
-    args[9] = p.sdn_gx; args[10] = max(S, 1u); args[11] = 1;
+    if (!p.shs) tiles[U] = 0xffffffffu;
+    const uint U1 = p.shs ? U : U + 1;
+    ntiles[0] = U1;
+    ntiles[1] = SA;
+    ntiles[2] = SB;
+    stats[p.layer] = total[3];
+    args[0] = p.gu_gx; args[1] = max(U1, 1u); args[2] = 1;
+    args[3] = p.dn_gx; args[4] = max(U1, 1u); args[5] = 1;
+    args[6] = p.sgu_gx; args[7] = max(SA, 1u); args[8] = 1;
+    args[9] = p.sdn_gx; args[10] = max(SA, 1u); args[11] = 1;
+    args[12] = p.gu_gx; args[13] = max(SB, 1u); args[14] = 1;  // list B: moe8e_gu_r2 (I / 64), moe8e_down_r2
+    args[15] = p.edn_gx; args[16] = max(SB, 1u); args[17] = 1;
   }
 }
 
@@ -1027,7 +1055,7 @@ NI_INLINE void v8s_dot2t(const device uint32_t* w, const device bfloat* scales, 
                           uint nsg [[simdgroups_per_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
   threadgroup float xs[2 * 2048];
   if (tg.y >= ntiles[1]) return;
-  const uint e = sm[tg.y], t0 = sm[64 + 2 * tg.y], t1r = sm[64 + 2 * tg.y + 1];
+  const uint e = sm[tg.y], t0 = sm[kV8SM + 2 * tg.y], t1r = sm[kV8SM + 2 * tg.y + 1];
   const bool two = t1r != 0xffffffffu;
   const uint t1 = two ? t1r : t0;
   for (uint i = tid; i < p.K / 4; i += 32 * nsg) {
@@ -1061,8 +1089,8 @@ NI_INLINE void v8s_dot2t(const device uint32_t* w, const device bfloat* scales, 
   threadgroup float xs[2 * 2048];
   if (tg.y >= ntiles[1]) return;
   const uint e = sm[tg.y];
-  const uint t0 = sm[64 + 2 * tg.y], t1r = sm[64 + 2 * tg.y + 1];
-  const uint j0 = sm[192 + 2 * tg.y], j1 = sm[192 + 2 * tg.y + 1];
+  const uint t0 = sm[kV8SM + 2 * tg.y], t1r = sm[kV8SM + 2 * tg.y + 1];
+  const uint j0 = sm[3 * kV8SM + 2 * tg.y], j1 = sm[3 * kV8SM + 2 * tg.y + 1];
   const bool two = t1r != 0xffffffffu;
   for (uint i = tid; i < p.K / 4; i += 32 * nsg) {
     ((threadgroup float4*)xs)[i] = ((const device float4*)(hs + (2 * tg.y) * p.K))[i];
@@ -1112,7 +1140,7 @@ struct Moe8eParams {
 // (11.98: too few threadgroups for the few such experts). Tile list (MT tiles at most): sm[s] = expert,
 // sm[MT + RT s + i] = row i, sm[MT + MT RT + RT s + i] = its top-k slot (0xffffffff past the tile's rows, which come
 // first). h and its group sums per tile row: hs[(RT s + i) * N], hsum[(RT s + i) * N / 64].
-NI_INLINE constexpr uint v8e_mt(uint rt) { return rt == 2 ? 64 : 32; }
+NI_INLINE constexpr uint v8e_mt(uint rt) { return rt == 2 ? kV8SM : 32; }
 NI_INLINE constexpr uint v8e_lrt(uint rt) { return rt == 2 ? 1 : 2; }  // log2(RT)
 // the tile's rows (dead entries: row 0) and live row count
 template <uint RT>
@@ -1135,7 +1163,9 @@ template <uint RT, uint NSG>
 NI_INLINE void moe8e_gu_t(const device uint32_t* Wg, const device ushort* Sg, const device ushort* Bg,
                           const device uint32_t* Wu, const device ushort* Su, const device ushort* Bu,
                           const device half* table, const device float* sums, device float* hs, device float* hsum,
-                          constant Moe8eParams& p, const device uint* sm, const device uint* ntiles, uint2 tg, uint tid,
+                          constant Moe8eParams& p, const device uint* sm, const device uint* ntiles,
+                          const device uint32_t* SWg, const device ushort* SSg, const device ushort* SBg,
+                          const device uint32_t* SWu, const device ushort* SSu, const device ushort* SBu, uint2 tg, uint tid,
                           uint sg, uint lane, threadgroup vec<half, RT>* xa, threadgroup vec<half, RT>* xb,
                           threadgroup float* dots, threadgroup float* hv, threadgroup float* red,
                           threadgroup float* tsx) {
@@ -1160,10 +1190,11 @@ NI_INLINE void moe8e_gu_t(const device uint32_t* Wg, const device ushort* Sg, co
     xb[i] = b;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  const device uint32_t* G = Wg + e * p.w_stride;
-  const device uint32_t* U = Wu + e * p.w_stride;
-  const device ushort *Gs = Sg + e * p.s_stride, *Gb = Bg + e * p.s_stride;
-  const device ushort *Us = Su + e * p.s_stride, *Ub = Bu + e * p.s_stride;
+  const bool shr = e == 0xffffffffu;  // the shared expert (its own weights)
+  const device uint32_t* G = shr ? SWg : Wg + e * p.w_stride;
+  const device uint32_t* U = shr ? SWu : Wu + e * p.w_stride;
+  const device ushort *Gs = shr ? SSg : Sg + e * p.s_stride, *Gb = shr ? SBg : Bg + e * p.s_stride;
+  const device ushort *Us = shr ? SSu : Su + e * p.s_stride, *Ub = shr ? SBu : Bu + e * p.s_stride;
   threadgroup float* dt = dots + sg * (2 * 2 * RT * 32);
   // epilogue lane: (column, gate/up, row, k-slice of the tile kernel's 2-way K split)
   const uint eslice = lane & 1, etrow = (lane >> 1) & (RT - 1), emat = (lane >> (1 + LRT)) & 1,
@@ -1265,7 +1296,10 @@ NI_INLINE void moe8e_gu_t(const device uint32_t* Wg, const device ushort* Sg, co
                        const device half* table [[buffer(6)]], const device float* sums [[buffer(7)]],          \
                        device float* hs [[buffer(8)]], device float* hsum [[buffer(9)]],                        \
                        constant Moe8eParams& p [[buffer(10)]], const device uint* sm [[buffer(11)]],            \
-                       const device uint* ntiles [[buffer(12)]], uint2 tg [[threadgroup_position_in_grid]],     \
+                       const device uint* ntiles [[buffer(12)]], const device uint32_t* SWg [[buffer(13)]],    \
+                       const device ushort* SSg [[buffer(14)]], const device ushort* SBg [[buffer(15)]],        \
+                       const device uint32_t* SWu [[buffer(16)]], const device ushort* SSu [[buffer(17)]],      \
+                       const device ushort* SBu [[buffer(18)]], uint2 tg [[threadgroup_position_in_grid]],      \
                        uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],    \
                        uint lane [[thread_index_in_simdgroup]]) {                                               \
     threadgroup vec<half, RT> xa[32 * 32], xb[32 * 32];                                                         \
@@ -1273,8 +1307,8 @@ NI_INLINE void moe8e_gu_t(const device uint32_t* Wg, const device ushort* Sg, co
     threadgroup float hv[64 * RT];                                                                              \
     threadgroup float red[8 * kV8];                                                                             \
     threadgroup float tsx[RT * 32];                                                                             \
-    moe8e_gu_t<RT, NSG>(Wg, Sg, Bg, Wu, Su, Bu, table, sums, hs, hsum, p, sm, ntiles, tg, tid, sg, lane, xa, xb, dots, \
-                        hv, red, tsx);                                                                          \
+    moe8e_gu_t<RT, NSG>(Wg, Sg, Bg, Wu, Su, Bu, table, sums, hs, hsum, p, sm, ntiles, SWg, SSg, SBg, SWu, SSu, SBu, tg,  \
+                        tid, sg, lane, xa, xb, dots, hv, red, tsx);                                             \
   }
 NI_MOE8E_GU_T(moe8e_gu_r2, 2, 8)
 
@@ -1284,7 +1318,9 @@ NI_MOE8E_GU_T(moe8e_gu_r2, 2, 8)
 template <uint RT>
 NI_INLINE void moe8e_down_t(const device uint32_t* W, const device ushort* S, const device ushort* B,
                             const device float* hs, const device float* hsum, device float* out,
-                            constant Moe8eParams& p, const device uint* sm, const device uint* ntiles, uint2 tg,
+                            constant Moe8eParams& p, const device uint* sm, const device uint* ntiles,
+                            const device uint32_t* SW, const device ushort* SS, const device ushort* SB,
+                            device float* sh_out, uint2 tg,
                             uint tid, uint sg, uint lane, threadgroup vec<half, RT>* xa, threadgroup vec<half, RT>* xb,
                             threadgroup float* dots, threadgroup float* tsx) {
   constexpr uint MT = v8e_mt(RT), gpr = 8, wpr = 64, NSG = 4;
@@ -1311,9 +1347,10 @@ NI_INLINE void moe8e_down_t(const device uint32_t* W, const device ushort* S, co
     xb[i] = b;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  const device uint32_t* Wb = W + e * p.w_stride;
-  const device ushort* Sb = S + e * p.s_stride;
-  const device ushort* Bb = B + e * p.s_stride;
+  const bool shr = e == 0xffffffffu;  // the shared expert: its own weights, outputs to sh_out[t * N]
+  const device uint32_t* Wb = shr ? SW : W + e * p.w_stride;
+  const device ushort* Sb = shr ? SS : S + e * p.s_stride;
+  const device ushort* Bb = shr ? SB : B + e * p.s_stride;
   const uint c4 = lane >> 3, g = lane & 7;
   threadgroup float* dt = dots + sg * (16 * RT * 8);
   for (uint pp = 0; pp < 2; ++pp) {
@@ -1372,7 +1409,7 @@ NI_INLINE void moe8e_down_t(const device uint32_t* W, const device ushort* S, co
         acc = fma(hsr[gi], fma(-1024.0f, s, bi), acc);
       }
       const uint tr = (lane & 1) ? t[1 + 2 * u] : t[2 * u], js = (lane & 1) ? jj[1 + 2 * u] : jj[2 * u];
-      if (trow < nr) out[(tr * p.k + js) * p.N + en] = acc;
+      if (trow < nr) (shr ? sh_out + tr * p.N : out + (tr * p.k + js) * p.N)[en] = acc;
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
   }
@@ -1382,13 +1419,15 @@ NI_INLINE void moe8e_down_t(const device uint32_t* W, const device ushort* S, co
                        const device ushort* B [[buffer(2)]], const device float* hs [[buffer(3)]],             \
                        const device float* hsum [[buffer(4)]], device float* out [[buffer(5)]],                \
                        constant Moe8eParams& p [[buffer(6)]], const device uint* sm [[buffer(7)]],             \
-                       const device uint* ntiles [[buffer(8)]], uint2 tg [[threadgroup_position_in_grid]],     \
+                       const device uint* ntiles [[buffer(8)]], const device uint32_t* SW [[buffer(9)]],       \
+                       const device ushort* SS [[buffer(10)]], const device ushort* SB [[buffer(11)]],         \
+                       device float* sh_out [[buffer(12)]], uint2 tg [[threadgroup_position_in_grid]],         \
                        uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],   \
                        uint lane [[thread_index_in_simdgroup]]) {                                              \
     threadgroup vec<half, RT> xa[32 * 8], xb[32 * 8];                                                          \
     threadgroup float dots[4 * 16 * RT * 8];                                                                   \
     threadgroup float tsx[RT * 8];                                                                             \
-    moe8e_down_t<RT>(W, S, B, hs, hsum, out, p, sm, ntiles, tg, tid, sg, lane, xa, xb, dots, tsx);             \
+    moe8e_down_t<RT>(W, S, B, hs, hsum, out, p, sm, ntiles, SW, SS, SB, sh_out, tg, tid, sg, lane, xa, xb, dots, tsx); \
   }
 NI_MOE8E_DOWN_T(moe8e_down_r2, 2)
 
