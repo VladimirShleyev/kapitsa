@@ -425,7 +425,10 @@ DFlash2::DFlash2(Qwen35& target, const std::string& dir, int bits) : tg_(target)
   // T > 0 uses an exact rule (dfl_depth): default tau 0.3 (offline replay, 35B T = 0.6, 4 prompts x 6 seeds: 0.25 /
   // 0.3 / 0.35 within 0.4%); NI_DFLASH_DYN_T overrides. NI_DFLASH_DYN_RULE=2: the earlier T > 0 rule (exclusive
   // product of the walk's q; 35B code_35b 512, T = 0.6: 139.2 tok/s without, 149.4 / 147.8 / 140.3 at 0.3 / 0.5 / 0.7)
+  // Rule 0 is the default on the M5 (Apple10), where it was measured; other Macs keep rule 2, which they were tuned
+  // with, until it is measured there.
   dyn_tau_t_ = dyn_tau_ > 0 ? 0.3f : 0.0f;
+  dyn_rule_ = Gpu::get().apple10() ? 0u : 2u;
   if (const char* v = getenv("NI_DFLASH_DYN_RULE")) dyn_rule_ = uint32_t(atoi(v));
   if (const char* v = getenv("NI_DFLASH_DYN_T")) dyn_tau_t_ = tg_.config().moe ? float(atof(v)) : 0.0f;
   if (dyn_tau_ <= 0) dyn_tau_t_ = 0.0f;
@@ -793,6 +796,14 @@ void DFlash2::dbg(Encoder& e, const std::string& name, const Buffer& src, size_t
   e.dispatch((n + 255) / 256, 1, 1, 256);
 }
 
+// The drafter's 4-bit GEMMs on the core before dfl_q8_run4: dfl_q8_run4 (two groups per step, the next step's loads
+// first, subnormal codes) was measured on the M5 only, so other Macs keep the earlier core (NI_DFLASH_CORE4=1 / 0
+// forces it).
+static bool dfl_old4() {
+  static const bool old = getenv("NI_DFLASH_CORE4") ? atoi(getenv("NI_DFLASH_CORE4")) == 0 : !Gpu::get().apple10();
+  return old;
+}
+
 // K split (bench_qmm8 sweep, M4 Pro): no split once there are >= 1024 threadgroups (LM head) on its 20 GPU cores,
 // ~51 per core (Gpu::core_count); otherwise the largest split that leaves every simdgroup >= 8 groups of 64.
 static uint32_t dfl_qmm8_ks(uint32_t rbs_total, uint32_t K, int ks_req) {
@@ -810,6 +821,7 @@ void dfl_enc_qmm8(Encoder& e, const std::vector<DflSeg8>& segs, const Buffer& xh
                   uint32_t x_ld, int ks_req, int rf_req) {
   if (segs.empty() || segs.size() > 4) fatal("enc_qmm8: 1-4 segments");
   kp::DflQmm8 p{};
+  p.old4 = dfl_old4() ? 1u : 0u;
   p.K = K;
   p.nseg = uint32_t(segs.size());
   p.x_ld = x_ld;
@@ -861,6 +873,7 @@ void dfl_enc_qmm8_gu(Encoder& e, const QLinear& g, const QLinear& u, const Buffe
   }
   if (ks != 1 && ks != 2 && ks != 4) fatal("enc_qmm8_gu: ks %u", ks);
   kp::DflQmm8 p{};
+  p.old4 = dfl_old4() ? 1u : 0u;
   p.K = g.K;
   p.nseg = 1;
   p.ks = ks;
@@ -948,6 +961,7 @@ void DFlash2::enc_qmm8(Encoder& e, const std::vector<DflSeg8>& segs, const Buffe
 void DFlash2::enc_qmm8_cp(Encoder& e, const QLinear& L, const Tensor* base, const Buffer& xh, const Buffer& xs) {
   if (L.K != uint32_t(cfg_.H) || L.N % 8 || L.gs != 64) fatal("enc_qmm8_cp: shapes");
   kp::DflQmm8 p{};
+  p.old4 = dfl_old4() ? 1u : 0u;
   p.K = L.K;
   p.nseg = 1;
   p.x_ld = L.K;

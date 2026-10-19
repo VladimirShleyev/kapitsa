@@ -892,6 +892,7 @@ struct DflQmm8Params {
   uint bits[4];
   uint y_ld[4];
   float oscale[4];
+  uint old4;  // 1: 4-bit GEMMs on dfl_q8_run (the core before dfl_q8_run4)
 };
 
 
@@ -1111,7 +1112,7 @@ NI_INLINE void dfl_qmm8_impl(const device uint32_t* const* Wv, const device bflo
   const device bfloat* B[1] = {Bv[si]};
   float2 acc[1][RF];
   if (p.bits[si] == 4) {
-    if (RF == 1) {
+    if (RF == 1 && !p.old4) {
       float2 a1[1][1];
       dfl_q8_run4<1>(W, S, B, rows[0], p.K, X, p.x_ld, XS, g0, g1, lane, a1);
       acc[0][0] = a1[0][0];
@@ -1193,7 +1194,8 @@ DFL_QMM8(dfl_qmm8_r2, 2)
   const device bfloat* S[1] = {S0};
   const device bfloat* B[1] = {B0};
   float2 acc[1][1];
-  if (p.bits[0] == 4) dfl_q8_run4<1>(W, S, B, rows[0], p.K, X, p.x_ld, XS, g0, g1, lane, acc);
+  if (p.bits[0] == 4 && !p.old4) dfl_q8_run4<1>(W, S, B, rows[0], p.K, X, p.x_ld, XS, g0, g1, lane, acc);
+  else if (p.bits[0] == 4) dfl_q8_run<4, 1, 1>(W, S, B, rows, p.K, X, p.x_ld, XS, g0, g1, lane, acc);
   else dfl_q8_run<8, 1, 1>(W, S, B, rows, p.K, X, p.x_ld, XS, g0, g1, lane, acc);
   if (ks > 1) {
     if (kslice) red[sg * 32 + lane] = acc[0][0];
@@ -1259,7 +1261,8 @@ NI_INLINE void dfl_qmm8_gu_impl(const device uint32_t* Wg, const device bfloat* 
   float2 acc[2][1];
   // subnormal codes only: dfl_q8_run4's pairs / prefetch measured slower here (6144 x 2048: 44.5 us; pairs +
   // prefetch 49.1, pairs 45.2; subnormal codes 44.2)
-  if (p.bits[0] == 4) dfl_q8_run<4, 2, 1, true>(W, S, B, rows, p.K, X, p.x_ld, XS, g0, g1, lane, acc);
+  if (p.bits[0] == 4 && !p.old4) dfl_q8_run<4, 2, 1, true>(W, S, B, rows, p.K, X, p.x_ld, XS, g0, g1, lane, acc);
+  else if (p.bits[0] == 4) dfl_q8_run<4, 2, 1>(W, S, B, rows, p.K, X, p.x_ld, XS, g0, g1, lane, acc);
   else dfl_q8_run<8, 2, 1>(W, S, B, rows, p.K, X, p.x_ld, XS, g0, g1, lane, acc);
   if (KS > 1) {
     if (kslice) {

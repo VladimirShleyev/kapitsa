@@ -509,7 +509,7 @@ void Qwen35::enc_mlp8(Encoder& e, const Layer& L, int R) {
 // The moe8e passes (MMA-exact small experts) rely on the MMA adding its products one at a time in k order with an fp32
 // rounding after each; mma_chain_check tests that on this GPU once (a fresh command buffer, before the first verify's
 // is committed). NI_V8_MOE_EMU: 0 = never use them (sampled verifies run every routed expert as an MMA tile),
-// 1 (default) = sampled verifies, 2 = greedy verifies too (instead of moe8s2's fp32 passes).
+// 1 (default on the M5) = sampled verifies, 2 = greedy verifies too (instead of moe8s2's fp32 passes).
 static int moe_emu_mode() {
   static const bool ok = [] {
     Gpu& g = Gpu::get();
@@ -525,7 +525,8 @@ static int moe_emu_mode() {
     if (n) logi("moe8e: this GPU's MMA rounds differently (%u of 4096 check values); sampled verifies keep MMA tiles", n);
     return n == 0;
   }();
-  static const int env = std::clamp(env_int("NI_V8_MOE_EMU", 1), 0, 2);
+  // default on the M5 (Apple10), where it was measured; other Macs keep the MMA tiles unless NI_V8_MOE_EMU is set
+  static const int env = std::clamp(env_int("NI_V8_MOE_EMU", Gpu::get().apple10() ? 1 : 0), 0, 2);
   const int m = v8_knobs().emu >= 0 ? std::min(v8_knobs().emu, 2) : env;
   return m && ok ? m : 0;
 }

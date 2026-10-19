@@ -231,6 +231,7 @@ struct DflQmm8 {
   uint32_t bits[4];
   uint32_t y_ld[4];
   float oscale[4];
+  uint32_t old4;  // 1: 4-bit GEMMs on dfl_q8_run, the core before dfl_q8_run4 (dflash2.cpp dfl_old4)
 };
 
 struct DflMerge {
