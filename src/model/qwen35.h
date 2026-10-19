@@ -126,8 +126,9 @@ struct V8Knobs {
   // 8192 conv / attention projections, 16384 ring commit. With NI_AB: the in-pipeline cost of those kernels.
   int skip = 0;
   int pad = 0;  // timing only: this many empty dispatches after every verify GEMM (the per-dispatch cost, with NI_AB)
-  // fused verify passes (verify8_fuse.metal, bitwise the passes they replace): 1 = MoE combine + the next norm's X8 table
-  int fuse = 1;
+  // fused verify passes (verify8_fuse.metal, bitwise the passes they replace): 1 = MoE combine + the next norm's X8
+  // table, 2 = MoE top-k + plan
+  int fuse = 3;
 };
 V8Knobs& v8_knobs();
 // "key=value,..." over a copy of `base` (keys: cm, pair, kplan, gusplit, gdnsplit, prepu, skip, pad, fuse); unknown keys are fatal

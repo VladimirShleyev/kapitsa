@@ -790,20 +790,12 @@ struct Moe8PlanParams {
   uint rlim;    // 1: route only rows < min(R, rows[0]) (a drafter's dynamic verify depth; later rows are dropped)
 };
 
-[[kernel]] void moe8_plan(const device uint* ridx [[buffer(0)]], device uint* tiles [[buffer(1)]],
-                          device uint* ntiles [[buffer(2)]], device uint* slot [[buffer(3)]],
-                          device uint* args [[buffer(4)]], constant Moe8PlanParams& p [[buffer(5)]],
-                          device uint* stats [[buffer(6)]], device uint* sm [[buffer(7)]],
-                          const device uint* rows_lim [[buffer(8)]],
-                          uint tid [[thread_position_in_threadgroup]], uint ntg [[threads_per_threadgroup]],
-                          uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup uint ids[64];
-  threadgroup uint cnt[2][32];
-  threadgroup uint total[2];
-  const uint R = p.rlim ? min(p.R, rows_lim[0]) : p.R;
-  const uint n = R * p.k;
-  if (tid < n) ids[tid] = ridx[tid];
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+// The plan from the rows' expert ids in threadgroup memory (ids[t * k + j], rows < R; cnt, total: the kernel's
+// threadgroup scratch); shared with moe8_topk_plan (verify8_fuse.metal), whose top-k writes the ids there.
+NI_INLINE void moe8_plan_body(threadgroup const uint* ids, uint R, device uint* tiles, device uint* ntiles,
+                              device uint* slot, device uint* args, constant Moe8PlanParams& p, device uint* stats,
+                              device uint* sm, uint tid, uint ntg, uint sg, uint lane, threadgroup uint (*cnt)[32],
+                              threadgroup uint* total) {
   // thread e: its slots per row (rows use each expert at most once)
   const uint e = tid;
   uint my[8];
@@ -865,6 +857,22 @@ struct Moe8PlanParams {
     args[6] = p.sgu_gx; args[7] = max(S, 1u); args[8] = 1;
     args[9] = p.sdn_gx; args[10] = max(S, 1u); args[11] = 1;
   }
+}
+[[kernel]] void moe8_plan(const device uint* ridx [[buffer(0)]], device uint* tiles [[buffer(1)]],
+                          device uint* ntiles [[buffer(2)]], device uint* slot [[buffer(3)]],
+                          device uint* args [[buffer(4)]], constant Moe8PlanParams& p [[buffer(5)]],
+                          device uint* stats [[buffer(6)]], device uint* sm [[buffer(7)]],
+                          const device uint* rows_lim [[buffer(8)]],
+                          uint tid [[thread_position_in_threadgroup]], uint ntg [[threads_per_threadgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup uint ids[64];
+  threadgroup uint cnt[2][32];
+  threadgroup uint total[2];
+  const uint R = p.rlim ? min(p.R, rows_lim[0]) : p.R;
+  const uint n = R * p.k;
+  if (tid < n) ids[tid] = ridx[tid];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  moe8_plan_body(ids, R, tiles, ntiles, slot, args, p, stats, sm, tid, ntg, sg, lane, cnt, total);
 }
 
 // ---- scalar expert passes for experts used by 1-2 rows ----

@@ -451,10 +451,6 @@ bool Qwen35::enc_moe8(Encoder& e, const Layer& L, int R, int li, const Tensor* n
   enc_x8(e, x_, R, D, L.post_norm, precise, 0, small ? &v8xn_ : nullptr);
   enc_qmm8(e, {{&L.router, rlog_, uint32_t(E)}, {&L.shared_gate, slog_, 1u}}, R, v8t_, v8s_, precise);
   kp::Topk tp{uint32_t(E), uint32_t(k), cfg_.norm_topk ? 1u : 0u};
-  e.use(pipe8(E == 256 && k <= 8 ? "moe_topk256_rows" : "moe_topk_rows"));
-  e.buf(0, rlog_); e.buf(1, slog_); e.buf(2, ridx_); e.buf(3, rwts_);
-  e.val(4, tp);
-  e.dispatch(R, 1, 1, 32);
   static const int dn_nf = env_int("NI_V8_MOE_NF", 2), dn_cs = 4;
   if (D % (8 * dn_nf * dn_cs)) fatal("moe8: hidden %d", D);
   // scalar passes: 8 simdgroups x 4 columns per threadgroup, inputs staged (hidden <= 2048)
@@ -462,12 +458,28 @@ bool Qwen35::enc_moe8(Encoder& e, const Layer& L, int R, int li, const Tensor* n
   if (small && D > 2048) fatal("moe8s2: hidden %d > 2048", D);
   kp::Moe8Plan pp{uint32_t(R), uint32_t(k), uint32_t(E), I / 64, uint32_t(D / (8 * dn_nf * dn_cs)), uint32_t(li),
                   uint32_t(small), I / (SR * s_nsg), uint32_t(D) / (SR * s_nsg), v8_rlim_ ? 1u : 0u};
-  e.use(pipe8("moe8_plan"));
-  e.buf(0, ridx_); e.buf(1, v8tiles_); e.buf(2, v8nt_); e.buf(3, v8slot_); e.buf(4, v8args_);
-  e.val(5, pp);
-  e.buf(6, v8ustat_); e.buf(7, v8sm_);
-  e.buf(8, v8_rlim_ ? *v8_rlim_ : v8nt_);
-  e.dispatch(1, 1, 1, uint32_t(std::max(32, (E + 31) / 32 * 32)));
+  if ((v8_knobs().fuse & 2) && E == 256 && k <= 8) {
+    // top-k and plan as one threadgroup (moe8_topk_plan: bitwise moe_topk256_rows + moe8_plan)
+    e.use(pipe8("moe8_topk_plan"));
+    e.buf(0, rlog_); e.buf(1, slog_); e.buf(2, ridx_); e.buf(3, rwts_);
+    e.val(4, tp);
+    e.buf(5, v8tiles_); e.buf(6, v8nt_); e.buf(7, v8slot_); e.buf(8, v8args_);
+    e.val(9, pp);
+    e.buf(10, v8ustat_); e.buf(11, v8sm_);
+    e.buf(12, v8_rlim_ ? *v8_rlim_ : v8nt_);
+    e.dispatch(1, 1, 1, 256);
+  } else {
+    e.use(pipe8(E == 256 && k <= 8 ? "moe_topk256_rows" : "moe_topk_rows"));
+    e.buf(0, rlog_); e.buf(1, slog_); e.buf(2, ridx_); e.buf(3, rwts_);
+    e.val(4, tp);
+    e.dispatch(R, 1, 1, 32);
+    e.use(pipe8("moe8_plan"));
+    e.buf(0, ridx_); e.buf(1, v8tiles_); e.buf(2, v8nt_); e.buf(3, v8slot_); e.buf(4, v8args_);
+    e.val(5, pp);
+    e.buf(6, v8ustat_); e.buf(7, v8sm_);
+    e.buf(8, v8_rlim_ ? *v8_rlim_ : v8nt_);
+    e.dispatch(1, 1, 1, uint32_t(std::max(32, (E + 31) / 32 * 32)));
+  }
   // gate/up + SwiGLU per touched expert (+ the shared expert), one h table per tile; strides in the routed format's
   // words / scale groups
   const uint32_t wstride = uint32_t(size_t(I) * L.eg.row_bytes() / 4), sstride = L.eg.dense() ? 0u : I * (uint32_t(D) / L.eg.gs);
