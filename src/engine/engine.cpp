@@ -2111,7 +2111,7 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
       // the copy lane: the conversation's continuation of the text before the anchor, verified instead of the drafted
       // chain when it is expected to accept more (tokens 0 .. P are final; the drafting half in flight writes P + 1 ..)
       CopyChain cc;
-      const bool copy = copy_lane_enabled() && copy_lookup(s.tokens(), P, cc);
+      const bool copy = dfl_->copy_lane() && copy_lookup(s.tokens(), P, cc);
       if (copy) dfl_->set_copy(&cc);
       auto e2 = g.begin();
       dfl_->encode_cycle_verify(*e2, s, P, K, sp);

@@ -29,10 +29,11 @@ bool copy_lookup(const int* tok, int P, CopyChain& out, int min_match = CopyChai
 // Expected proposals right in a row (of 7) of a copy chain whose match is `match` tokens long.
 float copy_expect(int match);
 
-// NI_COPY: 0 = off, 1 = on (default: on). NI_COPY_MARGIN: a cycle verifies the copy chain when its expectation
-// exceeds the drafter's own by more than this (default -1.5: the drafter rates itself high; a large negative value
-// takes the copy whenever one exists).
-bool copy_lane_enabled();
-float copy_lane_margin();
+// NI_COPY: 0 = off, 1 = on, unset: by_default (DFlash2::copy_lane: the target's measured default). NI_COPY_MARGIN: a
+// cycle verifies the copy chain when its expectation exceeds the drafter's own by more than this (default -1.5 on MoE
+// targets, whose drafter rates itself high, -0.5 on dense ones; a large negative value takes the copy whenever one
+// exists).
+bool copy_lane_enabled(bool by_default);
+float copy_lane_margin(bool moe_target);
 
 }  // namespace ni

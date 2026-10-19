@@ -47,24 +47,28 @@ float copy_expect(int match) {
   return 5.96f;
 }
 
-bool copy_lane_enabled() {
-  static const bool on = [] {
+bool copy_lane_enabled(bool by_default) {
+  static const int forced = [] {  // NI_COPY: 0 = off, 1 = on, unset = the target's default
     const char* v = getenv("NI_COPY");
-    return !(v && *v) || atoi(v) != 0;
+    return v && *v ? (atoi(v) != 0 ? 1 : 0) : -1;
   }();
-  return on;
+  return forced < 0 ? by_default : forced == 1;
 }
 
-float copy_lane_margin() {
-  // The drafter's own expectation runs high: in greedy runs of the 35B on the agent session's requests 6, 7, 12, 14
-  // and 18 (ni_run, NI_COPY_LOG), the cycles that kept the drafted chain accepted 4.35 drafts against an E_d of 5.45.
-  // Replaying those cycles with the copy's known outcome, a margin of -1.5 took the copy in 88 of 226 and accepted
-  // 4.66 drafts a cycle (4.35 at 0, 4.72 at -2), and lost on none of the five requests (-2 lost on the plain-text one).
-  static const float m = [] {
-    const char* v = getenv("NI_COPY_MARGIN");
-    return v && *v ? float(atof(v)) : -1.5f;
-  }();
-  return m;
+float copy_lane_margin(bool moe_target) {
+  // Drafters rate themselves differently. Greedy runs on the agent session's requests 6, 7, 12, 14 and 18 (ni_run,
+  // NI_COPY_LOG; the copy's outcome replayed from the known continuation), where the drafted chain was verified:
+  // - Qwen3.6-35B-A3B (incoai's DFlash2 drafter): it accepted 4.35 drafts against an E_d of 5.45. A margin of -1.5
+  //   took the copy in 88 of 226 cycles and accepted 4.66 drafts a cycle (4.35 at 0, 4.72 at -2), losing on none
+  //   of the five requests (-2 lost on the plain-text one).
+  // - Qwen3.8-27B (z-lab's DFlash2 drafter): 5.12 against 5.92; over 165 cycles -0.5 gained the most (+21 drafts;
+  //   -1.5 none, and it cost decode speed: an edit answer of 102 tokens -10%).
+  // - Qwen3.5-4B (z-lab's DFlash v1 drafter): 3.08 against 3.07; over 363 cycles 0 and -0.5 gained the most (+572
+  //   drafts), -1.0 and lower lost on fresh code.
+  // So -1.5 on the MoE target, -0.5 on the dense ones.
+  static const char* v = getenv("NI_COPY_MARGIN");
+  if (v && *v) return float(atof(v));
+  return moe_target ? -1.5f : -0.5f;
 }
 
 }  // namespace ni

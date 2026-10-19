@@ -418,6 +418,7 @@ DFlash2::DFlash2(Qwen35& target, const std::string& dir, int bits) : tg_(target)
   if (const char* v = getenv("NI_DFLASH_DYN_T")) dyn_tau_t_ = tg_.config().moe ? float(atof(v)) : 0.0f;
   if (dyn_tau_ <= 0) dyn_tau_t_ = 0.0f;
   if (dyn_tau_ > 0) logi("DFlash2: dynamic verify depth, tau %.3f (T = 0) / %.3f (T > 0)", dyn_tau_, dyn_tau_t_);
+  copy_margin_ = copy_lane_margin(tg_.config().moe);
   if (const char* v = getenv("NI_DFLASH_EXACT_MOE")) exact_moe_ = atoi(v) != 0;
   if (const char* v = getenv("NI_DFLASH_QT")) walk_tf_ = std::max(0.0f, float(atof(v)));
   if (cfg_.v1)
@@ -1367,7 +1368,7 @@ void DFlash2::encode_cycle_verify(Encoder& e, Seq& s, int P, int K, const Sampli
     cp.P = uint32_t(P);
     cp.K = uint32_t(K);
     cp.expect = copy_.expect;
-    cp.margin = copy_lane_margin();
+    cp.margin = copy_margin_;
     cp.temp = sp.temperature > 0 ? sp.temperature : 0.0f;
     e.use(dpipe("dfl_copy_pick"));
     e.buf(0, s.tok); e.buf(1, walk_s_); e.buf(2, walk_k_); e.buf(3, qprob_); e.buf(4, cand_i_); e.buf(5, cand_v_);

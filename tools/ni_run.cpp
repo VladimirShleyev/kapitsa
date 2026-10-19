@@ -398,10 +398,10 @@ int main(int argc, char** argv) {
     // NI_DFLASH_CONF=<file>: per cycle "a c_0 .. c_6", c_p = softmax over the 16 candidates of the walk's
     // scores S_p at the chosen candidate (the drafter's confidence; calibration data for a dynamic depth)
     FILE* conf = getenv("NI_DFLASH_CONF") ? fopen(getenv("NI_DFLASH_CONF"), "a") : nullptr;
-    // copy lane (NI_COPY, default on): per run, the cycles that had a copy chain, took it, found the drafted chain the
+    // copy lane (NI_COPY, else DFlash2::copy_lane's default): per run, the cycles that had a copy chain, took it, found the drafted chain the
     // same, and the tokens the copy cycles emitted; NI_COPY_LOG=<file>: per cycle with a copy chain "P match expect
     // E_d taken same a" (calibration data for the rule)
-    const bool copy_lane = copy_lane_enabled();
+    const bool copy_lane = dfl->copy_lane();
     FILE* copy_log = getenv("NI_COPY_LOG") ? fopen(getenv("NI_COPY_LOG"), "a") : nullptr;
     int copy_found = 0, copy_taken = 0, copy_same = 0, copy_emitted = 0;
     double ts = now_ms();
@@ -559,7 +559,7 @@ int main(int argc, char** argv) {
     if (copy_log) fclose(copy_log);
     if (copy_lane)
       fprintf(stderr, "copy lane (margin %.2f): a copy chain in %d of %d cycles, verified in %d (%d tokens, %.3f tok/cycle), "
-              "the drafted chain the same in %d\n", copy_lane_margin(), copy_found, cycles, copy_taken, copy_emitted,
+              "the drafted chain the same in %d\n", dfl->copy_margin(), copy_found, cycles, copy_taken, copy_emitted,
               double(copy_emitted) / std::max(copy_taken, 1), copy_same);
     if (ab) {
       double med[2], mean[2];

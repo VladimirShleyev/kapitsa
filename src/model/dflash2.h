@@ -198,6 +198,11 @@ class DFlash2 {
   bool copy_taken() const { return copy_flag_.as<uint32_t>()[0] == 1; }
   bool copy_same() const { return copy_flag_.as<uint32_t>()[1] == 1; }
   float copy_drafter_expect() const { return copy_flag_.as<float>()[2]; }
+  float copy_margin() const { return copy_margin_; }  // NI_COPY_MARGIN, else by target (copy_lane_margin)
+  // whether decode loops run the copy lane with this drafter: NI_COPY, else on for MoE targets and DFlash (v1)
+  // drafters and off for a dense target's DFlash2 drafter, as measured over the recorded agent session (writing rate:
+  // 35B +7.4%, 4B +34%, 27B -1.2%: its drafter already drafts most of what the copy would)
+  bool copy_lane() const { return copy_lane_enabled(tg_.config().moe || cfg_.v1); }
 
   // results of the last pass (host-visible after the command buffer completed)
   const int* cand_ids() const { return cand_i_.as<int>(); }       // [7][16]
@@ -280,6 +285,7 @@ class DFlash2 {
   Buffer copy_flag_;
   CopyChain copy_;
   bool copy_on_ = false;
+  float copy_margin_ = -1.5f;
   float dyn_tau_ = 0.0f;    // T = 0 (0: dynamic depth off)
   float dyn_tau_t_ = 0.0f;  // T > 0 (exclusive-product rule)
   bool exact_moe_ = true;  // T > 0 on MoE targets: row-independent expert numerics (NI_DFLASH_EXACT_MOE=0 off)
