@@ -1,0 +1,101 @@
+{
+  "schema": 1,
+  "kind": "kapitsa-bench",
+  "mode": "quick",
+  "time_utc": "2026-10-19T14:48:55Z",
+  "kapitsa": {
+    "version": "0.1.38",
+    "commit": "3cc97ce"
+  },
+  "mac": {
+    "identifier": "Mac16,11",
+    "name": "Mac mini (2024)",
+    "year": 2024,
+    "chip": "Apple M4 Pro",
+    "cpu_cores": 12,
+    "gpu_cores": 16,
+    "memory_gb": 48,
+    "macos": "27.0.1",
+    "macos_build": "26A434"
+  },
+  "model": {
+    "name": "nemotron-3.5-bolt",
+    "title": "Nemotron 3.5 Bolt 74B-A9B",
+    "variant": "24gb",
+    "precision": "NVIDIA 24 GB",
+    "catalog": true,
+    "revision": "c6cc2e8",
+    "decoding": "LiLiCorr",
+    "decoding_detail": "LiLiCorr speculative decoding (7-token blocks)",
+    "drafter": "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr@abd4780"
+  },
+  "protocol": {
+    "corpus_sha256": "1a9bb103b3f6d39ee5b9f5bf7207e304c5ce92788c273685f597508c7d2bde28",
+    "decode_tokens": 512,
+    "decode_runs": 3,
+    "greedy_runs": 3,
+    "sizes": [
+      4000
+    ]
+  },
+  "results": {
+    "decode": {
+      "median_tps": 56.21,
+      "runs_tps": [
+        56.24,
+        56.21,
+        52.16
+      ]
+    },
+    "decode_greedy": {
+      "median_tps": 54.28,
+      "runs_tps": [
+        54.28,
+        53.08,
+        54.82
+      ]
+    },
+    "prefill": [
+      {
+        "size": 4000,
+        "prompt_tokens": 4185,
+        "ttft_s": 12.5529,
+        "tps": 333.4,
+        "followup_s": [
+          0.3126,
+          0.3428,
+          0.2863
+        ],
+        "followup_median_s": 0.3126
+      }
+    ],
+    "tool_calls": "pass",
+    "peak_memory_gb": 22.65,
+    "mapped_gb": 1.01
+  },
+  "conditions": {
+    "power_source": "ac",
+    "power_mode": "automatic",
+    "low_power_mode": false,
+    "thermal_state": "nominal",
+    "swapouts": 0,
+    "gpu_quiet_wait_s": 120.8,
+    "gpu_other_mean_pct": 12.73,
+    "gpu_other_max_pct": 25.43,
+    "gpu_ambient_mean_pct": 0.0,
+    "gpu_users": [
+      "Screen Sharing",
+      "com.apple.gpusw.ParavirtualizedGraphicsGPUTask"
+    ],
+    "contention": [
+      "decode",
+      "decode_greedy",
+      "prefill_4000",
+      "tools"
+    ]
+  },
+  "flags": [
+    "CONTENTION: sustained foreign GPU load > 5% in ['decode', 'decode_greedy', 'prefill_4000', 'tools'] (mean 12.73%, top ['Screen Sharing'])"
+  ],
+  "invalid": []
+}
