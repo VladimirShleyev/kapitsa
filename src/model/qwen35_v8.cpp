@@ -237,7 +237,7 @@ static V8Plan v8_plan(uint32_t N, uint32_t K, int nf_def) {
   return p;
 }
 
-// qmm8t's tiling: NT weight rows per simdgroup (16; 32 for grids beyond 16384 threadgroups, the LM heads), ks
+// qmm8t's tiling: NT weight rows per simdgroup (16; 32 for grids beyond 8192 threadgroups of 16, the LM heads), ks
 // k-slices per threadgroup (4 for K 2049-4096, else 8), PF prefetching the next group (all but K <= 2048 at NT 16).
 // bench_v8 cmp / bench_tq (median of 8-15 interleaved runs, us; vs qmm8snb with the M5's v8_plan and with its best
 // tiling nf1 cs1 ks8): 35B GDN in_proj 12352x2048 31.0 vs 39.1 / 34.9; q|k|v 9216x2048 24.5 vs 28.9 / 27.2; GDN out /
@@ -250,7 +250,7 @@ struct V8tPlan {
 static V8tPlan v8t_plan(uint32_t Ntot, uint32_t K) {
   static const int nt_env = env_int("NI_V8T_NT", 0), ks_env = env_int("NI_V8T_KS", 0), pf_env = env_int("NI_V8T_PF", -1);
   const uint32_t gpr = K / 64;
-  V8tPlan p{(Ntot + 15) / 16 > 16384 ? 32 : 16, gpr > 32 && gpr <= 64 ? 4 : 8, 0};
+  V8tPlan p{(Ntot + 15) / 16 > 8192 ? 32 : 16, gpr > 32 && gpr <= 64 ? 4 : 8, 0};
   if (nt_env == 16 || nt_env == 32) p.nt = nt_env;
   if (ks_env >= 1 && ks_env <= 8) p.ks = ks_env;
   p.pf = pf_env >= 0 ? (pf_env ? 1 : 0) : (p.nt == 32 || gpr > 32 ? 1 : 0);

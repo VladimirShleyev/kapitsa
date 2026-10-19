@@ -34,7 +34,7 @@ using namespace metal;
 using namespace mpp::tensor_ops;
 
 struct TqParams {
-  uint K, N, ks, R;
+  uint K, N, ks, R, cs;
 };
 
 NI_TQ_KERNELS
@@ -304,7 +304,8 @@ template <int NT, int PF, int MAXKS>
 inline void tc_body(const device uint* W, const device ushort* S, const device ushort* Bq, const device half* T,
                     const device float* sums, device float* Y, constant TqParams& p, threadgroup float* red, uint tg,
                     uint sg, uint lane) {
-  const uint n0 = tg * NT, gpr = p.K / 64, wpr = p.K / 8, gper = gpr / p.ks, g0 = sg * gper, g1 = g0 + gper;
+  const uint cb = sg / p.ks, ksl = sg % p.ks;
+  const uint n0 = (tg * p.cs + cb) * NT, gpr = p.K / 64, wpr = p.K / 8, gper = gpr / p.ks, g0 = ksl * gper, g1 = g0 + gper;
   const uint c = (lane & 1) | (((lane >> 3) & 1) << 1), r = ((lane >> 1) & 3) | (((lane >> 4) & 1) << 2);
   constexpr auto desc = matmul2d_descriptor(NT, 16, 32, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<desc, execution_simdgroup> op;
@@ -383,14 +384,14 @@ inline void tc_body(const device uint* W, const device ushort* S, const device u
   }
   if (p.ks > 1) {
     constexpr uint cap = NT / 2;
-    if (sg)
+    if (ksl)
       _Pragma("clang loop unroll(full)")
-      for (uint i = 0; i < cap; ++i) red[((sg - 1) * cap + i) * 32 + lane] = acc[i];
+      for (uint i = 0; i < cap; ++i) red[((cb * (p.ks - 1) + ksl - 1) * cap + i) * 32 + lane] = acc[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg) return;
+    if (ksl) return;
     for (uint jj = 1; jj < p.ks; ++jj)
       _Pragma("clang loop unroll(full)")
-      for (uint i = 0; i < cap; ++i) acc[i] += red[((jj - 1) * cap + i) * 32 + lane];
+      for (uint i = 0; i < cap; ++i) acc[i] += red[((cb * (p.ks - 1) + jj - 1) * cap + i) * 32 + lane];
   }
   if ((lane >> 3) & 1) return;
   _Pragma("clang loop unroll(full)")
@@ -683,12 +684,13 @@ int main(int argc, char** argv) {
           add_t(nt, ks, pre_s.c_str());
   auto enc = [&](Encoder& e, V& v, int i) {
     if (v.tq) {
-      struct { uint32_t K, N, ks, R; } prm{K, N, uint32_t(v.ks), 8};
+      const uint32_t cs = v.name.rfind("tc", 0) == 0 && getenv("CS") ? uint32_t(atoi(getenv("CS"))) : 1u;
+      struct { uint32_t K, N, ks, R, cs; } prm{K, N, uint32_t(v.ks), 8, cs};
       e.use(v.p);
       e.buf(0, mats[i].w); e.buf(1, mats[i].s); e.buf(2, mats[i].b); e.buf(3, v.name.rfind("tw", 0) == 0 ? ttab : v.name.rfind("tc", 0) == 0 ? ctab : xh);
       e.buf(4, sums); e.buf(5, y2);
       e.val(6, prm);
-      e.dispatch(N / v.nt, 1, 1, 32 * v.ks);
+      e.dispatch(N / (v.nt * cs), 1, 1, 32 * v.ks * cs);
     } else {
       kp::Qmm8 prm{};
       prm.K = K; prm.R = 8; prm.nseg = 1; prm.ks = uint32_t(v.ks);
