@@ -448,6 +448,11 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
 
 Engine::~Engine() = default;
 
+void Engine::save_kflash() {
+  if (kf_budget_) kf_budget_->save();
+  if (dfl_ && dfl_->budget()) dfl_->budget()->save();
+}
+
 size_t default_mem_budget() {
   if (const char* v = getenv("NI_MEM_BUDGET"); v && *v) return size_t(atof(v) * 1e9);
   const size_t rws = Gpu::get().recommended_working_set();
@@ -2041,7 +2046,6 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
         break;
       }
       // two command buffers: the drafting half starts on the GPU while the host encodes the verify half
-      const double t_cycle = Encoder::host_ms();
       auto e1 = g.begin();
       commit_kept(*e1);
       if (kft) {
@@ -2062,7 +2066,9 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
       nh_->set_tree(false);
       nh_->set_dynamic_rows(false);
       e2->commit_and_wait();
-      if (kft) kf_budget_->observe(nh_->tree_buf().as<int32_t>(), Encoder::host_ms() - t_cycle);
+      // KFlash: the budget reads the cycle's outcome and its GPU time, the drafting half's and the verify's (as every
+      // backend and tool measures it)
+      if (kft) kf_budget_->observe(nh_->tree_buf().as<int32_t>(), e1->gpu_ms() + e2->gpu_ms());
       const int a = nh_->accepted();
       const int* tk = s.tokens();
       int m = 0;
@@ -2103,7 +2109,10 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
     nh_->encode_flush(*e3, s);
     e3->commit_and_wait();
     fed_until = P;
-    if (kft && req_cycles > 0) logi("%s", kf_budget_->summary().c_str());
+    if (kft && req_cycles > 0) {
+      logi("%s", kf_budget_->summary().c_str());
+      kf_budget_->save(KfBudget::kSaveEvery);
+    }
   } else if (dfl_) {
     // DFlash2, double-buffered: each cycle's verify (8-row target forward with captures + on-GPU
     // acceptance) is committed, then right behind it the NEXT cycle's drafting half (ring commit of the
@@ -2148,7 +2157,7 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
         res.context_full = true;
         break;
       }
-      next_draft.reset();
+      const auto draft = std::move(next_draft);  // this cycle's drafting half (the budget reads its GPU time)
       auto e2 = g.begin();
       dfl_->encode_cycle_verify(*e2, s, P, K, sp);
       e2->commit();
@@ -2172,7 +2181,9 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
         next_draft->commit();
       }
       e2->wait();
-      dfl_->observe(e2->gpu_ms());  // KFlash: the budget reads the cycle's outcome and the verify's cost
+      // KFlash: the budget reads the cycle's outcome and its GPU time, the drafting half's (done before the verify
+      // started) and the verify's, as ni_run measures it
+      dfl_->observe(draft->gpu_ms() + e2->gpu_ms());
       const int a = dfl_->accepted();
       a_last = a;
       const int* tk = s.tokens();
@@ -2238,7 +2249,10 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
     q35_->encode_flush(*e3, s);
     e3->commit_and_wait();
     fed_until = P;
-    if (dfl_->tree() && dfl_->budget() && req_cycles > 0) logi("%s", dfl_->budget()->summary().c_str());
+    if (dfl_->tree() && dfl_->budget() && req_cycles > 0) {
+      logi("%s", dfl_->budget()->summary().c_str());
+      dfl_->budget()->save(KfBudget::kSaveEvery);
+    }
   } else if (dory_spec_ > 0) {
     // Dory speculative decoding (per-loop KV). Prompt lookup: when the last tokens occurred earlier in the
     // conversation, the tokens that followed them are the drafts, and one pass of the full loop count verifies them

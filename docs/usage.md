@@ -527,7 +527,7 @@ this Mac, on `127.0.0.1:8000`) in the background and at each login, restarting i
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `KAPITSA_HOME` | `~/.cache/kapitsa` | Kapitsa's folder: models in `models/`, the coding-agent servers' logs in `logs/`, `kapitsa bench`'s results in `bench/`, the last model chosen in `state.json`, the automatic update's state in `update.json`. |
+| `KAPITSA_HOME` | `~/.cache/kapitsa` | Kapitsa's folder: models in `models/`, the coding-agent servers' logs in `logs/`, `kapitsa bench`'s results in `bench/`, the last model chosen in `state.json`, the automatic update's state in `update.json`, KFlash's measurements (this Mac's cost per verified row count and the draft model's calibration, per model, draft model and chip) in `kflash/`, saved as the server runs and when it stops. |
 | `KAPITSA_NO_AUTO_UPDATE` | | `1`: no automatic update and no check in the background ([Updating](#updating)); `kapitsa update` still works. |
 | `KAPITSA_UPDATE_URL` | `https://github.com/nace-ai/kapitsa/releases` | Where updates come from: a GitHub releases page or a copy of one (https, or http to this Mac). |
 | `KAPITSA_UPDATE_TIMEOUT_S` | `300` | The background check's time limit, in seconds. |

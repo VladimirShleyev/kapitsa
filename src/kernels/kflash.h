@@ -56,8 +56,9 @@ KF_WORD(PathWords, 40);  // Seq::pend_path: the accepted path's rows (int32), up
 
 // What the budget (src/model/kflash_budget.h, KfBudget) gives the builder each cycle, from past cycles only:
 // the per-depth calibration of the path model's probabilities (p = sigmoid(alpha_d + beta_d logit(q)); 0 and 1 give q
-// itself), the measured cost of a verify of n rows, which row counts the backend's verify runs at a cost of their own
-// (allowed: bit n - 1), the verify's row capacity, and the cost table's exploration (force_n > 0: verify that many).
+// itself), the measured cost of a cycle that verifies n rows (its GPU ms), which row counts the backend's verify runs
+// at a cost of their own (allowed: bit n - 1), the verify's row capacity, and the cost table's exploration (force_n >
+// 0: verify that many).
 struct KfParams {
   float alpha[33], beta[33];  // depth d = 1 .. 32 (index d)
   float cost[33];             // n = 1 .. 32 rows (index n), ms

@@ -303,6 +303,10 @@ class Engine {
   // template keeps the think block and the live state already matches the next request).
   // With DFlash2 the prefilled rows also enter the slot's drafter context ring, as prompt rows do.
   void prefill_history(const ChatRequest& r, const ChatResult& res);
+  // KFlash: the budgets' cost tables and calibrations (KfBudget) to their cache files now. They are saved when the
+  // engine ends and every KfBudget::kSaveEvery cycles between requests; a server stopped by a signal ends no
+  // destructor, so it calls this. From any thread, with requests running.
+  void save_kflash();
 
  private:
   // Recurrent-state snapshot at a turn boundary. `query`: the request that saved it ended with a user
