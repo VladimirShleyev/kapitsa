@@ -75,10 +75,13 @@ class NhDrafter {
   // positions pos0.. into d's ring
   virtual const NhCapture& verify_hook() const = 0;
   virtual void enc_commit_rows(Encoder& e, LiliSeq& d, const Buffer& feat, int R, int pos0) = 0;
-  // KFlash: the tree builder over a lattice tlq [S][K][K] of candidates cand [S][K] (nh_kf_build)
-  static void enc_kf_build(Encoder& e, NemotronH& tg, Seq& s, int P, const Buffer& cand, const Buffer& tlq, int K,
-                           const Buffer& kfp);
+  // KFlash: the shared tree builder (kf_build, src/kernels/kflash.h) over a lattice tlq [S][K][K] of candidates
+  // cand [S][K]: the children tokens and the rows' constant successors are this drafter's tables
+  void enc_kf_build(Encoder& e, NemotronH& tg, Seq& s, int P, const Buffer& cand, const Buffer& tlq, int K,
+                    const Buffer& kfp);
   Buffer kfeat_;  // the accepted path's verify features, in path order
+  Buffer kf_tok_, kf_next_;  // the lattice's children tokens [S][K][K] and successors (kf::lattice_next)
+  int kf_K_ = 0;
 };
 
 }  // namespace ni

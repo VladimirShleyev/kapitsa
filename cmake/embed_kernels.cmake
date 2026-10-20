@@ -2,6 +2,8 @@
 file(READ ${SRC_DIR}/common.h COMMON)
 file(READ ${SRC_DIR}/quant.h QUANT)
 string(APPEND COMMON "\n${QUANT}")
+file(READ ${SRC_DIR}/kflash.h KFLASH)
+string(APPEND COMMON "\n// ---- kflash.h ----\n${KFLASH}")
 file(GLOB METALS ${SRC_DIR}/*.metal)
 list(SORT METALS)
 set(ALL "${COMMON}\n")

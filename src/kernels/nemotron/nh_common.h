@@ -102,17 +102,4 @@ struct NhGnormParams {
   float eps;
 };
 
-// KFlash tree of a verify block (int32 words; the drafter's tree builder writes the tree, the target's verify reads
-// it, the acceptance appends its results). Rows are the tree's nodes in insertion order: row 0 is the root (the anchor
-// token), every row's parent comes before it, row r's token is tokens[P + r] and it sits at position P + depth.
-//   [kKfN]          rows n (<= 8; the verify's live rows)
-//   [kKfPar + r]    parent row (-1: the root)
-//   [kKfDep + r]    depth (the root: 0)
-//   [kKfMask + r]   bit j set: row j is r or one of its ancestors
-//   [kKfLq + r]     the drafter's log-probability of the node given its parent (float bits; the root: 0)
-//   [kKfA]          accepted drafts a (the acceptance)
-//   [kKfPath + i]   the accepted path's rows, i = 0 .. a (path[0] = 0)
-//   [kKfNrec]       calibration records: the nodes whose parent is on the accepted path
-//   [kKfRecDep + i], [kKfRecLq + i], [kKfRecHit + i]: their depth, log-probability (float bits), 1 if accepted
-constant constexpr uint kKfN = 0, kKfPar = 1, kKfDep = 9, kKfMask = 17, kKfLq = 25, kKfA = 33, kKfPath = 34,
-                        kKfNrec = 43, kKfRecDep = 44, kKfRecLq = 52, kKfRecHit = 60, kKfWords = 68;
+// (the KFlash tree descriptor's layout, kKf*, comes from src/kernels/kflash.h, shared with every backend)

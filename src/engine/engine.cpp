@@ -428,6 +428,7 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
   const std::string mode = lili_ ? std::string(lili_->name()) + " speculative decoding (7-token blocks)"
                          : nh_ngram_ > 0 ? "prompt-lookup speculative decoding (up to " + std::to_string(nh_ngram_) +
                                                " drafts per cycle)"
+                         : dfl_ && dfl_->tree() ? std::string("KFlash speculative decoding (DFlash2 lattice, tree verify)")
                          : dfl_ ? "DFlash2 speculative decoding (verify " + std::to_string(DFlash2::verify_depth()) + " of 7)"
                          : spec_ ? "MTP speculative decoding depth " + std::to_string(opts_.spec_depth)
                          : dory_spec_ > 0 ? "speculative decoding (" +
@@ -2171,6 +2172,7 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
         next_draft->commit();
       }
       e2->wait();
+      dfl_->observe(e2->gpu_ms());  // KFlash: the budget reads the cycle's outcome and the verify's cost
       const int a = dfl_->accepted();
       a_last = a;
       const int* tk = s.tokens();
@@ -2186,7 +2188,15 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
       ++req_cycles;
       spec_accepted_ += m;
       cycle_done(m);
-      if (trace_path) trace_fn(q35_->logits(), m, tk + P + 1);
+      if (trace_path && dfl_->tree()) {  // the accepted path's verify rows (tree slots), in order
+        const size_t V = size_t(model_->vocab());
+        std::vector<float> rows(size_t(m) * V);
+        for (int j = 0; j < m; ++j)
+          memcpy(rows.data() + size_t(j) * V, q35_->logits() + size_t(s.pend_path.as<int>()[j]) * V, V * 4);
+        trace_fn(rows.data(), m, tk + P + 1);
+      } else if (trace_path) {
+        trace_fn(q35_->logits(), m, tk + P + 1);
+      }
       q35_->commit_rows(s, m);  // rows P .. P+m-1 are fed; tk[P+m] is the new anchor
       P += m;
       d.ctx = P;  // the committed drafting half (if any) puts these rows into the ring
@@ -2228,6 +2238,7 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
     q35_->encode_flush(*e3, s);
     e3->commit_and_wait();
     fed_until = P;
+    if (dfl_->tree() && dfl_->budget() && req_cycles > 0) logi("%s", dfl_->budget()->summary().c_str());
   } else if (dory_spec_ > 0) {
     // Dory speculative decoding (per-loop KV). Prompt lookup: when the last tokens occurred earlier in the
     // conversation, the tokens that followed them are the drafts, and one pass of the full loop count verifies them
