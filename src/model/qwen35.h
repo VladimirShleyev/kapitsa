@@ -324,6 +324,11 @@ class Qwen35 : public Model {
   // Drafter's dynamic verify depth (DFlash2, MoE only): while set, the 8-row verify routes experts only
   // for rows < min(R, rows[0]) (uint read by the GPU); later rows' outputs are garbage and must not be used.
   void set_verify_row_limit(const Buffer* rows) { v8_rlim_ = rows; }
+  // Tree verify (DFlash2 NI_DFLASH_TREE): while set, the 8 rows are a tree (uint tree[] = {L1, f, L1 - f, nb}:
+  // rows L1+1 .. 7 fork off row f): RoPE by depth, branch rows don't see rows f+1 .. L1, their GDN conv window
+  // and recurrence restart from row f's. Needs encode_verify8's split GDN step, gdn_prep_verify8 and attn8m.
+  void set_verify_tree(const Buffer* tree) { v8_tree_ = tree; }
+  bool verify_tree_ok(const Seq& s) const;
   // Row-independent MoE numerics in the 8-row verify (every routed expert as an MMA tile, no scalar
   // passes for 1-2-row experts): a row's logits then depend only on the rows before it, not on how the
   // other rows route. A speculative sampler that needs p(. | prefix) exactly sets it (~3% slower verify).
@@ -548,6 +553,8 @@ class Qwen35 : public Model {
   bool full_draft_ = false;  // draft over the whole vocabulary (see load_mtp; NI_FULL_DRAFT=0/1 overrides)
   const CaptureHook* cap_ = nullptr;
   const Buffer* v8_rlim_ = nullptr;
+  const Buffer* v8_tree_ = nullptr;
+  const Buffer* v8_tree_cur_ = nullptr;  // v8_tree_ during an encode_verify8 of 8 rows
   bool v8_moe_exact_ = false;
   std::deque<Tensor> owned_;
   std::vector<Buffer> owned_bufs_;

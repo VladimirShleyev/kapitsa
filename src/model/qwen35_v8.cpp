@@ -419,10 +419,12 @@ void Qwen35::enc_attn8(Encoder& e, const Seq& s, const Layer& L, const Buffer& k
   }
   kp::AttnPrep ap{uint32_t(R), uint32_t(cfg_.hq), uint32_t(cfg_.hkv), uint32_t(cfg_.head_dim),
                   uint32_t(cfg_.rot_dims), uint32_t(pos), uint32_t(cap), cfg_.eps, cfg_.theta};
-  e.use(pipe8(mrope(s) ? "attn_prep_m" : "attn_prep"));
+  const Buffer* tree = v8_tree_cur_;  // tree verify (encode_verify8 with set_verify_tree; never mrope)
+  e.use(pipe8(tree ? "attn_prep_t" : mrope(s) ? "attn_prep_m" : "attn_prep"));
   e.buf(0, qg_); e.buf(1, kr_); e.buf(2, vr_); e.buf(3, L.q_norm->buf); e.buf(4, L.k_norm->buf);
   e.buf(5, qo_); e.buf(6, kc); e.buf(7, vc);
   e.val(8, ap);
+  if (tree) e.buf(9, *tree);
   if (mrope(s)) enc_mrope_args(e, s);
   e.dispatch(cfg_.hq + 2 * cfg_.hkv, R, 1, cfg_.head_dim);
   // NI_V8_ATTN: 1 = attn8m_partial (MMA, all rows and heads of a kv head per threadgroup),
@@ -443,10 +445,11 @@ void Qwen35::enc_attn8(Encoder& e, const Seq& s, const Layer& L, const Buffer& k
                   1.0f / std::sqrt(float(cfg_.head_dim)), nch};
   const uint32_t Ru = uint32_t(R);
   if (mma) {
-    e.use(pipe8("attn8m_partial"));
+    e.use(pipe8(tree ? "attn8m_partial_t" : "attn8m_partial"));
     e.buf(0, qo_); e.buf(1, kc); e.buf(2, vc); e.buf(3, part_o_); e.buf(4, part_ml_);
     e.val(5, rp);
     e.val(6, Ru);
+    if (tree) e.buf(7, *tree);
     e.dispatch(nch, cfg_.hkv, 1, 64 * G);
   } else {
     static const int rb_env = env_int("NI_V8_ATTN_RB", 0);
@@ -792,10 +795,22 @@ void Qwen35::moe8_replay(Encoder& e, int li, int mask) {
   }
 }
 
+bool Qwen35::verify_tree_ok(const Seq& s) const {
+  static const bool gdn8 = env_int("NI_V8_GDN", 1) != 0;
+  static const int attn_mma = env_int("NI_V8_ATTN", 1);
+  const int split_thr = v8_knobs().gdnsplit;
+  const bool split = gdn8 && cfg_.lin_dv == 128 && cfg_.lin_dk == 128 && split_thr >= 32 && split_thr <= 1024 &&
+                     split_thr % 32 == 0 && 128 % (split_thr / 8) == 0;
+  return !mrope(s) && !cfg_.moe && split && (v8_knobs().fuse & 4) && !(v8_knobs().skip & (1 | 4)) && attn_mma &&
+         cfg_.hq / cfg_.hkv <= 16 && cfg_.head_dim == 256;
+}
+
 void Qwen35::encode_verify8(Encoder& e, Seq& s, int pos, int R, const SamplingParams& sp, uint32_t step) {
   if (R < 1 || R > 8) fatal("encode_verify8: R=%d", R);
   if (pos + R + 1 >= s.cap) fatal("context full (%d)", s.cap);
   v8_alloc();
+  if (v8_tree_ && R == 8 && !verify_tree_ok(s)) fatal("encode_verify8: tree verify unsupported here");
+  v8_tree_cur_ = v8_tree_ && R == 8 ? v8_tree_ : nullptr;
   const int D = cfg_.hidden;
   const uint32_t C = 2 * cfg_.lin_hk * cfg_.lin_dk + cfg_.lin_hv * cfg_.lin_dv;
   const int VD = cfg_.lin_hv * cfg_.lin_dv;
@@ -811,12 +826,14 @@ void Qwen35::encode_verify8(Encoder& e, Seq& s, int pos, int R, const SamplingPa
         enc_qmm8(e, {{&L.qkv, qkv_}, {&L.z, zb_}, {&L.b, bb_}, {&L.a, ab_}}, R, v8t_, v8s_, false, ti ? &v8tt_ : nullptr);
       if (!(skip & 4)) {
         // fuse & 4: gdn_prep_verify8 (the rows' q / k norms reduced together; bitwise gdn_prep_verify)
-        e.use(pipe8(R <= 8 && cfg_.lin_dk == 128 && (v8_knobs().fuse & 4) ? "gdn_prep_verify8" : "gdn_prep_verify"));
+        e.use(pipe8(v8_tree_cur_ ? "gdn_prep_verify8_t"
+                    : R <= 8 && cfg_.lin_dk == 128 && (v8_knobs().fuse & 4) ? "gdn_prep_verify8" : "gdn_prep_verify"));
         e.buf(0, qkv_); e.buf(1, ab_); e.buf(2, bb_); e.buf(3, s.conv[i]);
         e.buf(4, L.conv_w->buf); e.buf(5, L.A_log->buf); e.buf(6, L.dt_bias->buf);
         e.buf(7, gq_); e.buf(8, gk_); e.buf(9, gv_); e.buf(10, gg_); e.buf(11, gbeta_);
         e.buf(12, s.pend_qkv[i]);
         e.val(13, gv);
+        if (v8_tree_cur_) e.buf(14, *v8_tree_cur_);
         e.dispatch(C / 128, 1, 1, 128);
       }
       static const bool gdn8 = env_int("NI_V8_GDN", 1) != 0;  // gdn_step_verify8: one norm pass
@@ -828,12 +845,13 @@ void Qwen35::encode_verify8(Encoder& e, Seq& s, int pos, int R, const SamplingPa
       const bool tgn = v8_tw() && size_t(VD) * 16 <= v8tt_.size;
       if (!(skip & 1) && split) {
         // value-row blocks of split_thr / 32 simdgroups x 4 rows, then the gated norm into the table
-        e.use(pipe8("gdn_step_verify8s"));
+        e.use(pipe8(v8_tree_cur_ ? "gdn_step_verify8s_t" : "gdn_step_verify8s"));
         e.buf(0, gq_); e.buf(1, gk_); e.buf(2, gv_); e.buf(3, gg_); e.buf(4, gbeta_);
         e.buf(5, s.rec[i]); e.buf(6, gout_);
         e.buf(9, s.pend_k[i]); e.buf(10, s.pend_g[i]); e.buf(11, s.pend_d[i]);
         e.val(12, gv);
         e.buf(13, v8cnt_);
+        if (v8_tree_cur_) e.buf(14, *v8_tree_cur_);
         e.dispatch(cfg_.lin_hv, 128 / (split_thr / 8), 1, uint32_t(split_thr));
         // gdn_gnorm_x8t: also the T table of qmm8t
         e.use(pipe8(tgn ? "gdn_gnorm_x8t" : "gdn_gnorm_x8"));
@@ -861,6 +879,7 @@ void Qwen35::encode_verify8(Encoder& e, Seq& s, int pos, int R, const SamplingPa
     else enc_mlp8(e, L, R);
     if (cap_) enc_capture(e, i, pos, R);  // block-drafter capture (DFlash2), off unless armed (reads x_ only)
   }
+  v8_tree_cur_ = nullptr;
   s.n_pend = 0;  // folded by this verify; commit_rows() sets the new count
   const bool tl = table_ready ? v8_tw() : enc_x8(e, x_, R, D, final_norm_, false, 0, nullptr, true);
   if (v8_knobs().skip & 128) return;

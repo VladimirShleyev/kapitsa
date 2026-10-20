@@ -243,7 +243,7 @@ class DFlash2 {
   void enc_commit_kv(Encoder& e, DFlashSeq& d, const Buffer& kv, int rows, int pos0);
   // encode_commit's projections of m rows of `src` (bf16 [8][n_slots * H]; the verify captures capt_ by default)
   void enc_commit_from(Encoder& e, DFlashSeq& d, int m, const Buffer& src);
-  void encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const SamplingParams& sp, bool gpu);
+  void encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const SamplingParams& sp, bool gpu, bool tree_ok = false);
   void dbg(Encoder& e, const std::string& name, const Buffer& src, size_t bytes);
 
   Qwen35& tg_;
@@ -272,6 +272,14 @@ class DFlash2 {
   bool exact_moe_ = true;  // T > 0 on MoE targets: row-independent expert numerics (NI_DFLASH_EXACT_MOE=0 off)
   // T > 0: the walk samples its chain at T_q = walk_tf_ * T (NI_DFLASH_QT; 0 = argmax chain with one-hot q)
   float walk_tf_ = 1.0f;
+  // Tree verify (NI_DFLASH_TREE=1; dense targets on the 8-row MMA verify path, full depth, no dynamic depth): the
+  // 8 rows hold the argmax chain plus one branch (dfl_tree), accepted by dfl_tree_accept, the accepted branch rows
+  // compacted onto the chain's slots (KV, GDN tapes, captures) by dfl_tree_move. tree_ = {L1, f, L1-f, nb, b, a}
+  bool tree_on_ = false;
+  bool tree_drafted_ = false;  // the last draft built a tree (only the single-sequence cycle paths do)
+  Buffer tree_;
+  bool tree_for(const Seq& s, int K) const;
+  void encode_tree_move(Encoder& e, Seq& s, int P);
   // MLP and LM head on the target's 8-row verify GEMMs (Qwen35::enc_gu8 / enc_qmm8 with the verify's V8Knobs;
   // NI_DFLASH_V8, default on for hidden >= 4096, where they measured 6-16% faster than dfl_qmm8): inputs permuted
   // into their table

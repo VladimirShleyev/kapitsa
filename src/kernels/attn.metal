@@ -15,15 +15,11 @@ struct AttnPrepParams {
 };
 
 // grid: x = Hq + 2*Hkv (q heads, k heads, v heads), y = T; threadgroup = D threads
-[[kernel]] void attn_prep(const device float* qg [[buffer(0)]], const device float* kr [[buffer(1)]],
-                          const device float* vr [[buffer(2)]], const device bfloat* qn_w [[buffer(3)]],
-                          const device bfloat* kn_w [[buffer(4)]], device float* q_out [[buffer(5)]],
-                          device half* kc [[buffer(6)]], device half* vc [[buffer(7)]],
-                          constant AttnPrepParams& p [[buffer(8)]], uint2 tg [[threadgroup_position_in_grid]],
-                          uint2 tid2 [[thread_position_in_threadgroup]]) {
-  const uint tid = tid2.x;
-  threadgroup float scratch[32];
-  threadgroup float row[512];
+// rope_pos: the RoPE position of row t (its cache slot is p.pos + t); the tree verify rotates by depth
+static inline void attn_prep_body(const device float* qg, const device float* kr, const device float* vr,
+                                  const device bfloat* qn_w, const device bfloat* kn_w, device float* q_out,
+                                  device half* kc, device half* vc, constant AttnPrepParams& p, uint2 tg, uint tid,
+                                  uint rope_pos, threadgroup float* scratch, threadgroup float* row) {
   const uint h = tg.x, t = tg.y, D = p.D;
   const uint pos = p.pos + t;
   if (h >= p.Hq + p.Hkv) {  // value head: plain copy into the cache
@@ -41,13 +37,38 @@ struct AttnPrepParams {
   if (tid < p.rot) {
     uint i = tid % half_rot;
     float inv_freq = metal::precise::pow(p.theta, -2.0f * float(i) / float(p.rot));
-    float ang = float(pos) * inv_freq;
+    float ang = float(rope_pos) * inv_freq;
     float cs = metal::precise::cos(ang), sn = metal::precise::sin(ang);
     if (tid < half_rot) x = row[tid] * cs - row[tid + half_rot] * sn;
     else x = row[tid] * cs + row[tid - half_rot] * sn;
   }
   if (is_q) q_out[(t * p.Hq + h) * D + tid] = x;
   else kc[((h - p.Hq) * p.max_seq + pos) * D + tid] = half(x);
+}
+
+[[kernel]] void attn_prep(const device float* qg [[buffer(0)]], const device float* kr [[buffer(1)]],
+                          const device float* vr [[buffer(2)]], const device bfloat* qn_w [[buffer(3)]],
+                          const device bfloat* kn_w [[buffer(4)]], device float* q_out [[buffer(5)]],
+                          device half* kc [[buffer(6)]], device half* vc [[buffer(7)]],
+                          constant AttnPrepParams& p [[buffer(8)]], uint2 tg [[threadgroup_position_in_grid]],
+                          uint2 tid2 [[thread_position_in_threadgroup]]) {
+  threadgroup float scratch[32];
+  threadgroup float row[512];
+  attn_prep_body(qg, kr, vr, qn_w, kn_w, q_out, kc, vc, p, tg, tid2.x, p.pos + tg.y, scratch, row);
+}
+
+// Tree verify rows (tree = {L1, f, L1 - f, nb}): row t > L1 is at depth t - (L1 - f)
+[[kernel]] void attn_prep_t(const device float* qg [[buffer(0)]], const device float* kr [[buffer(1)]],
+                            const device float* vr [[buffer(2)]], const device bfloat* qn_w [[buffer(3)]],
+                            const device bfloat* kn_w [[buffer(4)]], device float* q_out [[buffer(5)]],
+                            device half* kc [[buffer(6)]], device half* vc [[buffer(7)]],
+                            constant AttnPrepParams& p [[buffer(8)]], const device uint* tree [[buffer(9)]],
+                            uint2 tg [[threadgroup_position_in_grid]],
+                            uint2 tid2 [[thread_position_in_threadgroup]]) {
+  threadgroup float scratch[32];
+  threadgroup float row[512];
+  const uint t = tg.y, depth = t > tree[0] ? t - tree[2] : t;
+  attn_prep_body(qg, kr, vr, qn_w, kn_w, q_out, kc, vc, p, tg, tid2.x, p.pos + depth, scratch, row);
 }
 
 // ---- KV cache growth (Qwen35::reserve): positions [0, old_cap) of every kv head of a [H, old_cap, D]

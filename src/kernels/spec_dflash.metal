@@ -1543,6 +1543,170 @@ struct DflSelectParams {
   }
 }
 
+// ---- tree verify (NI_DFLASH_TREE): one fork off the walk's argmax chain in the 8 verify rows ----
+// Rows: 0 = anchor, 1..L1 = the chain d_0 .. d_{L1-1}, L1+1 .. 7 = a branch of nb = 7 - L1 nodes forking off
+// chain row f (f < L1): its first node is the second-best candidate of proposal f (given the chain's parent),
+// the rest the greedy continuation through the lattice. Row r sits at depth r (chain) or r - (L1 - f) (branch).
+// tree = {L1, f, L1 - f, nb, b, a, 0, 0}: b / a written by dfl_tree_accept (accepted branch nodes / proposals).
+// (L1, f) maximizes the drafter's expected accepted length sum over nodes of prod softmax(S)[k] along the path
+// (replayed over 96 greedy Qwen3.8-27B cycles: 5.24 -> 5.55 tok/round). The tree depends on the drafter only, so the
+// acceptance below (sample each row from the target and descend into the child holding that sample) is
+// ancestral sampling of the target at any temperature. Needs the argmax walk (qtemp 0). One thread.
+[[kernel]] void dfl_tree(const device int* cand_i [[buffer(0)]], const device float* cand_v [[buffer(1)]],
+                         const device float* E [[buffer(2)]], device int* tokens [[buffer(3)]],
+                         const device float* walk_s [[buffer(4)]], const device int* walk_k [[buffer(5)]],
+                         device uint* tree [[buffer(6)]], constant uint& Pp [[buffer(7)]],
+                         const device uint* gst [[buffer(8)]], uint tid [[thread_position_in_grid]]) {
+  if (tid != 0) return;
+  const uint P = dfl_pos(Pp, gst);
+  float mp[7];
+  for (uint p = 0; p < 7; ++p) {
+    float mx = -INFINITY;
+    for (uint k = 0; k < 16; ++k) mx = max(mx, walk_s[p * 16 + k]);
+    float tot = 0.0f;
+    for (uint k = 0; k < 16; ++k) tot += metal::precise::exp(walk_s[p * 16 + k] - mx);
+    mp[p] = metal::precise::exp(walk_s[p * 16 + uint(walk_k[p])] - mx) / tot;
+  }
+  float ce[8];  // ce[L] = expected accepted chain proposals among the first L
+  ce[0] = 0.0f;
+  float pr = 1.0f;
+  for (uint p = 0; p < 7; ++p) {
+    pr *= mp[p];
+    ce[p + 1] = ce[p] + pr;
+  }
+  float be[7][7];  // be[f][n]: expected accepted nodes among a branch of n nodes forking at f
+  int bk[7][6];
+  for (uint f = 0; f < 7; ++f) {
+    float pf = 1.0f;
+    for (uint p = 0; p < f; ++p) pf *= mp[p];
+    be[f][0] = 0.0f;
+    uint jp = 0;
+    for (uint j = 0; j + f < 7 && j < 6; ++j) {
+      const uint p = f + j;
+      float S[16], mx = -INFINITY;
+      for (uint k = 0; k < 16; ++k) {
+        S[k] = j == 0 ? walk_s[p * 16 + k] : cand_v[p * 16 + k] + E[p * 256 + jp * 16 + k];
+        mx = max(mx, S[k]);
+      }
+      uint kb = 0;
+      float bv = -INFINITY;
+      for (uint k = 0; k < 16; ++k) {
+        if (j == 0 && k == uint(walk_k[p])) continue;  // the fork: best candidate other than the chain's
+        if (S[k] > bv) { bv = S[k]; kb = k; }
+      }
+      float tot = 0.0f;
+      for (uint k = 0; k < 16; ++k) tot += metal::precise::exp(S[k] - mx);
+      pf *= metal::precise::exp(S[kb] - mx) / tot;
+      be[f][j + 1] = be[f][j] + pf;
+      bk[f][j] = int(kb);
+      jp = kb;
+    }
+  }
+  uint L1b = 7, fb = 0;
+  float ex = -1.0f;
+  for (uint L1 = 1; L1 <= 7; ++L1) {  // ties keep the first (smallest L1, then f)
+    const uint nb = 7 - L1;
+    for (uint f = 0; f < L1; ++f) {
+      if (nb == 0 && f > 0) continue;
+      const float e = ce[L1] + (nb ? be[f][nb] : 0.0f);
+      if (e > ex) { ex = e; L1b = L1; fb = f; }
+    }
+  }
+  const uint nb = 7 - L1b;
+  for (uint j = 0; j < nb; ++j) tokens[P + 1 + L1b + j] = cand_i[(fb + j) * 16 + uint(bk[fb][j])];
+  tree[0] = L1b;
+  tree[1] = fb;
+  tree[2] = L1b - fb;
+  tree[3] = nb;
+  tree[4] = 0;
+  tree[5] = 0;
+}
+
+constant uint kDflSaltTree = 0x1B873593u;
+
+// Tree acceptance: from the anchor row, y = the target's sample at the current row (T = 0: its argmax, the
+// verify's samp; T > 0: drawn from dfl_dist_rows' row with the uniform of its depth's position P+1+d,
+// kDflSaltTree); descend into the child row holding token y, else stop and emit y. The accepted path's tokens
+// are moved to tokens[P+1 ..] (a branch: rows L1+1 .. -> positions after f, ascending), y to tokens[P+1+a].
+struct DflTreeAcceptParams {
+  uint P;
+  float temp;
+  uint seed;
+};
+[[kernel]] void dfl_tree_accept(device int* tokens [[buffer(0)]], const device int* samp [[buffer(1)]],
+                                const device int* dist_id [[buffer(2)]], const device float* dist_p [[buffer(3)]],
+                                device uint* tree [[buffer(4)]], device int* res [[buffer(5)]],
+                                constant DflTreeAcceptParams& p [[buffer(6)]], device uint* gst [[buffer(7)]],
+                                uint tid [[thread_position_in_grid]]) {
+  if (tid != 0) return;
+  const uint L1 = tree[0], f = tree[1], nb = tree[3], P = p.P;
+  uint cur = 0, d = 0, b = 0;
+  int y = 0;
+  for (;;) {
+    if (p.temp <= 0.0f) {
+      y = samp[cur];
+    } else {
+      float tot = 0.0f;
+      for (uint q = 0; q < 32; ++q) tot += dist_id[cur * 32 + q] >= 0 ? dist_p[cur * 32 + q] : 0.0f;
+      const float u = dfl_uniform(p.seed, P + 1 + d, kDflSaltTree) * tot;
+      float cum = 0.0f;
+      y = dist_id[cur * 32];
+      for (uint q = 0; q < 32; ++q) {
+        if (dist_id[cur * 32 + q] < 0) continue;
+        y = dist_id[cur * 32 + q];  // fallback: the last kept id (u above the rounded total)
+        cum += dist_p[cur * 32 + q];
+        if (cum > u) break;
+      }
+    }
+    uint next = 0;
+    if (cur < L1 && tokens[P + cur + 1] == y) next = cur + 1;                          // chain child
+    else if (cur == f && nb > 0 && tokens[P + L1 + 1] == y) next = L1 + 1;             // the fork
+    else if (cur > L1 && cur < 7 && tokens[P + cur + 1] == y) next = cur + 1;          // branch child
+    if (!next) break;
+    if (next > L1) ++b;
+    cur = next;
+    ++d;
+  }
+  for (uint j = 0; j < b; ++j) tokens[P + f + 1 + j] = tokens[P + L1 + 1 + j];
+  tokens[P + 1 + d] = y;
+  tree[4] = b;
+  tree[5] = d;
+  res[0] = int(d);
+  res[1] = y;
+  gst[0] = P + d + 1;
+  gst[1] = d + 1;
+  gst[2] = P;
+}
+
+// Compaction after dfl_tree_accept: rows L1+1 .. L1+b of a row-major buffer move to rows f+1 .. f+b (tree[4] = b;
+// nothing when 0). Ascending per column: the ranges overlap when b > L1 - f but each destination lies below the
+// next source. Words of 4 bytes; row r of group y at base + y * group + r * row. grid (ceil(row / 256), groups).
+struct DflRowsMove {
+  uint base;    // words to row 0 of group 0
+  uint row;     // words per row
+  uint group;   // words between groups (kv heads)
+  uint groups;
+};
+// up to 16 buffers per dispatch (binding z = buffer index; the moves table at 17); grid (words / 256, groups, n)
+[[kernel]] void dfl_tree_move(device uint* b0 [[buffer(0)]], device uint* b1 [[buffer(1)]],
+                              device uint* b2 [[buffer(2)]], device uint* b3 [[buffer(3)]],
+                              device uint* b4 [[buffer(4)]], device uint* b5 [[buffer(5)]],
+                              device uint* b6 [[buffer(6)]], device uint* b7 [[buffer(7)]],
+                              device uint* b8 [[buffer(8)]], device uint* b9 [[buffer(9)]],
+                              device uint* b10 [[buffer(10)]], device uint* b11 [[buffer(11)]],
+                              device uint* b12 [[buffer(12)]], device uint* b13 [[buffer(13)]],
+                              device uint* b14 [[buffer(14)]], device uint* b15 [[buffer(15)]],
+                              const device uint* tree [[buffer(16)]], constant DflRowsMove* mv [[buffer(17)]],
+                              uint3 gid [[thread_position_in_grid]]) {
+  const uint b = tree[4];
+  const DflRowsMove m = mv[gid.z];
+  if (b == 0 || gid.x >= m.row || gid.y >= m.groups) return;
+  device uint* const bs[16] = {b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15};
+  const uint L1 = tree[0], f = tree[1];
+  device uint* g = bs[gid.z] + m.base + gid.y * m.group + gid.x;
+  for (uint j = 0; j < b; ++j) g[(f + 1 + j) * m.row] = g[(L1 + 1 + j) * m.row];
+}
+
 // ---- acceptance (SPEC §8): verify rows -> accepted length a and the bonus / correction token ----
 // Uniform streams (counter-based, keyed by seed, absolute position and purpose; SPEC §8.2): the walk
 // draws proposal p with position P+1+p (kDflSaltWalk), acceptance of proposal i uses P+1+i
