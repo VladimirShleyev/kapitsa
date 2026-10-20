@@ -190,7 +190,7 @@ class DFlash2 {
   // KFlash on the dense targets (NI_DFLASH_TREE=0/1 overrides): the single-stream cycles (encode_cycle*) verify a
   // best-first tree over the lattice (the shared builder kf_build on this drafter's children tables, dfl_kf_table)
   // instead of the walk's chain, under the shared budget (KfBudget: the lattice's probabilities calibrated against
-  // the verify's own acceptances, the verify's cost per row count measured on this Mac), and accept it with the shared
+  // the verify's own acceptances, a cycle's GPU time per row count measured on this Mac), and accept it with the shared
   // kf_accept: greedy and sampled alike the emitted tokens are plain decoding's (at T > 0 its sampler's draws with
   // each position's uniform). The verify's rows are whole 8-row tiles (one today). encode_draft (the batched path)
   // keeps the walk.
@@ -198,7 +198,8 @@ class DFlash2 {
   void set_tree(bool on);
   const int* tree_desc() const { return tree_buf_.as<int>(); }  // the tree descriptor (kflash.h) of the last cycle
   KfBudget* budget() const { return kf_budget_.get(); }
-  // after each tree cycle completed: the cycle's GPU ms for the budget (the loop calls it after its wait)
+  // after each tree cycle completed: the cycle's GPU ms for the budget, its drafting half's command buffer and its
+  // verify's (the loop calls it after its wait)
   void observe(double ms);
   // proposals verified per cycle: NI_DFLASH_VERIFY (1..7), default 7
   static int verify_depth();

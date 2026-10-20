@@ -11,8 +11,15 @@
 #include <cstring>
 #include <fstream>
 #include <sys/stat.h>
+#include <unistd.h>
 
 namespace ni {
+
+namespace {
+// What the cache's cost table holds, saved with it: a table measured as anything else (the verify alone, or the
+// host's clock, as the server and the Nemotron loop measured before) is measured again; the calibration is kept.
+constexpr const char* kCostOf = "cycle GPU ms";
+}  // namespace
 
 KfBudget::KfBudget(std::string key) : key_(std::move(key)) {
   for (int d = 0; d < kD; ++d) {
@@ -63,6 +70,7 @@ void KfBudget::fit(const std::vector<float>& x, const std::vector<uint8_t>& y, f
 }
 
 void KfBudget::observe(const int32_t* t, double ms) {
+  std::lock_guard<std::mutex> lk(mu_);
   const int n = std::clamp(int(t[kf::kN]), 1, kf::kMaxRows);
   ++cycles_;
   rows_sum_ += n;
@@ -95,6 +103,7 @@ void KfBudget::observe(const int32_t* t, double ms) {
 }
 
 void KfBudget::write(KfParams& p) const {
+  std::lock_guard<std::mutex> lk(mu_);
   for (int d = 0; d < kD; ++d) {
     p.alpha[d] = alpha_[d];
     p.beta[d] = beta_[d];
@@ -115,6 +124,7 @@ void KfBudget::write(KfParams& p) const {
 }
 
 std::string KfBudget::summary() const {
+  std::lock_guard<std::mutex> lk(mu_);
   char b[1024];
   int o = snprintf(b, sizeof b, "KFlash: %d cycles, %.2f rows per cycle; cost ms by rows", cycles_,
                    cycles_ ? rows_sum_ / cycles_ : 0.0);
@@ -135,8 +145,9 @@ void KfBudget::load() {
     const auto& c = j.at("cost");
     const auto& a = j.at("alpha");
     const auto& bb = j.at("beta");
-    for (int n = 1; n < kD && n < int(c.size()); ++n)
-      if (c[size_t(n)].get<double>() > 0) cost_[n] = c[size_t(n)].get<double>(), ncost_[n] = 2;
+    if (j.value("cost_of", "") == kCostOf)
+      for (int n = 1; n < kD && n < int(c.size()); ++n)
+        if (c[size_t(n)].get<double>() > 0) cost_[n] = c[size_t(n)].get<double>(), ncost_[n] = 2;
     for (int d = 1; d < kD && d < int(a.size()) && d < int(bb.size()); ++d) {
       alpha_[d] = a[size_t(d)].get<float>();
       beta_[d] = bb[size_t(d)].get<float>();
@@ -146,16 +157,36 @@ void KfBudget::load() {
   }
 }
 
-void KfBudget::save() const {
-  if (key_.empty() || cycles_ < 32) return;
+void KfBudget::save(int fresh) {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (key_.empty() || cycles_ < 32 || cycles_ - saved_ < std::max(fresh, 1)) return;
   const std::string dir = hub::home_dir() + "/kflash";
   mkdir(dir.c_str(), 0755);
   nlohmann::json j;
+  j["cost_of"] = kCostOf;
   j["cost"] = std::vector<double>(cost_, cost_ + kD);
   j["alpha"] = std::vector<float>(alpha_, alpha_ + kD);
   j["beta"] = std::vector<float>(beta_, beta_ + kD);
-  std::ofstream f(dir + "/" + key_ + ".json");
-  f << j.dump() << "\n";
+  // written whole beside it, then renamed over it: a process ended mid-write (kill -9 after a stop signal), or another
+  // tool saving the same key at once, leaves one whole file
+  const std::string path = dir + "/" + key_ + ".json", tmp = path + "." + std::to_string(getpid()) + ".tmp";
+  {
+    std::ofstream f(tmp);
+    f << j.dump() << "\n";
+    f.close();
+    if (!f) {
+      unlink(tmp.c_str());
+      logi("KFlash: could not write the budget's cache %s", tmp.c_str());
+      return;
+    }
+  }
+  if (rename(tmp.c_str(), path.c_str()) != 0) {
+    unlink(tmp.c_str());
+    logi("KFlash: could not write the budget's cache %s", path.c_str());
+    return;
+  }
+  saved_ = cycles_;
+  logi("KFlash: budget saved (%d cycles) to %s", cycles_, path.c_str());
 }
 
 }  // namespace ni

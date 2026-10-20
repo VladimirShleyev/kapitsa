@@ -28,12 +28,20 @@
 #include "model/kparams.h"
 #include "util/log.h"
 
+#include <dirent.h>
+#include <nlohmann/json.hpp>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <random>
+#include <thread>
 #include <vector>
 
 using namespace ni;
@@ -644,6 +652,109 @@ int fit_check(uint64_t salt) {
   return bad ? 1 : 0;
 }
 
+// The shared budget's cache file (KfBudget::save, load; KAPITSA_HOME/kflash): nothing before 32 cycles, nor without
+// new ones since the last save, nor before kSaveEvery new ones when asked for that many; written whole (no temporary
+// file left); its table (cost_of: the cycle's GPU ms) comes back as measured, a table without cost_of is measured
+// again with the calibration kept; saves from another thread while cycles are observed leave a whole file.
+int cache_check() {
+  const char* t = getenv("TMPDIR");
+  std::string dir = std::string(t && *t ? t : "/tmp") + "/kf_cache_XXXXXX";
+  if (!mkdtemp(dir.data())) {
+    printf("[cache] no temporary folder: FAIL\n");
+    return 1;
+  }
+  const char* h = getenv("KAPITSA_HOME");
+  const std::string old_home = h ? h : "";
+  setenv("KAPITSA_HOME", dir.c_str(), 1);
+  const std::string kdir = dir + "/kflash", file = kdir + "/t.json";
+  auto exists = [](const std::string& p) {
+    struct stat st;
+    return stat(p.c_str(), &st) == 0;
+  };
+  auto files = [&] {
+    std::vector<std::string> v;
+    if (DIR* d = opendir(kdir.c_str())) {
+      while (dirent* e = readdir(d))
+        if (e->d_name[0] != '.') v.push_back(e->d_name);
+      closedir(d);
+    }
+    std::sort(v.begin(), v.end());
+    return v;
+  };
+  int bad = 0;
+  auto check = [&](bool ok, const char* what) {
+    printf("[cache] %s: %s\n", what, ok ? "PASS" : "FAIL");
+    bad += !ok;
+  };
+  std::vector<int32_t> tree(kf::kWords, 0);
+  tree[kf::kN] = 8;
+  {
+    KfBudget b("t");
+    b.set_rows(1u << 7, 8);
+    for (int i = 0; i < 31; ++i) b.observe(tree.data(), 30.0);
+    b.save();
+    check(!exists(file), "31 cycles, save(): no file (32 needed)");
+    b.observe(tree.data(), 30.0);
+    b.save(KfBudget::kSaveEvery);
+    check(!exists(file), "32 cycles, save(kSaveEvery): no file (kSaveEvery new cycles needed)");
+    b.save();
+    check(exists(file), "32 cycles, save(): written");
+    unlink(file.c_str());
+    b.save();
+    check(!exists(file), "no cycle since the last save, save(): not written again");
+    b.observe(tree.data(), 30.0);
+  }  // the destructor saves the 33rd
+  check(files() == std::vector<std::string>{"t.json"}, "the destructor wrote it, whole (no temporary file left)");
+  {
+    KfBudget b("t");
+    b.set_rows(1u << 7, 8);
+    KfParams p{};
+    b.write(p);
+    check(p.force_n == 0 && std::fabs(p.cost[8] - 30.0f) < 1e-4f, "loaded: the cost table counts as measured");
+  }
+  {
+    nlohmann::json j = nlohmann::json::parse(std::ifstream(file));
+    j.erase("cost_of");
+    j["alpha"][1] = 0.5;
+    std::ofstream(file) << j.dump();
+    KfBudget b("t");
+    b.set_rows(1u << 7, 8);
+    KfParams p{};
+    b.write(p);
+    check(p.force_n == 8 && p.cost[8] == 1.0f && p.alpha[1] == 0.5f,
+          "a table without cost_of: measured again (8 rows forced), the calibration kept");
+  }
+  {
+    const int lvl = log_level();
+    log_level() = 0;  // (one "budget saved" line per save)
+    KfBudget b("t2");
+    b.set_rows(1u << 7, 8);
+    std::atomic<bool> done{false};
+    std::thread saver([&] {
+      while (!done) b.save();
+    });
+    for (int i = 0; i < 20000; ++i) b.observe(tree.data(), 30.0 + i % 7);
+    done = true;
+    saver.join();
+    b.save();
+    log_level() = lvl;
+    bool whole = false;
+    try {
+      const nlohmann::json j = nlohmann::json::parse(std::ifstream(kdir + "/t2.json"));
+      whole = j.value("cost_of", "") == "cycle GPU ms" && j.at("cost").at(8).get<double>() > 30.0;
+    } catch (...) {
+    }
+    check(whole && files() == std::vector<std::string>({"t.json", "t2.json"}),
+          "saves from another thread while cycles are observed: one whole file");
+  }
+  for (const auto& f : files()) unlink((kdir + "/" + f).c_str());
+  rmdir(kdir.c_str());
+  rmdir(dir.c_str());
+  if (h) setenv("KAPITSA_HOME", old_home.c_str(), 1);
+  else unsetenv("KAPITSA_HOME");
+  return bad ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -851,6 +962,7 @@ int main(int argc, char** argv) {
   if (only < 0 || (only >= int(cases.size()) && only < 1000))
     fails += tree_cases(trials, salt, only < 0 ? -1 : only - int(cases.size()));
   if (only < 0) fails += fit_check(salt);
+  if (only < 0) fails += cache_check();
   // ---- 4. the KFlash decoder's sampled walk on the GPU + dfl_accept32 (cases 1000 + i) ----
   {
     struct Case3 {

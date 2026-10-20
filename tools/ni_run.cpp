@@ -504,7 +504,7 @@ int main(int argc, char** argv) {
         gap_sum += e->gpu_start_host_ms() - e1->gpu_end_host_ms();  // GPU idle between the drafting pass and the verify
       }
       if (cycles > 0) ab_ms[cycles & 1].push_back(gms);  // the first cycle includes the first drafting half
-      dfl->observe(gms);  // KFlash: the budget reads the cycle's outcome and cost
+      dfl->observe(gms);  // KFlash: the budget reads the cycle's outcome and GPU time (drafting half + verify)
       const int a_cycle = dfl->accepted();
       if (lat) {
         const int V = m.config().vocab;
