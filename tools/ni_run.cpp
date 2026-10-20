@@ -436,6 +436,12 @@ int main(int argc, char** argv) {
     auto knobs_for = [&](int cycle) { v8_knobs() = (ab && (cycle & 1)) ? knob_b : knob_a; };
     knobs_for(0);
     std::unique_ptr<Encoder> next_draft;  // mode 3: the committed drafting half of the coming cycle
+    // mode 3, long copy runs (DFlash2::encode_cycle_copy, NI_COPY_RUN): the coming cycle as a copy cycle at P + 8 (not
+    // committed), this cycle's verify when it is a copy cycle committed after the last one, its chain
+    const int run_match = copy_lane && mode == 3 && K == DFlash2::kB - 1 ? copy_run_match() : 0;
+    std::unique_ptr<Encoder> next_copy, copy_cycle;
+    CopyChain run_cc;
+    int copy_cycles = 0, copy_dropped = 0;
     double tr[7] = {0, 0, 0, 0, 0, 0, 0}, prev_end = 0;
     int ntr = 0;
     if (mode == 3) {
@@ -449,11 +455,26 @@ int main(int argc, char** argv) {
       const double tc0 = now_ms(), tc0h = Encoder::host_ms();
       double t_commit = tc0h;
       CopyChain cc;  // tokens 0 .. P are final here (the drafting half in flight writes P + 1 ..)
-      const bool cl = copy_lane && copy_lookup(s.tokens(), P, cc);
-      if (cl) dfl->set_copy(&cc);
+      const bool cyc_copy = copy_cycle != nullptr;  // a copy cycle (no drafting pass), committed after the last verify
+      const bool cl = cyc_copy || (copy_lane && copy_lookup(s.tokens(), P, cc));
+      if (cyc_copy) cc = run_cc;
+      else if (cl) dfl->set_copy(&cc);
       std::unique_ptr<Encoder> e1;
-      auto e = g.begin();
-      if (mode == 1) {
+      auto e = cyc_copy ? std::move(copy_cycle) : g.begin();
+      if (cyc_copy) {
+        if (P + 8 + DFlash2::kB + 2 < s.cap) {
+          knobs_for(cycles + 1);
+          if (cc.match >= run_match) {  // the run goes on: the next cycle as a copy cycle too
+            m.commit_rows(s, K + 1);
+            next_copy = g.begin();
+            dfl->encode_cycle_copy(*next_copy, s, *dseq, P + K + 1, K, sp);
+          } else {
+            next_draft = g.begin();
+            dfl->encode_cycle_draft_gpu(*next_draft, s, *dseq, P + 8, sp);
+            next_draft->commit();
+          }
+        }
+      } else if (mode == 1) {
         dfl->encode_cycle(*e, s, *dseq, P, m_prev, K, sp);
         e->commit();
       } else if (mode == 2) {
@@ -469,16 +490,24 @@ int main(int argc, char** argv) {
         dfl->encode_cycle_verify(*e, s, P, K, sp);
         e->commit();
         t_commit = Encoder::host_ms();
-        // the next anchor is at most P + 8: commit its drafting half now (it waits on this verify)
+        // the next anchor is at most P + 8: commit its drafting half now (it waits on this verify); after a copy
+        // chain of a long match, encode the next cycle as a copy cycle at the anchor a full acceptance gives instead
+        // (with this cycle's rows committed as that acceptance commits them), committed below only if it happened
         if (P + 8 + DFlash2::kB + 2 < s.cap) {
           knobs_for(cycles + 1);
-          next_draft = g.begin();
-          dfl->encode_cycle_draft_gpu(*next_draft, s, *dseq, P + 8, sp);
-          next_draft->commit();
+          if (run_match > 0 && cl && cc.match >= run_match) {
+            m.commit_rows(s, K + 1);
+            next_copy = g.begin();
+            dfl->encode_cycle_copy(*next_copy, s, *dseq, P + K + 1, K, sp);
+          } else {
+            next_draft = g.begin();
+            dfl->encode_cycle_draft_gpu(*next_draft, s, *dseq, P + 8, sp);
+            next_draft->commit();
+          }
         }
       }
       e->wait();
-      if (mode == 3 && cycles > 0) {  // NI_CYCLE_TRACE: where a cycle's wall time goes (host clock)
+      if (mode == 3 && cycles > 0 && e1) {  // NI_CYCLE_TRACE: where a cycle's wall time goes (host clock)
         const double h0 = Encoder::host_ms();
         tr[0] += t_commit - tc0h;                                  // host: encode the verify
         tr[1] += e1->gpu_end_host_ms() - e1->gpu_start_host_ms();  // GPU: drafting half
@@ -504,14 +533,15 @@ int main(int argc, char** argv) {
       const int* tk = s.tokens();
       if (cl) {
         ++copy_found;
-        if (dfl->copy_same()) ++copy_same;
+        if (!cyc_copy && dfl->copy_same()) ++copy_same;
         if (dfl->copy_taken()) {
           ++copy_taken;
           copy_emitted += a + 1;
         }
+        // (a copy cycle's E_d and "same" read the buffers of an earlier drafting pass; its last field is 1)
         if (copy_log)
-          fprintf(copy_log, "%d %d %.2f %.3f %d %d %d\n", P, cc.match, cc.expect, dfl->copy_drafter_expect(),
-                  int(dfl->copy_taken()), int(dfl->copy_same()), a);
+          fprintf(copy_log, "%d %d %.2f %.3f %d %d %d %d\n", P, cc.match, cc.expect, dfl->copy_drafter_expect(),
+                  int(dfl->copy_taken()), int(!cyc_copy && dfl->copy_same()), a, int(cyc_copy));
       }
       if (trace)
         fprintf(stderr, "P=%d a=%d chain=%d,%d,%d,%d,%d,%d,%d next=%d wall=%.2fms gpu=%.2fms%s\n", P, a, tk[P + 1],
@@ -579,9 +609,30 @@ int main(int argc, char** argv) {
       P += mm;
       if (mode == 3) dseq->ctx = P;  // the GPU committed the kept rows to the ring
       if (mode != 3) knobs_for(cycles);
+      if (next_copy) {  // committed if every proposal was accepted and the new anchor's copy chain matches as long
+        CopyChain nc;
+        const bool more = !stop2 && int(out.size()) < n_gen && P + DFlash2::kB + 2 < s.cap;
+        if (more && a == K && mm == K + 1 && copy_lookup(s.tokens(), P, nc) && nc.match >= run_match) {
+          dfl->put_copy(nc);  // (the GPU is idle)
+          next_copy->commit();
+          copy_cycle = std::move(next_copy);
+          run_cc = nc;
+          m.commit_rows(s, 0);  // its verify folds this cycle's rows
+          ++copy_cycles;
+        } else {  // the drafting half from the actual anchor (with the ring commit of this cycle's rows)
+          next_copy.reset();
+          ++copy_dropped;
+          if (more) {
+            next_draft = g.begin();
+            dfl->encode_cycle_draft_gpu(*next_draft, s, *dseq, P, sp);
+            next_draft->commit();
+          }
+        }
+      }
     }
     v8_knobs() = knob_a;
     if (next_draft) next_draft->wait();
+    if (copy_cycle) copy_cycle->wait();
     double td = now_ms() - ts;
     if (conf) fclose(conf);
     if (Encoder::profiling()) Encoder::profile_report(cycles);
@@ -601,8 +652,9 @@ int main(int argc, char** argv) {
     if (copy_log) fclose(copy_log);
     if (copy_lane)
       fprintf(stderr, "copy lane (margin %.2f): a copy chain in %d of %d cycles, verified in %d (%d tokens, %.3f tok/cycle), "
-              "the drafted chain the same in %d\n", dfl->copy_margin(), copy_found, cycles, copy_taken, copy_emitted,
-              double(copy_emitted) / std::max(copy_taken, 1), copy_same);
+              "the drafted chain the same in %d; copy runs (match >= %d): %d copy cycles without a drafting pass, %d "
+              "encoded and dropped\n", dfl->copy_margin(), copy_found, cycles, copy_taken, copy_emitted,
+              double(copy_emitted) / std::max(copy_taken, 1), copy_same, run_match, copy_cycles, copy_dropped);
     if (getenv("NI_CYCLE_TRACE") && ntr)
       fprintf(stderr, "cycle trace (ms, mean of %d): host encodes the verify %.3f | GPU idle verify->draft %.3f, draft %.3f, "
               "idle draft->verify %.3f, verify %.3f | verify commit->start %.3f, host wake-up %.3f\n", ntr, tr[0] / ntr,

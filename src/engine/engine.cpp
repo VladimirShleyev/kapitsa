@@ -1943,6 +1943,7 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
   int fed_until = n;  // exclusive: tokens whose effect is in the live state
   int req_cycles = 0;  // DFlash2 cycles of this request
   int req_copy = 0;    // of which verified the copy lane's chain
+  int req_copy_cycles = 0;  // of those, copy cycles (no drafting pass)
   const int depth = spec_ ? opts_.spec_depth : 0;
   auto cycle_done = [live](int m) {  // a decode cycle wrote m tokens (for a display)
     if (!live) return;
@@ -2071,12 +2072,20 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
     // waits for the host between cycles; the host encodes each verify while the drafting half runs.
     // With other requests waiting for the GPU a cycle commits no drafting half behind its verify: the request parks
     // (the ring commit of the kept rows alone) and starts the next cycle from the anchor once its turn comes back.
+    // Long copy runs (DFlash2::encode_cycle_copy): a cycle that verifies a copy chain of a long match commits no
+    // drafting half; the next cycle is encoded as a copy cycle at the anchor P + 8 while this verify runs and committed
+    // once it shows every proposal accepted and the new anchor's copy chain matches as long, else the drafting half
+    // from the actual anchor is committed then.
     DFlashSeq& d = *slot.dseq;
     const int K = DFlash2::verify_depth();
     int P = n, m = 0, a_last = 0;
     req_cycles = 0;
     bool go = handle(s.tokens()[n]);
     std::unique_ptr<Encoder> next_draft;  // committed drafting half of the coming cycle
+    const int run_match = dfl_->copy_lane() && K == DFlash2::kB - 1 ? copy_run_match() : 0;
+    std::unique_ptr<Encoder> next_copy;   // the coming cycle as a copy cycle at P + 8, not committed
+    std::unique_ptr<Encoder> copy_cycle;  // this cycle's verify, a copy cycle committed after the last one
+    CopyChain run_cc;                     // copy_cycle's chain
     // The drafting half from the anchor P with nothing in flight (after the prefill, and when the request's turn
     // comes back after parking), with KV cache room for the first cycles (it grows between cycles below): nothing may
     // use the old buffers, so the deferred prompt work completes first
@@ -2102,20 +2111,28 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
         parked = false;
         start_cycles();
       }
-      if (!next_draft) {  // no room for another drafting pass
-        finish = "length";
-        res.context_full = true;
-        break;
-      }
-      next_draft.reset();
-      // the copy lane: the conversation's continuation of the text before the anchor, verified instead of the drafted
-      // chain when it is expected to accept more (tokens 0 .. P are final; the drafting half in flight writes P + 1 ..)
       CopyChain cc;
-      const bool copy = dfl_->copy_lane() && copy_lookup(s.tokens(), P, cc);
-      if (copy) dfl_->set_copy(&cc);
-      auto e2 = g.begin();
-      dfl_->encode_cycle_verify(*e2, s, P, K, sp);
-      e2->commit();
+      bool copy = true;
+      std::unique_ptr<Encoder> e2;
+      if (copy_cycle) {  // committed after the last verify
+        e2 = std::move(copy_cycle);
+        cc = run_cc;
+      } else {
+        if (!next_draft) {  // no room for another drafting pass
+          finish = "length";
+          res.context_full = true;
+          break;
+        }
+        next_draft.reset();
+        // the copy lane: the conversation's continuation of the text before the anchor, verified instead of the
+        // drafted chain when it is expected to accept more (tokens 0 .. P are final; the drafting half in flight
+        // writes P + 1 ..)
+        copy = dfl_->copy_lane() && copy_lookup(s.tokens(), P, cc);
+        if (copy) dfl_->set_copy(&cc);
+        e2 = g.begin();
+        dfl_->encode_cycle_verify(*e2, s, P, K, sp);
+        e2->commit();
+      }
       bool kv_wait = false;  // no KV room for the next cycle while other requests' caches hold the memory
       if (P + 8 + 8 + DFlash2::kB + 3 > s.cap && s.cap < s.limit) {
         // the KV cache grows here: the verify in flight (and the drafting half before it) complete first, so
@@ -2130,7 +2147,13 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
       const bool park = turn || kv_wait || join;
       const bool room = P + 8 + 8 + DFlash2::kB + 2 < s.cap;  // the next anchor is at most P + 8
       park_last = park && room;
-      if (!park && room) {
+      if (!park && room && run_match > 0 && copy && cc.match >= run_match) {
+        // a long copy run: the next cycle as a copy cycle at the anchor a full acceptance gives, its verify encoded
+        // with this cycle's rows committed as that acceptance commits them (and committed below only if it happened)
+        q35_->commit_rows(s, K + 1);
+        next_copy = g.begin();
+        dfl_->encode_cycle_copy(*next_copy, s, d, P + K + 1, K, sp);
+      } else if (!park && room) {
         next_draft = g.begin();
         dfl_->encode_cycle_draft_gpu(*next_draft, s, d, P + 8, sp);
         next_draft->commit();
@@ -2156,6 +2179,28 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
       q35_->commit_rows(s, m);  // rows P .. P+m-1 are fed; tk[P+m] is the new anchor
       P += m;
       d.ctx = P;  // the committed drafting half (if any) puts these rows into the ring
+      if (next_copy) {
+        CopyChain nc;
+        if (go && a == K && m == K + 1 && copy_lookup(s.tokens(), P, nc) && nc.match >= run_match) {
+          dfl_->put_copy(nc);  // (the GPU is idle: nothing of this request in flight)
+          next_copy->commit();
+          copy_cycle = std::move(next_copy);
+          run_cc = nc;
+          q35_->commit_rows(s, 0);  // its verify folds this cycle's rows
+          ++req_copy_cycles;
+        } else {
+          // the drafting half from the actual anchor, with the ring commit of this cycle's rows (or, at the end, the
+          // ring commit alone below, as for a cycle that meant to park)
+          next_copy.reset();
+          if (go) {
+            next_draft = g.begin();
+            dfl_->encode_cycle_draft_gpu(*next_draft, s, d, P, sp);
+            next_draft->commit();
+          } else {
+            park_last = true;
+          }
+        }
+      }
       if (go && park) {
         // park: the rows this cycle kept go into the ring as the drafting half would have put them (from the GPU
         // state the acceptance wrote, reading the verify's captures before any other request's passes)
@@ -2472,11 +2517,12 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
   }
   if (finish == "stop" && !res.tool_calls.empty()) finish = "tool_calls";
   res.finish_reason = finish;
-  char cyc[96] = "";
+  char cyc[160] = "";
   if ((dfl_ || lili_ || dory_spec_ || nh_ngram_) && req_cycles > 0)
     snprintf(cyc, sizeof cyc, ", %.2f tok/cycle", double(gen - 1) / req_cycles);
   if (req_copy > 0)
-    snprintf(cyc + strlen(cyc), sizeof cyc - strlen(cyc), " (%d of %d cycles from the copy lane)", req_copy, req_cycles);
+    snprintf(cyc + strlen(cyc), sizeof cyc - strlen(cyc), " (%d of %d cycles from the copy lane, %d without a drafting "
+             "pass)", req_copy, req_cycles, req_copy_cycles);
   // requests in flight at once: the slot, the wait for it, the turns given to the others (prefill, decode)
   char conc[256] = "";
   if (res.yields > 0 || res.queue_ms > 0 || res.batched > 0)

@@ -203,6 +203,17 @@ class DFlash2 {
   // drafters and off for a dense target's DFlash2 drafter, as measured over the recorded agent session (writing rate:
   // 35B +7.4%, 4B +34%, 27B -1.2%: its drafter already drafts most of what the copy would)
   bool copy_lane() const { return copy_lane_enabled(tg_.config().moe || cfg_.v1); }
+  // A copy cycle, for long copy runs (copy_lane.h, copy_run_match): no drafting pass, only the ring commit of the rows
+  // the last acceptance kept, then the verify of the copy chain that put_copy() wrote, whatever the drafter's own
+  // expectation, from the anchor P. A cycle that verifies a copy chain of a long match commits no drafting half behind
+  // its verify: the loop encodes the next cycle as a copy cycle at the anchor a full acceptance gives (P + 8) while
+  // that verify runs and commits it only once the verify accepted every proposal and the lookup at the new anchor
+  // found a long match again (put_copy() in between: a host write, with the GPU idle); otherwise it drops it and
+  // commits the drafting half from the actual anchor (one host round trip). On MoE targets a long match is one whose
+  // copy dfl_copy_pick takes whatever the drafter expects (copy_expect(32) = 5.96 > 7 + margin -1.5), so the verified
+  // rows, and the outputs, are those of the copy lane alone; dense targets' verify rows do not depend on each other.
+  void encode_cycle_copy(Encoder& e, Seq& s, DFlashSeq& d, int P, int K, const SamplingParams& sp);
+  void put_copy(const CopyChain& c);
 
   // results of the last pass (host-visible after the command buffer completed)
   const int* cand_ids() const { return cand_i_.as<int>(); }       // [7][16]
@@ -282,10 +293,10 @@ class DFlash2 {
   Buffer logits_, sel_, tk_v_, tk_i_, cand_v_, cand_i_, edges_, walk_s_, qprob_, walk_k_, rope_cs_;
   // acceptance: target distributions of the verify rows, result {a, token}
   Buffer dist_id_, dist_p_, dist_keep_, acc_, kdyn_, gst_;
-  // copy lane: the chain set for the next verify, dfl_copy_pick's result {taken, same, E_d}
-  Buffer copy_flag_;
+  // copy lane: the chain set for the next verify, dfl_copy_pick's result {taken, same, E_d}; a copy cycle's chain
+  Buffer copy_flag_, copy_buf_;
   CopyChain copy_;
-  bool copy_on_ = false;
+  bool copy_on_ = false, copy_force_ = false;
   float copy_margin_ = -1.5f;
   float dyn_tau_ = 0.0f;    // T = 0 (0: dynamic depth off)
   float dyn_tau_t_ = 0.0f;  // T > 0

@@ -510,6 +510,8 @@ void DFlash2::alloc_buffers() {
   kdyn_.as<uint32_t>()[1] = 8;
   copy_flag_ = g.alloc(16, "dfl_copy_flag");
   memset(copy_flag_.ptr(), 0, copy_flag_.size);
+  copy_buf_ = g.alloc(32, "dfl_copy_chain");
+  memset(copy_buf_.ptr(), 0, copy_buf_.size);
   capt_ = g.alloc(8 * nH * 2, "dfl_capt");
   y8_ = g.alloc(8 * H * 4, "dfl_y8");
   c8_ = g.alloc(8 * H * 4, "dfl_c8");
@@ -519,7 +521,7 @@ void DFlash2::alloc_buffers() {
   for (Buffer* b : {&h_, &n_, &xh_, &xs_, &xh2_, &xs2_, &hh_, &gu_g_, &gu_u_, &hs_, &dyn_, &q_, &kv_, &Q_, &Kb_, &Vb_, &part_o_, &part_ml_, &u_,
                     &logits_, &sel_, &tk_v_, &tk_i_, &cand_v_, &cand_i_, &edges_, &walk_s_, &qprob_, &walk_k_, &capt_,
                     &y8_, &c8_, &kv8_, &cdbg_, &rope_cs_, &dist_id_, &dist_p_, &dist_keep_, &acc_, &kdyn_, &gst_,
-                    &copy_flag_})
+                    &copy_flag_, &copy_buf_})
     resident_ += b->size;
 }
 
@@ -1522,8 +1524,16 @@ void DFlash2::set_copy(const CopyChain* c) {
   if (c) copy_ = *c;
 }
 
+void DFlash2::put_copy(const CopyChain& c) { memcpy(copy_buf_.ptr(), c.tok, sizeof c.tok); }
+
+void DFlash2::encode_cycle_copy(Encoder& e, Seq& s, DFlashSeq& d, int P, int K, const SamplingParams& sp) {
+  encode_commit(e, d, -1);  // the rows the last acceptance kept
+  copy_force_ = true;
+  encode_cycle_verify(e, s, P, K, sp);
+}
+
 void DFlash2::encode_cycle_verify(Encoder& e, Seq& s, int P, int K, const SamplingParams& sp) {
-  if (copy_on_) {  // the copy lane's chain instead of the drafted one when it is expected to accept more
+  if (copy_on_ || copy_force_) {  // the copy lane's chain instead of the drafted one when it is expected to accept more
     kp::DflCopy cp{};
     for (int j = 0; j < CopyChain::kLen; ++j) cp.chain[j] = copy_.tok[j];
     cp.P = uint32_t(P);
@@ -1531,12 +1541,14 @@ void DFlash2::encode_cycle_verify(Encoder& e, Seq& s, int P, int K, const Sampli
     cp.expect = copy_.expect;
     cp.margin = copy_margin_;
     cp.temp = sp.temperature > 0 ? sp.temperature : 0.0f;
+    cp.force = copy_force_ ? 1u : 0u;  // a copy cycle: put_copy's chain, always taken
     e.use(dpipe("dfl_copy_pick"));
     e.buf(0, s.tok); e.buf(1, walk_s_); e.buf(2, walk_k_); e.buf(3, qprob_); e.buf(4, cand_i_); e.buf(5, cand_v_);
     e.buf(6, copy_flag_);
     e.val(7, cp);
+    e.buf(8, copy_buf_);
     e.dispatch(1, 1, 1, 32);
-    copy_on_ = false;
+    copy_on_ = copy_force_ = false;
   }
   const Buffer rows = kdyn_.view(4, 4);
   if (dyn_tau_ > 0) {

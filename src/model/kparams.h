@@ -271,6 +271,7 @@ struct DflCopy {
   int32_t chain[7];  // the copy lane's proposals
   uint32_t P, K;
   float expect, margin, temp;
+  uint32_t force;  // 1: the chain from the kernel's chain buffer, taken whatever the drafter's expectation
 };
 
 struct DflPerm {

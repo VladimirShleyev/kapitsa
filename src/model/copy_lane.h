@@ -36,4 +36,10 @@ float copy_expect(int match);
 bool copy_lane_enabled(bool by_default);
 float copy_lane_margin(bool moe_target);
 
+// Long copy runs (DFlash2::encode_cycle_copy): a cycle whose copy chain matches at least this many tokens commits no
+// drafting half behind its verify, and the next cycle verifies its own copy chain without a drafting pass when it
+// matches as long. NI_COPY_RUN: that length (0 = off; default 32, where the copy expects 5.96 of 7).
+static constexpr int kCopyRunMatch = 32;
+int copy_run_match();
+
 }  // namespace ni

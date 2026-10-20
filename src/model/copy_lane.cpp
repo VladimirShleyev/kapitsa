@@ -1,5 +1,6 @@
 #include "model/copy_lane.h"
 
+#include <algorithm>
 #include <cstdlib>
 
 namespace ni {
@@ -69,6 +70,14 @@ float copy_lane_margin(bool moe_target) {
   static const char* v = getenv("NI_COPY_MARGIN");
   if (v && *v) return float(atof(v));
   return moe_target ? -1.5f : -0.5f;
+}
+
+int copy_run_match() {
+  static const int n = [] {
+    const char* v = getenv("NI_COPY_RUN");
+    return v && *v ? std::max(0, atoi(v)) : kCopyRunMatch;
+  }();
+  return n;
 }
 
 }  // namespace ni

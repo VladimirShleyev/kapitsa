@@ -15,7 +15,8 @@
 //    And with the copy lane (dfl_copy_pick before the acceptance): a deterministic chain from the prefix (in p's
 //    support or not) replaces the drawn one always, or by the engine's rule (an expectation against the drafter's,
 //    from draft logits no draw touched); the host replays the kernel's choice to condition the target rows on the
-//    chain actually verified, and checks that it chose the same.
+//    chain actually verified, and checks that it chose the same. A copy cycle's pick (no drafting pass: the chain
+//    from a buffer the host writes after encoding, always taken) likewise.
 #include "metal/gpu.h"
 #include "model/kparams.h"
 #include "util/log.h"
@@ -237,7 +238,8 @@ struct Slot {
 
 // Inputs of one cycle with the anchor at position P (tokens[P] = anchor, proposals at P+1..): the
 // prefix (the tokens emitted so far) conditions p and q. copy: 0 = the drawn chain; 1 = a copy chain always
-// replaces it; 2 = by dfl_copy_pick's rule (expect > E_d, E_d from the draft logits cv, which no draw touched).
+// replaces it; 2 = by dfl_copy_pick's rule (expect > E_d, E_d from the draft logits cv, which no draw touched); 3 = a
+// copy cycle's (force: the chain from the kernel's chain buffer, always taken).
 void fill(Slot& s, const std::vector<int>& prefix, int P, int K, int regime, std::mt19937_64& r, std::vector<int>* chain,
           int copy = 0) {
   s.tokens.assign(16, 0);
@@ -321,7 +323,8 @@ void fill(Slot& s, const std::vector<int>& prefix, int P, int K, int regime, std
   s.cp.margin = copy == 1 ? -1e9f : 0.0f;
   s.cp.P = uint32_t(P);
   s.cp.K = uint32_t(K);
-  s.take = copy == 1 || expect > ed;
+  s.cp.force = copy == 3 ? 1u : 0u;
+  s.take = copy == 1 || copy == 3 || expect > ed;
   if (!s.take) return;
   // the copy chain is verified: the target rows follow it
   chain->assign(s.cp.chain, s.cp.chain + K);
@@ -415,7 +418,7 @@ int main(int argc, char** argv) {
     float temp;
     float tau = 0.0f;  // > 0: dynamic verify depth (dfl_depth) with this threshold
     int rule = 0;      // dfl_depth rule (1 = own confidence at T > 0: biased, expected to fail; 2 = the earlier rule)
-    int copy = 0;      // copy lane (dfl_copy_pick first): 1 = the copy chain always, 2 = by its rule
+    int copy = 0;      // copy lane (dfl_copy_pick first): 1 = the copy chain always, 2 = by its rule, 3 = a copy cycle
   };
   std::vector<Case> cases = {{kRandom, Kmain, 0.6f}, {kEqual, Kmain, 0.6f}, {kDisjoint, Kmain, 0.6f},
                              {kPoint, Kmain, 0.6f},  {kMixed, Kmain, 0.6f}, {kRandom, 1, 0.6f},
@@ -424,7 +427,8 @@ int main(int argc, char** argv) {
                              {kEqual, 7, 0.6f, 0.3f},  {kBias, 3, 0.6f, 0.3f},       {kBias, 3, 0.6f, 0.3f, 1},
                              {kBias, 3, 0.6f, 0.3f, 2}, {kMixed, 7, 0.6f, 0.2f, 2},
                              {kRandom, 7, 0.6f, 0, 0, 1}, {kPoint, 3, 1.0f, 0, 0, 1},  {kRandom, 7, 0.6f, 0, 0, 2},
-                             {kMixed, 3, 1.0f, 0, 0, 2},  {kRandom, 7, 0.6f, 0.1f, 0, 2}, {kRandom, 7, 0.6f, 0.1f, 2, 2}};
+                             {kMixed, 3, 1.0f, 0, 0, 2},  {kRandom, 7, 0.6f, 0.1f, 0, 2}, {kRandom, 7, 0.6f, 0.1f, 2, 2},
+                             {kRandom, 7, 0.6f, 0, 0, 3}, {kMixed, 7, 1.0f, 0.1f, 0, 3}};
   Pipeline acc = g.pipeline("dfl_accept"), dep = g.pipeline("dfl_depth"), cpk = g.pipeline("dfl_copy_pick");
   const int B = 4096;  // trials per command buffer
   Buffer tok = g.alloc(size_t(B) * 16 * 4), cand = g.alloc(size_t(B) * 112 * 4), qp = g.alloc(size_t(B) * 112 * 4);
@@ -432,7 +436,7 @@ int main(int argc, char** argv) {
   Buffer res = g.alloc(size_t(B) * 4 * 4), samp = g.alloc(64), scratch = g.alloc(64), kd = g.alloc(size_t(B) * 16);
   Buffer ws = g.alloc(size_t(B) * 112 * 4);  // the walk's scores: log q, so softmax(S_j) = q_j (dfl_depth)
   // copy lane: the draft logits (its choice at T > 0), its result, and the host's replay of its choice
-  Buffer cvb = g.alloc(size_t(B) * 112 * 4), flag = g.alloc(size_t(B) * 16);
+  Buffer cvb = g.alloc(size_t(B) * 112 * 4), flag = g.alloc(size_t(B) * 16), chb = g.alloc(size_t(B) * 32);
   std::vector<kp::DflCopy> cps(B);
   std::vector<char> takes(B);
   for (size_t ci = 0; ci < cases.size(); ++ci) {
@@ -457,7 +461,9 @@ int main(int argc, char** argv) {
         memcpy(did.as<int>() + i * 256, s.did.data(), 256 * 4);
         memcpy(dp.as<float>() + i * 256, s.dp.data(), 256 * 4);
         memcpy(cvb.as<float>() + i * 112, s.cv.data(), 112 * 4);
+        memcpy(chb.as<int>() + i * 8, s.cp.chain, sizeof s.cp.chain);  // a copy cycle's chain buffer
         cps[i] = s.cp;
+        if (s.cp.force) memset(cps[i].chain, 0, sizeof cps[i].chain);  // (read from the buffer only)
         takes[i] = s.take;
       };
       auto run = [&](int count, uint32_t P, const std::vector<uint32_t>& seed) {
@@ -472,6 +478,7 @@ int main(int argc, char** argv) {
             e->buf(3, qp, size_t(i) * 448); e->buf(4, cand, size_t(i) * 448); e->buf(5, cvb, size_t(i) * 448);
             e->buf(6, flag, size_t(i) * 16);
             e->val(7, cp);
+            e->buf(8, chb, size_t(i) * 32);
             e->dispatch(1, 1, 1, 32);
           }
           if (cs.tau > 0) {  // the drafter's depth decision from this trial's q and walk choices
@@ -563,7 +570,7 @@ int main(int argc, char** argv) {
     if (cs.tau > 0) snprintf(dyn, sizeof dyn, ", depth tau %.2f rule %d", cs.tau, cs.rule);
     if (cs.copy)
       snprintf(dyn + strlen(dyn), sizeof dyn - strlen(dyn), ", copy lane %s: %ld copy cycles, %ld choices unlike the "
-               "host's", cs.copy == 1 ? "always" : "by its rule", copies, choice_bad);
+               "host's", cs.copy == 1 ? "always" : cs.copy == 3 ? "copy cycle" : "by its rule", copies, choice_bad);
     const bool expect_fail = cs.rule == 1;
     printf("[S1] %-24s K=%d T=%.1f%s: %ld trials, mean a %.2f; joint chi2 %.1f (%d dof) p=%.3f; first token chi2 "
            "%.1f (%d dof) p=%.3f; outside support %ld: %s%s\n",
