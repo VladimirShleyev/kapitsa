@@ -22,18 +22,15 @@ the drafter's candidates instead of one chain, exactly, sized by a budget that e
 | `4afa619` | `kapitsa serve` saves the KfBudget cache on shutdown and every 256 cycles; every tool measures a cycle's whole GPU time (same patch as `kflash` `bc46716`). |
 | `2acc61b` | One switch and one rule: trees on dense targets, the chain on MoE targets. `NI_KFLASH=1` forces trees, `NI_KFLASH=0` chains everywhere. |
 | `fa3edc2` | `tools/tensor_probe.mm` builds with SDKs before macOS 26 (found on the M1 Pro fleet Mac). |
+| `4fc87d0` | Trees on every target. On MoE targets (Qwen3.6-35B, Nemotron-H) the tree's size is dynamic: the budget picks 1..8 live rows per cycle, and the verify routes experts only for those rows. `NI_KFLASH=0` chains everywhere. |
 | (this file) | the map |
 
-**In progress, not pushed yet: dynamic trees on MoE targets.**
-- The user's rule: trees on every target; on MoE targets the tree's size is dynamic, never a fixed 8 rows. The
-  budget picks 1..8 live rows per cycle, and the verify's expert work covers only those rows.
-- Nemotron-H's budget is already dynamic (rows 1..8). The Qwen3.6-35B needs it built.
-- Owner: the session "KFlash: 16- and 32-row tree verifies on dense Qwen" (local id
-  `local_4e5ea98d-7f93-4f73-97ca-9355be24eb94`) on the coordinator Mac, working toward `kflash-trees`.
-- If that session is gone, restart from this brief. Allow `set_rows(0xFF, 8)` for MoE in `src/model/dflash2.cpp`;
-  have the 35B's row-scaled verify work (`enc_moe_rows`, `moe_unique_rows`, attention, GDN, sampling) honour the
-  tree's live row count, GPU-driven like the chain's dynamic depth; then turn trees on by default everywhere. Check
-  exactness, then A/B against the 35B's chain.
+**Done: dynamic trees on MoE targets (`4fc87d0`).**
+- The rule is trees on every target. Dense targets verify whole 8-row tiles.
+- On MoE targets, the budget picks 1..8 live rows per cycle and the verify's expert work covers only those
+  rows, so a tree of n rows costs about the experts of n rows.
+- Not completed: the sampled exactness check on the 35B and more sampled seeds. The user chose to commit
+  without them.
 
 ### `kflash` commit map
 
@@ -61,9 +58,10 @@ Trees of 7 nodes vs `main`, interleaved, M4 Pro 48 GB:
 
 - **M1 Pro 16 GB (Qwen3.5-4B):** +2% to +16% on code across greedy and sampled runs, +6% to +13% on the agent replay.
   The budget picks 8 rows, and on that GPU 8 rows cost 6% more than 1 row.
-- **Qwen3.6-35B MoE with a forced 7-node tree (always 8 rows):** tokens per cycle rose 15-24%, but cycle time rose
-  16-20%. Speed: code 0%, prose +1%, agent requests -3% / +2%, sampled code -7%. The chain stays until the dynamic
-  MoE tree lands.
+- **Qwen3.6-35B MoE, interleaved, tree vs mean(main, chain), M4 Pro:**
+  - Dynamic trees (`4fc87d0`), greedy: code +1.5%, prose +0.8%, agent requests +4.1% / -4.0%.
+  - Dynamic trees, T 0.6: +9% on average over 11 seeded runs, -7% to +27% per seed.
+  - A forced 8-row tree measured 0% greedy and -7% sampled.
 - **16/32-row verifies on the M4 Pro:**
   - At 4-bit, 16 rows cost 1.6-1.75× an 8-row verify for 1.09-1.14× the tokens, so the rule keeps 8.
   - At 8-bit, it keeps 8.
@@ -89,7 +87,7 @@ Trees of 7 nodes vs `main`, interleaved, M4 Pro 48 GB:
 
 ## Open items
 
-1. Dynamic MoE trees (in progress, above), then the 35B A/B.
+1. Dynamic MoE trees: done (`4fc87d0`). Optional: the 35B's sampled exactness check and more sampled seeds.
 2. Nemotron speed: tree vs chain on Lightning. This needs the 23 GB model; the user said not to download it for now.
 3. 16/32-row verifies: the interleaved A/B is deferred; decide whether they join `kflash-trees`.
 4. Merging to `main` waits for the user. `main` has moved on, so bring the branch up to date first, then rerun the
@@ -97,7 +95,6 @@ Trees of 7 nodes vs `main`, interleaved, M4 Pro 48 GB:
 5. Parked:
    - the decoder's measured on/off switch;
    - the online-tuned selector;
-   - the Qwen3.6-35B on the shared budget (subsumed by item 1);
    - the 4-bit verify on the M5's matrix units, which needs an M5 in the fleet.
 
 ## How to resume
