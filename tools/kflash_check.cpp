@@ -660,7 +660,7 @@ int main(int argc, char** argv) {
       }
       const bool ok = (bad_rows == 0 || near_tie) && bad_tab == 0 && (!early || unexpanded == 0);
       printf("[%s] decoder tree: %d rows built, %d live, %u pass%s, %d nodes expanded; builder = CPU reference%s, "
-             "tables = decoder scores, %s: %s\n",
+             "tables = decoder scores: %s, %s: %s\n",
              name, D[kf::kNodes], D[kf::kN], T.walk_passes, T.walk_passes == 1 ? "" : "es", expanded,
              bad_rows ? (near_tie ? " (a near-tie ordered differently)" : " NO") : "", bad_tab ? "NO" : "yes",
              early ? (unexpanded ? "rows left unexpanded" : "every row's node expanded") : "pass cap reached",
