@@ -453,6 +453,7 @@ DFlash2::DFlash2(Qwen35& target, const std::string& dir, int bits) : tg_(target)
   {
     std::string key = tg_.model_dir().substr(tg_.model_dir().find_last_of('/') + 1) + "-" +
                       dir.substr(dir.find_last_of('/') + 1) + "-b" + std::to_string(bits_) + "-" + Gpu::get().name();
+    if (kf_) key += "-kflash";  // the candidate decoder's probabilities have a calibration of their own
     for (char& c : key)
       if (!isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '.') c = '_';
     kf_budget_ = std::make_unique<KfBudget>(key);
@@ -1537,6 +1538,18 @@ void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const S
       e.dispatch(7 * 16, 1, 1, 32);
       KfParams kp{};
       kf_budget_->write(kp);
+      // with the candidate decoder (sel 1) the lattice's tree is only its first guess: every row the verify holds,
+      // the lattice's own probabilities; the decoder then has the builder take the tree from its scores (the budget's
+      // parameters, calibrated on the decoder's probabilities)
+      const bool dec = sel == 1 && kf_;
+      const KfParams kp_dec = kp;
+      if (dec) {
+        for (int i = 0; i <= kf::kMaxRows; ++i) {
+          kp.alpha[i] = 0.0f;
+          kp.beta[i] = 1.0f;
+        }
+        kp.force_n = kp.max_rows;
+      }
       // the GPU-driven anchor: the builder's P is unknown to the host, so the tokens' base comes from the drafter state
       // (kf_build reads P from its params: the host passes P; a GPU-driven pass passes the sentinel and the kernel reads
       // gst) -- see kf_build_gpu below
@@ -1548,6 +1561,9 @@ void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const S
       e.val(7, bp);
       if (gpu) e.buf(8, gst_);
       e.dispatch(1, 1, 1, 32);
+      if (dec && !(skip & 4096))
+        kf_->encode_tree(e, logits_.view(size_t(Vd) * 4, size_t(7) * Vd * 4), xh_, xs_, s.tok, Pk, gst_, sp, tree_buf_,
+                         kf_live_, kp_dec);
       return;
     }
     kp::DflSelect p{Pk, sp.temperature, sp.seed, uint32_t(P + 1), sp.temperature * walk_tf_};

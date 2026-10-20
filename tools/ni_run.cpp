@@ -641,7 +641,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, "; %.2f proposals verified per cycle; acceptance by position", double(verified_sum) / std::max(cycles, 1));
     for (int i = 0; i < K; ++i) fprintf(stderr, " %.2f", reached[i] ? double(acc_pos[i]) / reached[i] : 0.0);
     if (dfl->kflash() && mode != 3)
-      fprintf(stderr, "; KFlash decoder: %.2f speculative passes per cycle", double(kf_passes) / std::max(cycles, 1));
+      fprintf(stderr, "; KFlash decoder: %.2f passes per cycle", double(kf_passes) / std::max(cycles, 1));
     fprintf(stderr, "\n");
     if (dfl->tree() && dfl->budget()) fprintf(stderr, "%s\n", dfl->budget()->summary().c_str());
     if (getenv("NI_CYCLE_TRACE") && ntr)

@@ -32,7 +32,10 @@ they decode.
    attends to its ancestors only, the recurrent layers run from its own branch's state, and the longest branch that
    agrees with the target is kept, so the reply is plain decoding's. The tree's size follows this Mac's measured cost
    per verify row count and the drafter's probabilities as calibrated against its own acceptances. The 35B-A3B, whose
-   verify pays per row for its experts, keeps its chain. Plain generation is available with `--spec 0`.
+   verify pays per row for its experts, keeps its chain. With a KFlash candidate decoder in the Qwen model's `kflash/`
+   folder (`NI_KFLASH=1`; no trained one is published yet), the decoder scores the drafter's candidates given each
+   node's whole path and the same builder takes the tree from its scores (a chain: it walks the chain). Plain
+   generation is available with `--spec 0`.
 5. **Stream and retain state.** The output parser separates content, reasoning and complete tool calls. The engine
    retains the slot for follow-ups and can prefill the rendered assistant history while idle.
 
@@ -123,7 +126,7 @@ Neural Engine resources. `kapitsa doctor` uses the same planning logic to report
 | OpenAI Responses and Anthropic adapters | [`src/api/`](../src/api/) |
 | Request lifecycle, slots, turns, batched decoding and generation | [`src/engine/engine.cpp`](../src/engine/engine.cpp) |
 | Shared model contract and sequence state | [`src/model/model.h`](../src/model/model.h) |
-| Qwen backend and drafters | [`qwen35.h`](../src/model/qwen35.h), [`dflash2.h`](../src/model/dflash2.h), [`kflash.h`](../src/model/kflash.h) (KFlash candidate decoder, opt-in `NI_KFLASH`) |
+| Qwen backend and drafters | [`qwen35.h`](../src/model/qwen35.h), [`dflash2.h`](../src/model/dflash2.h), [`kflash.h`](../src/model/kflash.h) (KFlash candidate decoder, opt-in `NI_KFLASH`); KFlash trees: [`kernels/kflash.h`](../src/kernels/kflash.h) (descriptor, builder, acceptance), [`kflash_budget.h`](../src/model/kflash_budget.h) |
 | Qwen3.8-Flash-Next | [`qwen4_exp.h`](../src/model/qwen4_exp.h), [`ngram.h`](../src/model/ngram.h), [`qwen4.metal`](../src/kernels/qwen4.metal) |
 | Nemotron backend and drafters | [`nemotron_h.h`](../src/model/nemotron_h.h), [`nh_drafter.h`](../src/model/nh_drafter.h), [`lilicorr.h`](../src/model/lilicorr.h), [`dspark.h`](../src/model/dspark.h); KFlash trees: [`kflash_budget.h`](../src/model/kflash_budget.h), [`nh_tree.metal`](../src/kernels/nemotron/nh_tree.metal) |
 | Dory backend (looped; loops and KV mode per request and server) | [`dory.h`](../src/model/dory.h), [`src/kernels/dory/`](../src/kernels/dory/) |

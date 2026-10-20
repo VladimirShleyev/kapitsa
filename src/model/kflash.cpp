@@ -293,10 +293,14 @@ KFlash::KFlash(Qwen35& target, const std::string& dir) : tg_(target), dir_(dir) 
   u_ = g.alloc(8 * size_t(d) * 4, "kf_u");
   qkv_ = g.alloc(8 * size_t(3 * d) * 4, "kf_qkv");
   z_ = g.alloc(8 * size_t(H) * 4, "kf_z");
-  full_args_ = g.alloc(kSlots * 12, "kf_args");
+  full_args_ = g.alloc(kTreeSlots * 12, "kf_args");
   pass_args_ = g.alloc(size_t(16) * kSlots * 12, "kf_args");
+  t_clq_ = g.alloc(size_t(kMaxNodes) * kCand * 4, "kf_tree_clq");
+  t_tok_ = g.alloc(size_t(kMaxNodes) * kCand * 4, "kf_tree_tok");
+  t_next_ = g.alloc(size_t(kMaxNodes) * kCand * 4, "kf_tree_next");
+  tree_args_ = g.alloc(size_t(16) * kTreeSlots * 12, "kf_tree_args");
   for (Buffer* b : {&tree_, &kv_, &A_, &cd_, &xin_h_, &xin_s_, &hres_, &n_, &xh_, &xs_, &hh_, &hs_, &u_, &qkv_, &z_,
-                    &full_args_, &pass_args_}) {
+                    &full_args_, &pass_args_, &t_clq_, &t_tok_, &t_next_, &tree_args_}) {
     memset(b->ptr(), 0, b->size);
     resident_ += b->size;
   }
@@ -527,6 +531,57 @@ void KFlash::encode_chain(Encoder& e, const Buffer& tokens, uint32_t Pk, const B
     e.buf(5, walk.walk_s); e.buf(6, full_args_); e.buf(7, pass_args_.view(size_t(i + 1) * blk, blk));
     e.val(8, p);
     e.dispatch(1, 1, 1, 32);
+  }
+}
+
+void KFlash::encode_tree(Encoder& e, const Buffer& logits, const Buffer& xh, const Buffer& xs, const Buffer& tokens,
+                         uint32_t Pk, const Buffer& gst, const SamplingParams& sp, const Buffer& desc, const Buffer& live,
+                         const KfParams& kp) {
+  if (!vd_) fatal("KFlash::encode_tree: no drafter bound (bind_drafter)");
+  enc_top32(e, logits);
+  encode_prep(e, xh, xs);
+  encode_tree_passes(e, tokens, Pk, gst, sp, desc, live, kp);
+}
+
+void KFlash::encode_tree_passes(Encoder& e, const Buffer& tokens, uint32_t Pk, const Buffer& gst,
+                                const SamplingParams& sp, const Buffer& desc, const Buffer& live, const KfParams& kp) {
+  const bool sampled = sp.temperature > 0.0f;
+  // the children's probability: at T = 0 the acceptance head's greedy row (P(the child is the target's argmax)), at
+  // T > 0 q = softmax(S / T) (the decoder's estimate of the target's sampler)
+  const bool use_acc = !sampled && acc_rows_ > 0;
+  const float tq = sampled ? sp.temperature : 1.0f;
+  const int passes = std::clamp(passes_ > 0 ? passes_ : 7, 1, 16);
+  const bool gpu = Pk == 0xffffffffu;  // kDflGpu
+  uint32_t* full = full_args_.as<uint32_t>();  // kf_dtab: a threadgroup per node; kf_build: one
+  full[kSlots * 3 + 0] = kMaxNodes;
+  full[kSlots * 3 + 1] = 1;
+  full[kSlots * 3 + 2] = 1;
+  full[kSlots * 3 + 3] = 1;
+  full[kSlots * 3 + 4] = 1;
+  full[kSlots * 3 + 5] = 1;
+  const size_t blk = size_t(kTreeSlots) * 12;
+  for (int i = 0; i < passes; ++i) {
+    const Buffer ind = tree_args_.view(size_t(i) * blk, blk);
+    const kp::KfTreeNext np{Pk, i == 0 ? 1u : 0u, 7u, uint32_t(kTreeSlots)};
+    e.use(kfpipe("kf_tree_next"));
+    e.buf(0, tree_); e.buf(1, desc); e.buf(2, tokens);
+    e.val(3, np);
+    e.buf(4, gst); e.buf(5, full_args_); e.buf(6, ind);
+    e.dispatch(1, 1, 1, 32);
+    encode_step(e, c_i_, c_col_, c_v_, tq, sampled ? 1 : 0, nullptr, &ind);
+    const kp::KfDtab dp{use_acc ? 1u : 0u, 0u};
+    e.use(kfpipe("kf_dtab"));
+    e.buf(0, tree_); e.buf(1, t_clq_); e.buf(2, t_tok_); e.buf(3, t_next_);
+    e.val(4, dp);
+    e.dispatch_indirect(ind, size_t(kSlots) * 12, 32);
+    const kp::KfBuild bp{uint32_t(kCand), Pk, 0u, 0u};
+    e.use(kfpipe(gpu ? "kf_build_gpu" : "kf_build"));
+    e.buf(0, t_clq_); e.buf(1, t_tok_); e.buf(2, t_next_);
+    e.val(3, kp);
+    e.buf(4, desc); e.buf(5, tokens); e.buf(6, live);
+    e.val(7, bp);
+    if (gpu) e.buf(8, gst);
+    e.dispatch_indirect(ind, size_t(kSlots + 1) * 12, 32);
   }
 }
 

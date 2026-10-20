@@ -548,6 +548,172 @@ int main(int argc, char** argv) {
     dump_case("spec_chain", "tree", 0.0f, 1.0f, 0, 0);
   }
 
+  // ---- 5. the decoder's trees through the shared builder (DFlash2's tree cycles: kf_build over its tables) ----
+  // A tree cycle's drafting pass: the lattice's tree as the first guess, then passes of decoder steps and the shared
+  // builder (KFlash::encode_tree). Checked against a CPU transcription of kf_build over the decoder's final children
+  // tables: the rows (parent, token, log q, path score), the rows built and the live rows the size rule takes; the
+  // tables against the decoder's scores (ch_*); every row's node expanded once the passes stopped early (the tree is
+  // then the best-first tree over the decoder's probabilities). The decoder rows are dumped for kflash_ref.py.
+  {
+    auto lcal = [](float lq, float a, float b) {
+      const float q = std::min(std::exp(lq), 0.999999f);
+      const float z = a + b * (lq - std::log(1.0f - q));
+      const float x = -z;
+      return -(x > 20.0f ? x : std::log(1.0f + std::exp(x)));
+    };
+    const bool was_tree = dr.tree();
+    if (!was_tree) dr.set_tree(true);
+    // D: the descriptor the passes left, kp: the builder's parameters
+    auto verify_tree = [&](const char* name, const int* D, const KfParams& kp, const SamplingParams& sp) {
+      const KFlashTree& T = kf->tree_host();
+      const int K = KFlashTree::kCand;
+      const float* clq = kf->tree_clq().as<float>();
+      const int* ctok = kf->tree_tok().as<int>();
+      const int* cnext = kf->tree_next().as<int>();
+      const int R = std::clamp(kp.max_rows, 1, int(kf::kMaxRows));
+      // the CPU builder
+      struct Fe {
+        float s, lq;
+        int par, crow, c;
+        bool taken;
+      };
+      std::vector<Fe> f;
+      for (int c = 0; c < K; ++c) f.push_back({lcal(clq[c], kp.alpha[1], kp.beta[1]), clq[c], 0, 0, c, false});
+      std::vector<int> rpar = {-1}, rdep = {0}, rtok = {s.tokens()[P]};
+      std::vector<float> rlq = {0.0f}, rsc = {0.0f};
+      float gap = 1e9f;
+      for (int r = 1; r < R; ++r) {
+        int bi = -1;
+        for (int i = 0; i < int(f.size()); ++i)
+          if (!f[size_t(i)].taken && f[size_t(i)].s > -INFINITY && (bi < 0 || f[size_t(i)].s > f[size_t(bi)].s)) bi = i;
+        if (bi < 0) break;
+        for (int i = 0; i < int(f.size()); ++i)
+          if (i != bi && !f[size_t(i)].taken && f[size_t(i)].s > -INFINITY)
+            gap = std::min(gap, std::fabs(f[size_t(bi)].s - f[size_t(i)].s));
+        f[size_t(bi)].taken = true;
+        const Fe b = f[size_t(bi)];
+        const int dep = rdep[size_t(b.par)] + 1;
+        rpar.push_back(b.par);
+        rdep.push_back(dep);
+        rtok.push_back(ctok[b.crow * K + b.c]);
+        rlq.push_back(b.lq);
+        rsc.push_back(b.s);
+        const int nx = cnext[b.crow * K + b.c];
+        if (nx >= 0 && r + 1 < R) {
+          const int di = std::min(dep + 1, int(kf::kMaxRows));
+          for (int c2 = 0; c2 < K; ++c2)
+            f.push_back({b.s + lcal(clq[nx * K + c2], kp.alpha[di], kp.beta[di]), clq[nx * K + c2], r, nx, c2, false});
+        }
+      }
+      const int m = int(rpar.size());
+      int n = 0;
+      {
+        float E = 1.0f, best = -1.0f;
+        for (int nn = 1; nn <= m; ++nn) {
+          if (nn > 1) E += std::exp(rsc[size_t(nn - 1)]);
+          if (((kp.allowed >> (nn - 1)) & 1u) && E / kp.cost[nn] > best) {
+            best = E / kp.cost[nn];
+            n = nn;
+          }
+        }
+        if (kp.force_n > 0) n = std::min(kp.force_n, m);
+        if (n == 0) n = m;
+      }
+      int bad_rows = 0, bad_tab = 0, unexpanded = 0, expanded = 0;
+      bool near_tie = gap < 1e-4f;
+      if (D[kf::kNodes] != m || D[kf::kN] != n) ++bad_rows;
+      for (int r = 1; r < std::min(m, D[kf::kNodes]); ++r) {
+        float lq, sc;
+        const int dl = D[kf::kLq + r], ds2 = D[kf::kScore + r];
+        memcpy(&lq, &dl, 4);
+        memcpy(&sc, &ds2, 4);
+        if (D[kf::kPar + r] != rpar[size_t(r)] || D[kf::kDep + r] != rdep[size_t(r)] ||
+            s.tokens()[P + r] != rtok[size_t(r)] || lq != rlq[size_t(r)] ||
+            std::fabs(sc - rsc[size_t(r)]) > 1e-4f * std::max(1.0f, std::fabs(sc)))
+          ++bad_rows;
+      }
+      // when the passes stopped early, every row's node (its parent row's node's child with the row's token) exists
+      // and, above the last block row, was expanded
+      const bool early = int(T.walk_passes) < std::clamp(kf->passes() > 0 ? kf->passes() : 7, 1, 16);
+      std::vector<int> node(size_t(m), -1);
+      node[0] = 0;
+      for (int r = 1; r < m && early; ++r) {
+        const int pn = node[size_t(D[kf::kPar + r])];
+        for (uint32_t i = 1; i < T.n_nodes && pn >= 0; ++i)
+          if (T.parent[i] == pn && T.token[i] == s.tokens()[P + r]) node[size_t(r)] = int(i);
+        if (node[size_t(r)] < 0) ++unexpanded;
+        else if (T.depth[node[size_t(r)]] < 7) unexpanded += !T.expanded[node[size_t(r)]];
+      }
+      for (uint32_t i = 0; i < T.n_nodes; ++i) {
+        if (!T.expanded[i]) continue;
+        ++expanded;
+        for (int c = 0; c < K; ++c) {
+          const int o = int(i) * K + c;
+          const float src = sp.temperature > 0 ? T.ch_q[o] : T.ch_a[o];
+          int nx = -1;
+          for (uint32_t j = 1; j < T.n_nodes && nx < 0; ++j)
+            if (T.parent[j] == int(i) && T.token[j] == T.ch_tok[o] && T.expanded[j]) nx = int(j);
+          if (ctok[o] != T.ch_tok[o] || cnext[o] != nx ||
+              std::fabs(clq[o] - std::max(std::log(src), -80.0f)) > 1e-5f * std::max(1.0f, std::fabs(clq[o])))
+            ++bad_tab;
+        }
+      }
+      const bool ok = (bad_rows == 0 || near_tie) && bad_tab == 0 && (!early || unexpanded == 0);
+      printf("[%s] decoder tree: %d rows built, %d live, %u pass%s, %d nodes expanded; builder = CPU reference%s, "
+             "tables = decoder scores, %s: %s\n",
+             name, D[kf::kNodes], D[kf::kN], T.walk_passes, T.walk_passes == 1 ? "" : "es", expanded,
+             bad_rows ? (near_tie ? " (a near-tie ordered differently)" : " NO") : "", bad_tab ? "NO" : "yes",
+             early ? (unexpanded ? "rows left unexpanded" : "every row's node expanded") : "pass cap reached",
+             ok ? "PASS" : "FAIL");
+      fails += !ok;
+    };
+    auto tree_case = [&](const char* name, const SamplingParams& sp) {
+      if (!dr.tree()) {
+        printf("[%s] skipped: no tree verify on this target\n", name);
+        return;
+      }
+      auto e = g.begin();
+      dr.encode_cycle_draft(*e, s, ds, P, 0, sp);
+      e->commit_and_wait();
+      KfParams kp{};
+      dr.budget()->write(kp);
+      verify_tree(name, dr.tree_desc(), kp, sp);
+    };
+    tree_case("tree_dec_greedy", greedy);
+    dump_case("tree_dec_greedy", "tree", 0.0f, 1.0f, 0, 0);
+    tree_case("tree_dec_sampled", samp);
+    dump_case("tree_dec_sampled", "tree", temp, temp, seed, 1);
+    if (!was_tree) dr.set_tree(false);
+
+    // ---- 6. a 31-node decoder tree grown from the anchor alone (32 rows: the descriptor's and builder's capacity;
+    // the verifies run 8 rows today, so DFlash2's budget does not allow 32 yet): uncalibrated, every row count costing
+    // the same and only 32 rows allowed ----
+    Buffer desc = g.alloc(size_t(kf::kWords) * 4, "t_desc"), live = g.alloc(16, "t_live");
+    for (int t = 0; t < 2; ++t) {
+      const SamplingParams& sp = t ? samp : greedy;
+      int* D = desc.as<int>();
+      memset(D, 0, desc.size);
+      D[kf::kNodes] = 1;
+      D[kf::kN] = 1;
+      D[kf::kPar] = -1;
+      D[kf::kMask] = 1;
+      KfParams kp{};
+      for (int i = 0; i <= kf::kMaxRows; ++i) {
+        kp.alpha[i] = 0.0f;
+        kp.beta[i] = 1.0f;
+        kp.cost[i] = 1.0f;
+      }
+      kp.allowed = 1u << 31;
+      kp.max_rows = kf::kMaxRows;
+      auto e = g.begin();
+      dr.encode_draft_sel(*e, s, ds, P, sp, 2);
+      kf->encode_tree_passes(*e, s.tok, uint32_t(P), kf->tree(), sp, desc, live, kp);
+      e->commit_and_wait();
+      verify_tree(t ? "tree31_sampled" : "tree31_greedy", D, kp, sp);
+      dump_case(t ? "tree31_sampled" : "tree31_greedy", "tree", t ? temp : 0.0f, t ? temp : 1.0f, t ? seed : 0, t);
+    }
+  }
+
   if (!out.empty()) {  // the decoder's 4-bit weights as the engine quantized them
     const std::string wd = out + "/weights";
     mkdir(wd.c_str(), 0755);

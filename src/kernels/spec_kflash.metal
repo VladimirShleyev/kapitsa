@@ -14,7 +14,7 @@
 //   acceptance row r (0: greedy, 1: sampled): sigmoid(<w_y[r], y> + <w_e[r], E_out[c] / rms(E_out[c])>
 //                                                     + w_q[r] log softmax(S)[k] + b[r])
 // One decoder step expands up to 8 front nodes as the rows of the drafter's 8-row GEMMs (dfl_qmm8, dfl_qmm8_gu); the
-// node K/V rows stay in kv [64 nodes][layers][K | V][d] (fp32), written when the node is expanded and read by its
+// node K/V rows stay in kv [128 nodes][layers][K | V][d] (fp32), written when the node is expanded and read by its
 // descendants. A front may hold a node together with some of its descendants (a speculated chain or subtree whose
 // tokens the builder picked from the candidates before their scores exist): the attention then takes those
 // ancestors' K/V from the step's own q|k|v rows (tree-causal attention), so every row is still conditioned on exactly
@@ -22,7 +22,7 @@
 // The file sorts after spec_dflash.metal in the embedded library (dfl_put2, dfl_uniform, dfl_pos, kDflSaltWalk).
 
 constant constexpr uint kKfCand = 32;
-constant constexpr uint kKfMaxNodes = 64;
+constant constexpr uint kKfMaxNodes = 128;  // room for a 31-node tree's passes (nodes stay once mapped)
 constant constexpr uint kKfMaxFront = 8;
 constant constexpr uint kKfMaxDepth = 16;
 
@@ -577,4 +577,105 @@ NI_INLINE void kf_simd_top32(thread float* v, thread uint* id, uint lane, thread
   ov[o] = bv;
   oi[o] = bi;
   if (map) tok[o] = map == 1 ? int(head_ids[bi]) : int(bi);
+}
+
+// ---- the decoder's trees: the shared builder (src/kernels/kflash.h kf_build) over the decoder's own probabilities ----
+// A tree cycle's drafting pass: the shared builder takes a first tree from the drafter's lattice into the shared
+// descriptor; then each pass maps the descriptor's rows onto decoder nodes (kf_tree_next), expands the rows' nodes
+// that are not expanded yet in one decoder step, writes the decoder's children tables (kf_dtab) and has the builder
+// take the tree again from them. A tree whose every node is expanded is final: it is the builder's best-first tree
+// over the decoder's probabilities (every node it took had its children scored); later passes are skipped.
+
+// The descriptor's rows built -> decoder nodes, and the next pass's front. Row 0 is node 0 (the anchor); row r's node
+// is its parent row's node's child with token tokens[P + r] (appended when new; a row whose node does not fit, and its
+// descendants, are left out). The front: the first rows' nodes (in row order, so every ancestor comes first) that are
+// not expanded yet and sit above maxdep, up to 8. Writes this pass's indirect dispatch arguments (nslot x 3 uints: the
+// decoder step's slots, kf_dtab's, kf_build's): full ones while the front is non-empty, else zero threadgroups. init
+// (the first pass): the decoder tree restarts from the anchor alone. grid 1 x 32.
+struct KfTreeNextParams {
+  uint P;       // anchor position (kDflGpu: the drafter state's)
+  uint init;
+  uint maxdep;  // the depth of the block's last row: its nodes have no decoder row
+  uint nslot;
+};
+[[kernel]] void kf_tree_next(device KFlashTree* t [[buffer(0)]], const device int* desc [[buffer(1)]],
+                             const device int* tokens [[buffer(2)]], constant KfTreeNextParams& p [[buffer(3)]],
+                             const device uint* gst [[buffer(4)]], const device uint* full [[buffer(5)]],
+                             device uint* args [[buffer(6)]], uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup uint nf_out;
+  if (lane == 0) {
+    const uint P = dfl_pos(p.P, gst);
+    if (p.init) {
+      t->n_nodes = 1;
+      t->P = P;
+      t->walk_passes = 0;
+      t->parent[0] = -1;
+      t->token[0] = tokens[P];
+      t->depth[0] = 0;
+      t->cand_k[0] = -1;
+      t->logp[0] = 0.0f;
+      t->acc[0] = 1.0f;
+      t->expanded[0] = 0;
+      t->row[0] = 0;
+    }
+    int map[kKfMaxRows];
+    map[0] = 0;
+    uint nn = t->n_nodes, nf = 0;
+    const uint m = clamp(uint(desc[kKfNodes]), 1u, kKfMaxRows);
+    for (uint r = 1; r < m; ++r) {
+      const int pr = desc[kKfPar + r];
+      const int pn = pr >= 0 && uint(pr) < r ? map[pr] : -1;
+      int id = -1;
+      if (pn >= 0) {
+        const int tok = tokens[P + r];
+        for (uint i = 1; i < nn && id < 0; ++i)
+          if (t->parent[i] == pn && t->token[i] == tok) id = int(i);
+        if (id < 0 && nn < kKfMaxNodes) {
+          id = int(nn++);
+          t->parent[id] = pn;
+          t->token[id] = tok;
+          t->depth[id] = t->depth[pn] + 1;
+          t->cand_k[id] = -1;
+          t->logp[id] = 0.0f;
+          t->acc[id] = 0.0f;
+          t->expanded[id] = 0;
+        }
+        if (id >= 0) t->row[id] = int(r);
+      }
+      map[r] = id;
+    }
+    t->n_nodes = nn;
+    for (uint r = 0; r < m && nf < kKfMaxFront; ++r) {
+      const int id = map[r];
+      if (id >= 0 && !t->expanded[id] && uint(t->depth[id]) < p.maxdep) t->front[nf++] = uint(id);
+    }
+    t->n_front = nf;
+    if (nf) t->walk_passes += 1;
+    nf_out = nf;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint i = lane; i < p.nslot * 3; i += 32) args[i] = nf_out ? full[i] : 0u;
+}
+
+// The decoder's children tables for the shared builder: row n = decoder node n (expanded nodes only), entry c = its
+// candidate c: clq the log of the child's probability (use_acc: the acceptance head's ch_a, else ch_q; floored at -80),
+// ctok its token, cnext the child's node id when the decoder has expanded that child (its own row), else -1 (a leaf).
+// grid kKfMaxNodes x 32.
+struct KfDtabParams {
+  uint use_acc, pad;
+};
+[[kernel]] void kf_dtab(const device KFlashTree* t [[buffer(0)]], device float* clq [[buffer(1)]],
+                        device int* ctok [[buffer(2)]], device int* cnext [[buffer(3)]],
+                        constant KfDtabParams& p [[buffer(4)]], uint n [[threadgroup_position_in_grid]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+  const uint nn = t->n_nodes;
+  if (n >= nn || !t->expanded[n]) return;
+  const uint o = n * kKfCand + lane;
+  const int tok = t->ch_tok[o];
+  clq[o] = max(metal::precise::log(p.use_acc ? t->ch_a[o] : t->ch_q[o]), -80.0f);
+  ctok[o] = tok;
+  int nx = -1;
+  for (uint m = 1; m < nn && nx < 0; ++m)
+    if (t->parent[m] == int(n) && t->token[m] == tok && t->expanded[m]) nx = int(m);
+  cnext[o] = nx;
 }

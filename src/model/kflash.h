@@ -3,9 +3,11 @@
 // selector. Loads <model>/kflash in the trainer's format (M2's README: bf16 projections, quantized at
 // load to 4-bit group 64 with mx.quantize's rounding as the DFlash2 drafter's; the embedding norm, per-row logit
 // scales and the two-row acceptance head as stored), keeps the drafting tree on the GPU (KFlashTree) and encodes decoder
-// steps over the tree's front nodes. Kernels in src/kernels/spec_kflash.metal.
+// steps over the tree's front nodes. Kernels in src/kernels/spec_kflash.metal. Its trees go through the shared KFlash
+// builder and descriptor (src/kernels/kflash.h, encode_tree); its chain walk drafts where a chain is verified.
 // Opt-in: DFlash2 constructs one only with NI_KFLASH set (see KFlash::find).
 #pragma once
+#include "model/kflash_budget.h"
 #include "model/qwen35.h"
 
 #include <deque>
@@ -45,6 +47,14 @@ struct KfSoft {
   uint32_t seed, qt, maxdep, walk;
   uint32_t out_bits;
 };
+
+struct KfTreeNext {
+  uint32_t P, init, maxdep, nslot;
+};
+
+struct KfDtab {
+  uint32_t use_acc, pad;
+};
 }  // namespace kp
 
 // The drafting tree on the GPU, shared by the decoder step and the tree builder (a chain walk or the budgeted tree).
@@ -53,7 +63,7 @@ struct KfSoft {
 // j + 1 with their scores (ch_*[node * 32 + k]). Node ids are allocated in order; ancestors are expanded before
 // descendants. Mirrors KFlashTree in spec_kflash.metal.
 struct KFlashTree {
-  static constexpr int kCand = 32, kMaxNodes = 64, kMaxFront = 8;
+  static constexpr int kCand = 32, kMaxNodes = 128, kMaxFront = 8;
   uint32_t n_nodes;             // nodes in the tree
   uint32_t n_front;             // nodes the next decoder step expands (<= kMaxFront)
   uint32_t front[kMaxFront];    // their ids
@@ -75,7 +85,7 @@ struct KFlashTree {
   float ch_q[kMaxNodes * kCand];  // softmax(S / T_q)
   float ch_a[kMaxNodes * kCand];  // acceptance head
 };
-static_assert(sizeof(KFlashTree) == 4 * (16 + 8 * 64 + 4 * 64 * 32), "KFlashTree layout");
+static_assert(sizeof(KFlashTree) == 4 * (16 + 8 * 128 + 4 * 128 * 32), "KFlashTree layout");
 
 struct KFlashConfig {
   int d = 1024, NL = 2, nh = 8, hd = 128, I = 2816, H = 0, vocab = 0, ncand = 32, max_pos = 16;
@@ -153,6 +163,30 @@ class KFlash {
                     const Buffer& cand_col, const Buffer& cand_v, float qtemp, int acc_row, const KFlashWalk& walk,
                     int passes);
   static constexpr int kSlots = 9;  // distinct dispatch shapes of a step (encode_step's indirect argument block)
+  // ---- trees (the shared KFlash design: descriptor, builder kf_build and budget, src/kernels/kflash.h) ----
+  // The end of a tree cycle's drafting pass, after the shared builder took a first tree from the drafter's lattice
+  // into desc (and its tokens): the top-32 and W_h h as encode_draft, then passes that each map the tree's rows onto
+  // decoder nodes, expand the ones not expanded yet (up to 8, ancestors first) in one decoder step, and have the
+  // builder take the tree again from the decoder's children tables: rows = decoder nodes, children = the 32
+  // candidates of the next block row with the log of the greedy acceptance head (T = 0) or of q = softmax(S / T)
+  // (T > 0), a child expandable once the decoder expanded it. NI_KFLASH_PASSES passes at most (default 7); passes
+  // after every node of the tree is expanded are skipped (indirect dispatches of zero threadgroups): the tree is then
+  // the builder's best-first tree over the decoder's own probabilities. kp: the budget's parameters (calibration,
+  // costs, row counts) as for the lattice; Pk = 0xffffffff: the anchor from the drafter state (kf_build_gpu).
+  // The tree's acceptance (kf_accept) is exact whatever the tree, so the decoder only decides its shape.
+  void encode_tree(Encoder& e, const Buffer& logits, const Buffer& xh, const Buffer& xs, const Buffer& tokens,
+                   uint32_t Pk, const Buffer& gst, const SamplingParams& sp, const Buffer& desc, const Buffer& live,
+                   const KfParams& kp);
+  // encode_tree's passes alone (tests: after a pass that already took the top-32 and W_h h; desc may hold any first
+  // tree, the anchor alone included)
+  void encode_tree_passes(Encoder& e, const Buffer& tokens, uint32_t Pk, const Buffer& gst, const SamplingParams& sp,
+                          const Buffer& desc, const Buffer& live, const KfParams& kp);
+  static constexpr int kTreeSlots = kSlots + 2;  // a tree pass's dispatch shapes: the step's, kf_dtab, kf_build
+  // the children tables of the last tree pass (tests): clq float, ctok / cnext int, [kMaxNodes][kCand]
+  Buffer tree_clq() const { return t_clq_; }
+  Buffer tree_tok() const { return t_tok_; }
+  Buffer tree_next() const { return t_next_; }
+  int passes() const { return passes_; }
   const QLinear* weight(const std::string& name) const {
     auto it = named_.find(name);
     return it == named_.end() ? nullptr : it->second;
@@ -201,6 +235,8 @@ class KFlash {
   // speculative passes: the full indirect arguments of a step (kSlots x 3 uints, filled at encode time) and one
   // argument block per pass (kf_jac writes the next pass's)
   Buffer full_args_, pass_args_;
+  // trees: the decoder's children tables for the shared builder and one argument block per pass (kf_tree_next)
+  Buffer t_clq_, t_tok_, t_next_, tree_args_;
   // bind_drafter: the top-32 (ids, draft-head columns, logits), its staging, the chain walk's q and scores
   const Buffer* head_ids_ = nullptr;
   uint32_t vd_ = 0;
