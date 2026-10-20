@@ -152,10 +152,21 @@ offline replay says why. Over the 48 unseen agent turns, the decoder chain's gai
 | 150-300 tokens | 7 | 3.022 | 3.402 (+12.6%) |
 | over 300 tokens | 8 | 4.079 | 4.210 (+3.2%) |
 
-Over all 48 unseen agent turns (M3's run on origin/kflash, trees ranked by q at its default pass cap of 3; A = the
-lattice's best-first tree, arm order rotated per turn, budget caches warming across turns, every arm identical to plain
-decoding), decode tok/s, B vs A: answers under 150 tokens +16.8%, 150-300 +3.8%, over 300 +0.9%; all 48 turns +8.7%;
-weighted like the opencode session (10 of 15 turns under 150 tokens) +8.4%. Tokens per cycle 3.045 -> 3.444 (+13.1%).
+Over all 48 unseen agent turns, each decoded to its exact answer length (M3's run on origin/kflash, trees ranked by q,
+A = the lattice's best-first tree, B = the decoder's tree at pass caps 1 / 3 (3 is the default), arm order rotated per
+turn, per-arm budget caches warming across turns), session totals over 8069 tokens:
+
+| | A: lattice tree | B, cap 1 | B, cap 3 |
+| --- | --- | --- | --- |
+| cycles | 2415 | 2127 | 2063 |
+| tokens per cycle | 3.341 | 3.794 (+13.6%) | 3.911 (+17.1%) |
+| decode time | 47.05 s | 42.20 s (-10.3%) | 41.46 s (-11.9%) |
+| decode tok/s | 171.5 | 191.2 (+11.5%) | 194.6 (+13.5%) |
+
+By answer length (cap 3 vs A, tok/s): under 150 tokens +28.4%, 150-300 +2.9%, over 300 +4.3%; weighted like the
+opencode session (10 of 15 turns under 150 tokens) +12.9%. The +17.1% tokens per cycle is exactly the offline replay's
+number for this set. Every output equals plain decoding except two near-ties (logit gaps 0.0021-0.0022): one where the
+recorded answer itself came from a slightly different numeric path, one where the tree verify takes the other token.
 
 So what the decoder learned is the harness's tool-call syntax (tags, parameter names, paths and values copied from the
 context), which DFlash v1 drafts badly; prose and code inside long turns gain about what new code does, nothing. A
@@ -165,8 +176,8 @@ it is withdrawn.
 ## Next
 
 - The decision: on coding-agent turns the decoder clears the bar offline (+21-24% accepted tokens per cycle over
-  calibrated v1 trees on unseen turns) and gives +8.4% decode speed for a session's mix of turns in the engine, but the
-  gain is the tool-call syntax (+17% speed on tool-call turns, +1-4% on long ones); on everything else it adds nothing
+  calibrated v1 trees on unseen turns) and gives +12.9% decode speed for a session's mix of turns in the engine, but the
+  gain is the tool-call syntax (+28% speed on tool-call turns, +3-4% on long ones); on everything else it adds nothing
   (code -2 to -4% speed for its 0.8 ms of drafting per cycle), and over the mixed held-out set it stays under the bar
   (+3-7%). As trained here it is a tool-call specialist, not a better drafter.
 - Data, not passes: the training loss on seen sequences fell to a third of the held-out loss. More distinct code, chat
