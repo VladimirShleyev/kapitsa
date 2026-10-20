@@ -88,42 +88,27 @@ Trees of 7 nodes vs `main`, interleaved, M4 Pro 48 GB:
 ## Open items
 
 1. Dynamic MoE trees: done (`4fc87d0`). Optional: the 35B's sampled exactness check and more sampled seeds.
-2. **Greedy replies on MoE with dynamic trees: two fixes written, not yet run (no Mac with a GPU was at hand).**
+2. **Greedy replies on MoE with dynamic trees: two fixes verified on the M4 Pro, one residual gap open.**
    - The bug: on the Qwen3.6-35B, `kapitsa serve` failed `tests/test_server.py` "a request alone gives the same reply
-     every time (greedy)" with dynamic trees and passed with `NI_KFLASH=0`: the tree's size and shape follow the
-     budget's learned state, which changes between requests.
-   - Why the 35B and not the dense models: its router's top-8 flips on a last-bit difference between two rows of the
-     same path, where a dense model's greedy token rarely does. So the tree verify must give a path's rows
-     bit-identical logits in every tree, not just equal tokens in the usual case. Row-independent expert numerics
-     (the commit after `4fc87d0`) were necessary, not sufficient. Two more places gave a path's row different bits
-     depending on the tree around it (found by reading the kernels; the layer-by-layer bisection was not run):
-     - **Attention (`attn8m_partial_tree`).** The tree block's keys sat in the MMA tiles at their slots: which
-       32-key tile a key falls in, its column (the lanes' partial sums of the softmax denominator are added in an
-       order that follows the column), so the same path's softmax rounded differently in trees that put its rows in
-       other slots. Now the MMA tiles take the history alone (`attn8m_partial_hist`: keys < pos, tiles follow pos
-       only) and a new kernel (`attn8_tree_block`, one simdgroup per row and head) takes the block's keys, a
-       row's ancestors and itself in root-to-leaf order with fp32 scores and sums, as one more partial chunk that
-       `attn_rows_reduce` combines. `NI_V8_TREE_ATTN=0` restores the old kernel.
-     - **GDN tree step (`gdn_step_verify8s_tree`).** A row whose parent is not the row before it replays its
-       ancestors' updates from the base state (`st g + k d`), a row in sequence continues from the previous row's
-       state (`st g`, then `+ k d` after the dot), and the previous cycle's accepted rows are folded in with the
-       replay's form. With fast math the compiler may fuse these differently, so the same row got a state differing
-       in the last bit depending on whether the tree reached it in sequence or by a jump. All three now end in one
-       explicit fused multiply-add (`gdn_update`). `NI_V8_TREE_PIN=0` restores the old code.
-   - Not suspects after reading: the conv window (exact selects), the MoE plan and expert passes (row-independent
-     with `NI_DFLASH_EXACT_MOE`; the MMA tiles' rows are independent of their index, as `moe8e` relies on), the
-     live-row limit (every row-scaled kernel skips only dead rows), the K/V compaction and the tape fold (the same
-     bits as the rows' own).
-   - **To check on a Mac:** `tools/kflash_invariance.py <35B model dir>` runs `ni_run` greedy with the tree forced to
-     sizes 1, 3, 5, 8 and every size in turn (`NI_KFLASH_FORCE`); the ids must be equal. With the `--env` switches
-     above (`NI_V8_TREE_ATTN=0`, `NI_V8_TREE_PIN=0`) it shows which fix mattered. Then `tests/test_server.py` as
-     before. If the ids still differ, the first differing token tells where to look: force 1 against force 8
-     separates a slot or shape effect (rows at slot 0 against slots 0..7) from a size effect (try `--sizes 7,8`);
-     comparing one fixed path's row logits layer by layer (as `nh_tree_check` does for Nemotron) is still the
-     way to the exact layer, and nothing here replaces it if the check fails.
-   - The kernels were only syntax-checked off the Mac (the host files compile; the Metal source compiles at run time),
-     and the speed of the extra attention dispatch (10 layers, one simdgroup per row and head) was not measured.
-   - Fallback if the check still fails: default MoE targets to the chain (`NI_KFLASH=1` keeps the dynamic trees).
+     every time (greedy)" with dynamic trees and passed with `NI_KFLASH=0`. The tree's size and shape follow the
+     budget's learned state, and the 35B's router flips its top-8 on a last-bit difference between two rows of
+     the same path.
+   - The fixes (`fd9b6a9`):
+     - attention takes the tree block's keys in path order, as their own chunk (`attn8_tree_block`);
+     - the GDN tree step ends in one explicit fused update (`gdn_update`);
+     - plus row-independent expert numerics at every temperature (`0b52781`).
+   - Verified on the M4 Pro, 2026-10-20:
+     - server suite on the 35B: all pass, including "same reply every time (greedy)";
+     - `dflash_accept_test`: all pass;
+     - `nh_tree_check`: all pass;
+     - 4B and 27B greedy: identical to plain decoding;
+     - cost: about +1% GPU time per cycle (4B 16.85 -> 17.03 ms, 35B 21.0 -> 21.3 ms), within noise in tok/s.
+   - **Residual gap:** `tools/kflash_invariance.py` on the 35B (192 tokens) matches with the tree forced to 1 and
+     3 rows, but sizes 5, 8 and cycling all differ from size 1 at generated token 177 (5460 vs 1851). So something
+     still depends on how many live rows there are past a threshold between 3 and 5. A likely place is the expert
+     passes, if their path switches with how many rows share an expert. Next: `--sizes 1,2,3,4,5,6,7,8` to find the
+     threshold, then compare one row's logits layer by layer.
+   - Fallback if it can't be closed: default MoE targets to the chain (`NI_KFLASH=1` keeps the dynamic trees).
 3. Nemotron speed: tree vs chain on Lightning. This needs the 23 GB model; the user said not to download it for now.
 4. 16/32-row verifies: the interleaved A/B is deferred; decide whether they join `kflash-trees`.
 5. Merging to `main` waits for the user. `main` has moved on, so bring the branch up to date first, then rerun the
