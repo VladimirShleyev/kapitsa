@@ -2041,8 +2041,10 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
         lili_->encode_draft(*next, s, d, P);
         next->commit();
       }
-      // the drafting half starts on the GPU while the host encodes the verify half
-      next.reset();
+      // the drafting half starts on the GPU while the host encodes the verify half; its encoder is released after the
+      // verify's wait (released right after its commit, a pass in flight, the host stalled: Bolt's harness decode on
+      // the M5 Max 137 -> 160 tok/s at T = 0.6, 155 -> 165 greedy; nh_eval holds it so too)
+      const std::unique_ptr<Encoder> drafting = std::move(next);
       auto e2 = nh_->grouped_passes() ? g.begin_grouped() : g.begin();
       lili_->arm_verify(P);
       nh_->set_dynamic_rows(true);  // the drafter's pass chose how many of the block's rows to verify
