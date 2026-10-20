@@ -268,6 +268,131 @@ class OnlineCalib:
             self.ll[p][g] += z[k[0]] - np.log(np.exp(z).sum())
 
 
+class KfCalib:
+    """The shared KFlash calibration (src/model/kflash_budget.cpp, KfBudget): the probability that the target accepts a
+    node of depth d whose drafter probability is q is sigmoid(alpha_d + beta_d logit(q)), fitted online per depth
+    (L2-regularized logistic regression toward alpha 0, beta 1, Newton steps on the last 2048 records, every 16 cycles
+    once a depth holds 32 records) from the records of every cycle: each tree node whose parent is on the accepted path,
+    and whether it was accepted. Before any records p = q (the drafter's own probabilities)."""
+
+    WIN, EVERY, MIN_REC, ITERS = 2048, 16, 32, 4
+
+    def __init__(self):
+        self.alpha = np.zeros(8)
+        self.beta = np.ones(8)
+        self.x = [[] for _ in range(8)]
+        self.y = [[] for _ in range(8)]
+        self.head = [0] * 8
+        self.since = 0
+
+    @staticmethod
+    def logit_q(lq):
+        q = min(np.exp(lq), 0.999999)
+        return lq - np.log1p(-q)
+
+    @staticmethod
+    def fit(x, y, a, b, iters):
+        lam = 1.0
+        x = np.asarray(x, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+        for _ in range(iters):
+            z = a + b * x
+            p = 1.0 / (1.0 + np.exp(-z))
+            w = p * (1.0 - p)
+            r = p - y
+            ga, gb = lam * a + r.sum(), lam * (b - 1.0) + (r * x).sum()
+            haa, hab, hbb = lam + w.sum(), (w * x).sum(), lam + (w * x * x).sum()
+            det = haa * hbb - hab * hab
+            if not det > 1e-12:
+                break
+            da, db = (hbb * ga - hab * gb) / det, (haa * gb - hab * ga) / det
+            a = float(np.clip(a - da, -8.0, 8.0))
+            b = float(np.clip(b - db, 0.1, 4.0))
+            if abs(da) + abs(db) < 1e-4:
+                break
+        return a, b
+
+    def prob(self, rec, p, pk):
+        """calibrated acceptance probabilities of the 16 candidates at children position p (depth p + 1)"""
+        s = cond_logits(rec, p, pk)
+        lq = np.log(np.maximum(softmax(s, 1.0), 1e-30))
+        z = self.alpha[p + 1] + self.beta[p + 1] * np.array([self.logit_q(v) for v in lq])
+        return 1.0 / (1.0 + np.exp(-z))
+
+    def observe(self, records):
+        """records: [(depth 1..7, log q, hit)] of one cycle"""
+        for d, lq, hit in records:
+            if not 1 <= d <= 7:
+                continue
+            x = self.logit_q(lq)
+            if len(self.x[d]) < self.WIN:
+                self.x[d].append(x)
+                self.y[d].append(hit)
+            else:
+                self.x[d][self.head[d]] = x
+                self.y[d][self.head[d]] = hit
+                self.head[d] = (self.head[d] + 1) % self.WIN
+        self.since += 1
+        if self.since >= self.EVERY:
+            self.since = 0
+            for d in range(1, 8):
+                if len(self.x[d]) >= self.MIN_REC:
+                    self.alpha[d], self.beta[d] = self.fit(self.x[d], self.y[d], self.alpha[d], self.beta[d], self.ITERS)
+
+
+def replay_kf(run, calib, budget=7, max_tok=None, sizes=None, cost=None):
+    """replay() with the shared calibration (KfCalib): each cycle's tree from the calibration so far; the cycle's records
+    (every tree node whose parent is on the accepted path; hit = on it) teach it. sizes / cost: the verify's allowed row
+    counts and their cost (ms): the rows used are the n with the most expected tokens per ms, E(n) = 1 + the summed
+    calibrated path probabilities of the first n - 1 nodes (default: all budget + 1 rows)."""
+    P, cycles, toks = run.P0, 0, 0
+    lim = run.end - 8 if max_tok is None else min(run.end - 8, run.P0 + max_tok)
+    ns = []
+    while P <= lim and P in run.by_P:
+        rec = run.recs[run.by_P[P]]
+        nodes, _ = best_first(rec, budget, calib.prob)
+        # path probabilities in insertion order (best-first: a prefix is the best tree of its size)
+        n = len(nodes) + 1
+        if sizes is not None:
+            pp = []
+            for i, (par, d, k, tok) in enumerate(nodes):
+                pk = nodes[par][2] if par >= 0 else -1
+                pr = calib.prob(rec, d, pk if par >= 0 else -1)[k]
+                pp.append((pp[par] if par >= 0 else 1.0) * pr)
+            E = 1.0 + np.cumsum([0.0] + pp)
+            best, n = -1.0, None
+            for m in sizes:
+                if m <= len(nodes) + 1 and E[m - 1] / cost[m] > best:
+                    best, n = E[m - 1] / cost[m], m
+            if n is None:
+                n = min(sizes)
+        use = nodes[: n - 1]
+        cont = run.cont(P, 8)
+        a = accepted(use, cont[:7])
+        # records: nodes whose parent is on the accepted path
+        onpath = {-1}
+        cur = -1
+        for j in range(a):
+            for i, (par, d, k, tok) in enumerate(use):
+                if par == cur and tok == cont[j]:
+                    onpath.add(i)
+                    cur = i
+                    break
+        records = []
+        for i, (par, d, k, tok) in enumerate(use):
+            if par in onpath:
+                pk = use[par][2] if par >= 0 else -1
+                s = cond_logits(rec, d, pk if par >= 0 else -1)
+                lq = float(np.log(max(softmax(s, 1.0)[k], 1e-30)))
+                records.append((d + 1, lq, 1 if i in onpath else 0))
+        calib.observe(records)
+        cycles += 1
+        toks += a + 1
+        ns.append(n)
+        P += a + 1
+    return cycles, toks
+
+
 def replay_online(run, calib, budget=7, max_tok=None):
     """replay() with the online calibration: each cycle's tree from the calibration so far, then the cycle's accepted
     path rows teach it"""
