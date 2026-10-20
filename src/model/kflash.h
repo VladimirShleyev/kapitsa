@@ -169,7 +169,7 @@ class KFlash {
   // decoder nodes, expand the ones not expanded yet (up to 8, ancestors first) in one decoder step, and have the
   // builder take the tree again from the decoder's children tables: rows = decoder nodes, children = the 32
   // candidates of the next block row with the log of q = softmax(S / T) (T = 0: softmax(S)), calibrated per depth by
-  // the budget, a child expandable once the decoder expanded it. NI_KFLASH_PASSES passes at most (default 7); passes
+  // the budget, a child expandable once the decoder expanded it. tree_passes() passes at most (default 3); passes
   // after every node of the tree is expanded are skipped (indirect dispatches of zero threadgroups): the tree is then
   // the builder's best-first tree over the decoder's own probabilities. kp: the budget's parameters (calibration,
   // costs, row counts) as for the lattice; Pk = 0xffffffff: the anchor from the drafter state (kf_build_gpu).
@@ -186,7 +186,11 @@ class KFlash {
   Buffer tree_clq() const { return t_clq_; }
   Buffer tree_tok() const { return t_tok_; }
   Buffer tree_next() const { return t_next_; }
-  int passes() const { return passes_; }
+  // NI_KFLASH_PASSES, or the defaults: the chain walk's speculative passes (7: the sequential walk's chain, bitwise;
+  // 0: single-row steps) and the tree's decoder passes (3: on the trained 4B, agent requests gained as much as with 7,
+  // code lost less)
+  int chain_passes() const { return passes_ < 0 ? 7 : passes_; }
+  int tree_passes() const { return passes_ > 0 ? std::min(passes_, 16) : 3; }
   const QLinear* weight(const std::string& name) const {
     auto it = named_.find(name);
     return it == named_.end() ? nullptr : it->second;
@@ -241,7 +245,7 @@ class KFlash {
   // bind_drafter: the top-32 (ids, draft-head columns, logits), its staging, the chain walk's q and scores
   const Buffer* head_ids_ = nullptr;
   uint32_t vd_ = 0;
-  int passes_ = 7;
+  int passes_ = -1;  // NI_KFLASH_PASSES (-1: unset)
   Buffer c_i_, c_col_, c_v_, w_q_, w_s_, t_v_[2], t_i_[2];
   void enc_top32(Encoder& e, const Buffer& logits);
   bool debug_ = false;

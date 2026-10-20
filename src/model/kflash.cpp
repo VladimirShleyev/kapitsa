@@ -367,8 +367,8 @@ void KFlash::bind_drafter(const QLinear* head, const Buffer* head_ids, uint32_t 
     memset(b->ptr(), 0, b->size);
     resident_ += b->size;
   }
-  // NI_KFLASH_PASSES: speculative passes of the chain walk (default 7 = the sequential walk's result, passes after the
-  // chain is complete skipped); 0 = one single-row decoder step per position
+  // NI_KFLASH_PASSES: the decoder's passes per drafting pass (chain_passes(), tree_passes(): defaults 7 and 3; passes
+  // after the chain is complete or the tree final are skipped); 0 = the chain as one single-row step per position
   if (const char* v = getenv("NI_KFLASH_PASSES")) passes_ = std::max(0, atoi(v));
 }
 
@@ -419,8 +419,8 @@ void KFlash::encode_draft(Encoder& e, const Buffer& logits, const Buffer& xh, co
   w.seed = sp.seed;
   w.qt = walk_tf > 0.0f;
   w.maxdep = 7;
-  if (passes_ > 0) {
-    encode_chain(e, tokens, Pk, gst, c_i_, c_col_, c_v_, tq, sampled ? 1 : 0, w, passes_);
+  if (chain_passes() > 0) {
+    encode_chain(e, tokens, Pk, gst, c_i_, c_col_, c_v_, tq, sampled ? 1 : 0, w, chain_passes());
   } else {
     encode_root(e, tokens, Pk, gst);
     for (int j = 0; j < w.maxdep; ++j) encode_step(e, c_i_, c_col_, c_v_, tq, sampled ? 1 : 0, &w);
@@ -553,7 +553,7 @@ void KFlash::encode_tree_passes(Encoder& e, const Buffer& tokens, uint32_t Pk, c
   // tokens per cycle) and is under-confident (0.75 predicted vs 0.87 accepted at the chain's pick).
   const bool use_acc = false;
   const float tq = sampled ? sp.temperature : 1.0f;
-  const int passes = std::clamp(passes_ > 0 ? passes_ : 7, 1, 16);
+  const int passes = tree_passes();
   const bool gpu = Pk == 0xffffffffu;  // kDflGpu
   uint32_t* full = full_args_.as<uint32_t>();  // kf_dtab: a threadgroup per node; kf_build: one
   full[kSlots * 3 + 0] = kMaxNodes;

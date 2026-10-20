@@ -117,6 +117,9 @@ int main(int argc, char** argv) {
   }
   setvbuf(stdout, nullptr, _IOLBF, 0);
   setenv("NI_KFLASH", kfdir.c_str(), 1);
+  // the tree checks let the decoder's passes run until the tree is final (every row's node expanded); the chain walk
+  // caps its passes at the block's depth anyway
+  setenv("NI_KFLASH_PASSES", "16", 0);
   Gpu& g = Gpu::get();
   std::unique_ptr<Qwen35> tp = load_qwen(mdir, 2048);
   Qwen35& tgt = *tp;
@@ -634,7 +637,7 @@ int main(int argc, char** argv) {
       }
       // when the passes stopped early, every row's node (its parent row's node's child with the row's token) exists
       // and, above the last block row, was expanded
-      const bool early = int(T.walk_passes) < std::clamp(kf->passes() > 0 ? kf->passes() : 7, 1, 16);
+      const bool early = int(T.walk_passes) < kf->tree_passes();
       std::vector<int> node(size_t(m), -1);
       node[0] = 0;
       for (int r = 1; r < m && early; ++r) {
