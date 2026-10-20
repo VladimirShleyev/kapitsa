@@ -1,7 +1,7 @@
 // KFlash candidate decoder (internal/KFLASH.md §1, §4): a small autoregressive decoder that scores the
 // block drafter's top-32 candidates of each position given the whole drafted path, replacing DFlash2's first-order
 // selector. Loads <model>/kflash in the trainer's format (M2's README: bf16 projections, quantized at
-// load to 4-bit group 64 with mx.quantize's rounding as the DFlash2 drafter's; the embedding norm, per-row logit
+// load to 4-bit group 64 with mx.quantize's rounding as the DFlash2 drafter's (NI_KFLASH_BITS=8: 8-bit); the embedding norm, per-row logit
 // scales and the two-row acceptance head as stored), keeps the drafting tree on the GPU (KFlashTree) and encodes decoder
 // steps over the tree's front nodes. Kernels in src/kernels/spec_kflash.metal. Its trees go through the shared KFlash
 // builder and descriptor (src/kernels/kflash.h, encode_tree); its chain walk drafts where a chain is verified.
@@ -209,6 +209,7 @@ class KFlash {
     QLinear qkv, o, gate, up, down;
   };
   int acc_rows_ = 0;  // acceptance-head rows in the checkpoint (0: none)
+  int qbits_ = 4;     // the projections' width at load (NI_KFLASH_BITS)
   const QLinear* out_head_ = nullptr;
   const QLinear* emb_ = nullptr;
   void load_config(const std::string& dir);

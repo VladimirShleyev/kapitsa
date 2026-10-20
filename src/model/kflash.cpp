@@ -136,7 +136,7 @@ QLinear KFlash::quantize(const std::vector<std::vector<const Tensor*>>& blocks, 
     N += uint32_t(blocks[b][0]->shape[0]);
   }
   if (K % 64 || N % 8) fatal("KFlash quantize %s: [%u, %u] not a multiple of (8, 64)", label, N, K);
-  const int bits = 4;
+  const int bits = qbits_;
   const uint32_t wpr = K * bits / 32, gpr = K / 64;
   // horizontally concatenated blocks are copied into `cat` (sized first, so the row pointers stay valid)
   size_t cat_rows = 0;
@@ -190,6 +190,8 @@ QLinear KFlash::quantize(const std::vector<std::vector<const Tensor*>>& blocks, 
 
 KFlash::KFlash(Qwen35& target, const std::string& dir) : tg_(target), dir_(dir) {
   const double t0 = now_ms();
+  // NI_KFLASH_BITS=8: the projections as 8-bit group 64 (twice the bytes a step reads); default 4
+  if (const char* v = getenv("NI_KFLASH_BITS"); v && atoi(v) == 8) qbits_ = 8;
   load_config(dir);
   // the target's embedding rows (node tokens) in any format the engine runs; the candidates' LM-head rows come from a
   // 4 / 8-bit table (set_out_head: DFlash2's draft head, which is one for every target format)

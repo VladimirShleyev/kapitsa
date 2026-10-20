@@ -719,7 +719,8 @@ int main(int argc, char** argv) {
     mkdir(wd.c_str(), 0755);
     for (const std::string& nm : kf->weight_names()) {
       const QLinear* L = kf->weight(nm);
-      save_npy(wd + "/" + nm + ".w.npy", "<u4", {int64_t(L->N), int64_t(L->K / 8)}, L->w->buf.ptr(), size_t(L->N) * L->K / 2);
+      save_npy(wd + "/" + nm + ".w.npy", "<u4", {int64_t(L->N), int64_t(L->K * L->bits / 32)}, L->w->buf.ptr(),
+               size_t(L->N) * L->K * L->bits / 8);
       save_npy(wd + "/" + nm + ".s.npy", "<u2", {int64_t(L->N), int64_t(L->K / 64)}, L->s->buf.ptr(), size_t(L->N) * L->K / 32);
       save_npy(wd + "/" + nm + ".b.npy", "<u2", {int64_t(L->N), int64_t(L->K / 64)}, L->b->buf.ptr(), size_t(L->N) * L->K / 32);
     }
