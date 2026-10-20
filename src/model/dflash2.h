@@ -292,7 +292,7 @@ class DFlash2 {
   float dyn_tau_ = 0.0f;    // T = 0 (0: dynamic depth off)
   float dyn_tau_t_ = 0.0f;  // T > 0
   uint32_t dyn_rule_ = 0;   // dfl_depth rule (NI_DFLASH_DYN_RULE)
-  bool exact_moe_ = true;  // T > 0 on MoE targets: row-independent expert numerics (NI_DFLASH_EXACT_MOE=0 off)
+  bool exact_moe_ = true;  // MoE targets: row-independent expert numerics, tree verifies at every T and the chain's at T > 0 (NI_DFLASH_EXACT_MOE=0 off)
   // KFlash (see tree()): the tree descriptor (int32 [kf::kWords]), the lattice's children tables (clq float
   // [7][16][16], ctok int, the constant successors), the builder's live-row word, the budget
   bool tree_ = false;

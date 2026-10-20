@@ -1588,8 +1588,9 @@ void DFlash2::encode_cycle_verify(Encoder& e, Seq& s, int P, int K, const Sampli
     if (!s.pend_path) s.pend_path = Gpu::get().alloc(size_t(kf::kPathWords) * 4, "pend_path");
     tg_.set_verify_tree(&tree_buf_);
     tg_.set_verify_row_limit(&kf_live_);
-    // at T > 0 a row's logits must not depend on how the other rows route (Qwen35::set_verify_moe_exact)
-    tg_.set_verify_moe_exact(exact_moe_ && sp.temperature > 0);
+    // a row's logits must not depend on how the other rows route (Qwen35::set_verify_moe_exact): at T > 0 for the
+    // acceptance, and greedy too, because the live rows follow the budget's state and a reply must not
+    tg_.set_verify_moe_exact(exact_moe_);
     arm_verify(P);
     tg_.encode_verify(e, s, P, kB, sp, uint32_t(P), /*v8=*/true);
     disarm();
