@@ -88,11 +88,24 @@ Trees of 7 nodes vs `main`, interleaved, M4 Pro 48 GB:
 ## Open items
 
 1. Dynamic MoE trees: done (`4fc87d0`). Optional: the 35B's sampled exactness check and more sampled seeds.
-2. Nemotron speed: tree vs chain on Lightning. This needs the 23 GB model; the user said not to download it for now.
-3. 16/32-row verifies: the interleaved A/B is deferred; decide whether they join `kflash-trees`.
-4. Merging to `main` waits for the user. `main` has moved on, so bring the branch up to date first, then rerun the
+2. **Open bug, owner Alisher: greedy replies on MoE are not repeatable with dynamic trees.**
+   - On the Qwen3.6-35B, `kapitsa serve` fails `tests/test_server.py` "a request alone gives the same reply every
+     time (greedy)" with dynamic trees.
+   - It passes with `NI_KFLASH=0`, so the trees cause it: the tree's size and shape follow the budget's learned
+     state, which changes between requests.
+   - Tried: row-independent expert numerics for tree verifies at every temperature (the commit after `4fc87d0`).
+     Necessary, not sufficient; something else still depends on the tree.
+   - Suspects: the GDN tree step's rebuild of jumping rows from the base state, attention and the shared expert
+     over the live rows only, and the verify's row limit.
+   - How to find it: verify one fixed path inside trees of different sizes and shapes, compare its rows' logits bit
+     for bit (as `nh_tree_check` does for Nemotron), and locate the first layer that differs.
+   - Repro: `kapitsa serve --model qwen3.6-35b-a3b-4bit`, then `python3 tests/test_server.py http://127.0.0.1:<port>`.
+   - Fallback if it can't be fixed quickly: default MoE targets to the chain (`NI_KFLASH=1` keeps the dynamic trees).
+3. Nemotron speed: tree vs chain on Lightning. This needs the 23 GB model; the user said not to download it for now.
+4. 16/32-row verifies: the interleaved A/B is deferred; decide whether they join `kflash-trees`.
+5. Merging to `main` waits for the user. `main` has moved on, so bring the branch up to date first, then rerun the
    checks and a short A/B.
-5. Parked:
+6. Parked:
    - the decoder's measured on/off switch;
    - the online-tuned selector;
    - the 4-bit verify on the M5's matrix units, which needs an M5 in the fleet.
