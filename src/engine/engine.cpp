@@ -416,6 +416,7 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
   const std::string mode = lili_ ? std::string(lili_->name()) + " speculative decoding (7-token blocks)"
                          : nh_ngram_ > 0 ? "prompt-lookup speculative decoding (up to " + std::to_string(nh_ngram_) +
                                                " drafts per cycle)"
+                         : dfl_ && dfl_->tree() ? std::string("DFlash2 speculative decoding (a tree of 7 drafts per cycle)")
                          : dfl_ ? "DFlash2 speculative decoding (verify " + std::to_string(DFlash2::verify_depth()) + " of 7)"
                          : spec_ ? "MTP speculative decoding depth " + std::to_string(opts_.spec_depth)
                          : dory_spec_ > 0 ? "speculative decoding (" +
@@ -2093,6 +2094,9 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
         next_draft->commit();
       }
     };
+    // KFlash M1: the tree's budget needs this Mac's verify cost per row count; the first request a model serves measures
+    // it (~6 cycles per row count, a few seconds once; cached per Mac, model and precision)
+    if (go && dfl_->tree() && !dfl_->costs_known() && s.n_pend == 0 && d.ctx == P) dfl_->measure_costs(s, d, P, sp);
     if (go) start_cycles();
     bool parked = false;     // the request parked after the last cycle (no drafting half committed)
     bool park_last = false;  // the last cycle committed no drafting half though there was room: it meant to park

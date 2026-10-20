@@ -384,16 +384,19 @@ int tree_cases(long trials, uint64_t salt, int only) {
     int regime;     // lattice: kRandom or kEqual (aligned); target: kRandom, or kPoint (1-2 tokens: deep paths)
     float temp, top_p;
     int top_k;
-    float tau, slope;  // the tree's score temperature (the law must not depend on the tree's shape rule)
+    float tau, slope;  // > 0: a fixed score temperature; 0: a random learned state (the law must not depend on either)
+    int R;             // verify rows (the tree's first R slots)
   };
-  const std::vector<TCase> cases = {{kRandom, 0.6f, 0.95f, 20, 1.0f, 0.0f}, {kEqual, 0.6f, 0.95f, 20, 1.3f, 0.1f},
-                                    {kEqual, 1.0f, 1.0f, 32, 1.0f, 0.5f},   {kPoint, 0.6f, 0.95f, 20, 2.0f, 0.2f},
-                                    {kRandom, 0.0f, 1.0f, 1, 1.0f, 0.0f},   {kEqual, 0.0f, 1.0f, 1, 1.3f, 0.1f}};
+  const std::vector<TCase> cases = {
+      {kRandom, 0.6f, 0.95f, 20, 1.0f, 0.0f, 8}, {kEqual, 0.6f, 0.95f, 20, 0.0f, 0.0f, 8},
+      {kEqual, 1.0f, 1.0f, 32, 1.0f, 0.5f, 5},   {kPoint, 0.6f, 0.95f, 20, 0.0f, 0.0f, 3},
+      {kRandom, 0.0f, 1.0f, 1, 1.0f, 0.0f, 8},   {kEqual, 0.0f, 1.0f, 1, 0.0f, 0.0f, 6},
+      {kEqual, 0.6f, 0.95f, 20, 0.0f, 0.0f, 1}};
   Pipeline tree_p = g.pipeline("dfl_tree"), samp_p = g.pipeline("sample_stage2_rows_tree"),
            acc_p = g.pipeline("dfl_accept_tree");
   const int B = 2048;
   Buffer ci = g.alloc(size_t(B) * 112 * 4), cv = g.alloc(size_t(B) * 112 * 4), E = g.alloc(size_t(B) * 1792 * 4);
-  Buffer tok = g.alloc(size_t(B) * 16 * 4), tree = g.alloc(size_t(B) * 32 * 4);
+  Buffer tok = g.alloc(size_t(B) * 16 * 4), tree = g.alloc(size_t(B) * 64 * 4), cal = g.alloc(256 * 4);
   Buffer rv = g.alloc(size_t(B) * 8 * kTreeN * 4);
   Buffer rid = g.alloc(size_t(B) * 8 * kTreeN * 4), samp = g.alloc(size_t(B) * 8 * 4), res = g.alloc(size_t(B) * 16);
   Buffer gst = g.alloc(size_t(B) * 64), path = g.alloc(size_t(B) * 64);
@@ -407,6 +410,14 @@ int tree_cases(long trials, uint64_t salt, int only) {
     long done = 0, path_bad = 0, compared = 0;
     double mean_a = 0;
     std::mt19937_64 hr(4321 + cix * 7 + salt * 1000003);
+    {  // the learner's state the tree reads: a random one (positions' temperatures 0.25 .. 4, coverage 0.5 .. 1)
+      memset(cal.ptr(), 0, cal.size);
+      std::uniform_real_distribution<float> U(0, 1);
+      for (int q = 0; q < 7; ++q) {
+        cal.as<float>()[144 + q] = std::exp2(4.0f * U(hr) - 2.0f);
+        cal.as<float>()[152 + q] = 0.5f + 0.5f * U(hr);
+      }
+    }
     // one cycle for trials [0, n) after prefix pre[i] (the anchor at position P = pre[i].size()); the emitted tokens
     auto cycle = [&](const std::vector<std::vector<int>>& pre, const std::vector<uint32_t>& seed) {
       const int n = int(pre.size());
@@ -420,19 +431,19 @@ int tree_cases(long trials, uint64_t salt, int only) {
         auto e = g.begin();
         for (int i = 0; i < n; ++i) {
           const uint32_t P = uint32_t(pre[i].size());
-          kp::DflTree tp{P, P + 1, cs.tau, cs.slope};
+          kp::DflTree tp{P, P + 1, cs.tau, cs.slope, cs.tau > 0 ? 1u : 0u};
           e->use(tree_p);
           e->buf(0, ci, size_t(i) * 448); e->buf(1, cv, size_t(i) * 448); e->buf(2, E, size_t(i) * 1792 * 4);
-          e->buf(3, tok, size_t(i) * 64); e->buf(4, tree, size_t(i) * 128);
+          e->buf(3, tok, size_t(i) * 64); e->buf(4, tree, size_t(i) * 256);
           e->val(5, tp);
-          e->buf(6, gst, size_t(i) * 64);
+          e->buf(6, gst, size_t(i) * 64); e->buf(7, cal);
           e->dispatch(1, 1, 1, 32);
         }
         e->commit_and_wait();
       }
       for (int i = 0; i < n; ++i) {  // the target's rows: slot t's path from the tree
         const int* tk = tok.as<int>() + i * 16;
-        const int* tr = tree.as<int>() + i * 32;
+        const int* tr = tree.as<int>() + i * 64;
         const int P = int(pre[i].size());
         for (int t = 0; t < 8; ++t) {
           std::vector<int> nodes;
@@ -451,12 +462,13 @@ int tree_cases(long trials, uint64_t salt, int only) {
           e->buf(0, rv, size_t(i) * 8 * kTreeN * 4); e->buf(1, rid, size_t(i) * 8 * kTreeN * 4);
           e->buf(2, samp, size_t(i) * 32);
           e->val(3, sr);
-          e->buf(4, rid); e->buf(5, tree, size_t(i) * 128);
+          e->buf(4, rid); e->buf(5, tree, size_t(i) * 256);
           e->dispatch(8, 1, 1, 1024);
+          const kp::DflAcceptTree ap{P, uint32_t(cs.R)};
           e->use(acc_p);
-          e->buf(0, tok, size_t(i) * 64); e->buf(1, samp, size_t(i) * 32); e->buf(2, tree, size_t(i) * 128);
+          e->buf(0, tok, size_t(i) * 64); e->buf(1, samp, size_t(i) * 32); e->buf(2, tree, size_t(i) * 256);
           e->buf(3, res, size_t(i) * 16);
-          e->val(4, P);
+          e->val(4, ap);
           e->buf(5, gst, size_t(i) * 64); e->buf(6, path, size_t(i) * 64);
           e->dispatch(1, 1, 1, 32);
         }
@@ -527,14 +539,145 @@ int tree_cases(long trials, uint64_t salt, int only) {
     chi2(obs1, ex1, trials, &st1, &dof1, &pv1, &out1);
     const bool greedy = cs.temp <= 0;
     const bool ok = (greedy || (pv > 0.01 && pv1 > 0.01)) && out == 0 && out1 == 0 && path_bad == 0;
-    printf("[S1 tree] lattice %-8s target %-6s T=%.1f top-p %.2f top-k %d tau %.1f+%.1f/pos: %ld trials, mean a %.2f; "
+    char rule[48];
+    if (cs.tau > 0) snprintf(rule, sizeof rule, "tau %.1f+%.1f/pos", cs.tau, cs.slope);
+    else snprintf(rule, sizeof rule, "learned state");
+    printf("[S1 tree] lattice %-8s target %-6s T=%.1f top-p %.2f top-k %d %s, %d rows: %ld trials, mean a %.2f; "
            "joint chi2 %.1f (%d dof) p=%.3f; first token p=%.3f; outside support %ld; plain-decoding mismatches %ld of "
            "%ld: %s\n",
-           lat == kEqual ? "aligned" : "random", tgt == kPoint ? "1-2" : "random", cs.temp, cs.top_p, cs.top_k, cs.tau,
-           cs.slope, trials, mean_a / trials, st, dof, pv, pv1, out + out1, path_bad, compared, ok ? "PASS" : "FAIL");
+           lat == kEqual ? "aligned" : "random", tgt == kPoint ? "1-2" : "random", cs.temp, cs.top_p, cs.top_k, rule,
+           cs.R, trials, mean_a / trials, st, dof, pv, pv1, out + out1, path_bad, compared, ok ? "PASS" : "FAIL");
     if (!ok) ++fails;
   }
   return fails;
+}
+
+// The tree's learner (dfl_tree_learn) against a CPU transcription of it (the same float arithmetic in the same order)
+// over many random cycles, tree and chain: its state (per position the grid's log-likelihoods, hits, samples, the
+// temperature and coverage it picks; the running expectations) must match.
+void learn_cpu(float* cal, const int* ci, const float* cv, const float* E, const int* tree, const int* path,
+               const int* samp, const int* walk_k, const int* res, bool chain) {
+  const uint32_t n = chain ? uint32_t(res[0]) + 1 : uint32_t(path[8]);
+  const float lam = 1.0f - 1.0f / 256.0f;
+  for (uint32_t j = 0; j < std::min(n, 7u); ++j) {
+    const uint32_t slot = chain ? j : uint32_t(path[j]);
+    const uint32_t kpar = j == 0 ? 0u : chain ? uint32_t(walk_k[j - 1]) : uint32_t(tree[48 + slot]);
+    const int y = samp[slot];
+    float s[16], mx = -INFINITY;
+    int ks = 32;
+    for (int k = 0; k < 16; ++k) {
+      const float e = E[j * 256 + (j == 0 ? 0u : kpar) * 16 + k];
+      s[k] = cv[j * 16 + k] + (std::isnan(e) ? 0.0f : e);
+      if (ks == 32 && ci[j * 16 + k] == y) ks = k;
+      mx = std::max(mx, s[k]);
+    }
+    float best = -INFINITY;
+    int gb = 0;
+    for (int g = 0; g < 17; ++g) {
+      const float lg = (float(g) - 8.0f) / 4.0f, tau = std::exp2(lg);
+      float z = 0.0f, zk = 0.0f;
+      for (int k = 0; k < 16; ++k) {
+        const float sk = (s[k] - mx) / tau;
+        z += std::exp(sk);
+        if (k == ks) zk = sk;
+      }
+      const float ll = ks < 32 ? zk - std::log(z) : 0.0f;
+      const float cur = cal[j * 17 + g] * lam + ll;
+      cal[j * 17 + g] = cur;
+      if (cur - 0.5f * lg * lg > best) {
+        best = cur - 0.5f * lg * lg;
+        gb = g;
+      }
+    }
+    const float h = cal[128 + j] * lam + (ks < 32 ? 1.0f : 0.0f), m = cal[136 + j] * lam + 1.0f;
+    cal[128 + j] = h;
+    cal[136 + j] = m;
+    cal[144 + j] = std::exp2((float(gb) - 8.0f) / 4.0f);
+    cal[152 + j] = (h + 1.0f) / (m + 1.0f);
+  }
+  const float cnt = std::min(cal[170] + 1.0f, 64.0f);
+  cal[170] = cnt;
+  auto f = [&](int w) { float x; memcpy(&x, &tree[w], 4); return x; };
+  for (int r = 0; r < 8; ++r) cal[160 + r] += (f(40 + r) - cal[160 + r]) / cnt;
+  cal[168] += (f(26) - cal[168]) / cnt;
+  cal[169] += (float(n) - cal[169]) / cnt;
+}
+
+int learn_check(uint64_t salt) {
+  Gpu& g = Gpu::get();
+  const int N = 400;
+  std::mt19937_64 r(99 + salt);
+  std::normal_distribution<float> Nd(0, 1);
+  Buffer ci = g.alloc(size_t(N) * 112 * 4), cv = g.alloc(size_t(N) * 112 * 4), E = g.alloc(size_t(N) * 1792 * 4);
+  Buffer tree = g.alloc(size_t(N) * 64 * 4), path = g.alloc(size_t(N) * 64), samp = g.alloc(size_t(N) * 32);
+  Buffer wk = g.alloc(size_t(N) * 32), res = g.alloc(size_t(N) * 16), cal = g.alloc(256 * 4);
+  std::vector<float> ref(256, 0.0f);
+  for (int q = 0; q < 7; ++q) ref[144 + q] = ref[152 + q] = 1.0f;
+  memcpy(cal.ptr(), ref.data(), 256 * 4);
+  std::vector<uint32_t> modes(N);
+  for (int c = 0; c < N; ++c) {
+    int* cic = ci.as<int>() + c * 112;
+    float* cvc = cv.as<float>() + c * 112;
+    float* Ec = E.as<float>() + c * 1792;
+    int* tr = tree.as<int>() + c * 64;
+    int* pa = path.as<int>() + c * 16;
+    int* sa = samp.as<int>() + c * 8;
+    int* w = wk.as<int>() + c * 8;
+    int* rs = res.as<int>() + c * 4;
+    for (int i = 0; i < 112; ++i) {
+      cic[i] = 1000 + int(r() % 48);
+      cvc[i] = 2.0f * Nd(r);
+    }
+    for (int i = 0; i < 1792; ++i) Ec[i] = c % 3 == 0 ? 0.0f : Nd(r);  // (some v1-like lattices: no edges)
+    for (int i = 16; i < 256; ++i) Ec[i] = std::nanf("");               // position 0 has edge row 0 only
+    for (int i = 0; i < 64; ++i) tr[i] = 0;
+    for (int i = 0; i < 8; ++i) {
+      const float er = 1.0f + 0.7f * float(i) * (0.5f + 0.5f * float(r() % 100) / 100.0f);
+      memcpy(&tr[40 + i], &er, 4);
+      tr[48 + i] = i == 0 ? -1 : int(r() % 16);
+      w[i] = int(r() % 16);
+    }
+    const float ech = 1.0f + float(r() % 400) / 100.0f;
+    memcpy(&tr[26], &ech, 4);
+    modes[c] = uint32_t(r() % 2);
+    const int a = int(r() % 8);
+    rs[0] = a;
+    std::vector<int> slots = {1, 2, 3, 4, 5, 6, 7};
+    std::shuffle(slots.begin(), slots.end(), r);
+    pa[0] = 0;
+    for (int j = 1; j <= a; ++j) pa[j] = slots[size_t(j - 1)];
+    pa[8] = a + 1;
+    for (int j = 0; j <= std::min(a, 6); ++j) {  // the row's token: a candidate of position j (75%) or none
+      const int slot = modes[c] ? j : pa[j];
+      sa[slot] = r() % 4 ? cic[j * 16 + int(r() % 16)] : 7;
+    }
+    learn_cpu(ref.data(), cic, cvc, Ec, tr, pa, sa, w, rs, modes[c] != 0);
+  }
+  Pipeline lp = g.pipeline("dfl_tree_learn");
+  auto e = g.begin();
+  for (int c = 0; c < N; ++c) {
+    e->use(lp);
+    e->buf(0, ci, size_t(c) * 448); e->buf(1, cv, size_t(c) * 448); e->buf(2, E, size_t(c) * 7168);
+    e->buf(3, tree, size_t(c) * 256); e->buf(4, path, size_t(c) * 64); e->buf(5, samp, size_t(c) * 32);
+    e->buf(6, wk, size_t(c) * 32); e->buf(7, res, size_t(c) * 16); e->buf(8, cal);
+    e->val(9, modes[c]);
+    e->dispatch(1, 1, 1, 32);
+  }
+  e->commit_and_wait();
+  double ll_err = 0, other_err = 0;
+  int tau_bad = 0;
+  for (int i = 0; i < 171; ++i) {
+    const double d = std::fabs(double(cal.as<float>()[i]) - ref[size_t(i)]) / std::max(1.0, std::fabs(double(ref[size_t(i)])));
+    if (i < 128) ll_err = std::max(ll_err, d);
+    else if (i >= 144 && i < 151) tau_bad += cal.as<float>()[i] != ref[size_t(i)];
+    else other_err = std::max(other_err, d);
+  }
+  const bool ok = ll_err < 1e-4 && other_err < 1e-5 && tau_bad == 0;
+  printf("[learn] dfl_tree_learn vs CPU over %d tree / chain cycles: log-likelihood max rel. error %.2e, temperatures "
+         "differing %d of 7, other state max rel. error %.2e; learned tau/cover:", N, ll_err, tau_bad, other_err);
+  for (int q = 0; q < 7; ++q) printf(" %.2f/%.2f", cal.as<float>()[144 + q], cal.as<float>()[152 + q]);
+  printf(": %s\n", ok ? "PASS" : "FAIL");
+  return ok ? 0 : 1;
 }
 
 }  // namespace
@@ -743,6 +886,7 @@ int main(int argc, char** argv) {
   // ---- 3. tree drafting (dense targets): dfl_tree + sample_stage2_rows_tree + dfl_accept_tree ----
   if (only < 0 || only >= int(cases.size()))
     fails += tree_cases(trials, salt, only < 0 ? -1 : only - int(cases.size()));
+  if (only < 0) fails += learn_check(salt);
   printf(fails ? "FAILED: %d\n" : "ALL PASSED\n", fails);
   return fails ? 1 : 0;
 }

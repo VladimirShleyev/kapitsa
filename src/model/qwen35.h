@@ -312,6 +312,7 @@ class Qwen35 : public Model {
   // its rows again, so the hook must stay armed until the chunk has completed or been rerun.
   void set_capture(const CaptureHook* h) { cap_ = h; }
   const QLinear& embed_table() const { return embed_; }
+  const std::string& model_dir() const { return dir_; }
   const QLinear& lm_head() const { return lm_head_; }
   // Drafter's dynamic verify depth (DFlash2, MoE only): while set, the 8-row verify routes experts only
   // for rows < min(R, rows[0]) (uint read by the GPU); later rows' outputs are garbage and must not be used.

@@ -223,6 +223,75 @@ def calib_prob(tab, tau=1.0):
     return prob
 
 
+class OnlineCalib:
+    """The engine's online calibration of the lattice's node probabilities (dfl_tree_learn): per children position p,
+    a log-likelihood over a temperature grid (tau_g = 2^((g - 8) / 4), g = 0..16: 0.25 .. 4) and the coverage (how
+    often the target's token is among the 16 candidates), learned from the rows on each cycle's accepted path (the
+    anchor's and every accepted node's: the target's token after a correct prefix), all 16 candidates labeled by that
+    token; exponential forgetting over a window of W samples per position. Node probability = coverage_p *
+    softmax(scores / tau_p)[k]; tau_p = the grid's maximum of the log-likelihood minus a weak prior (log2 tau)^2 / 2;
+    before any data, tau 1 and coverage 1 (the drafter's own probabilities)."""
+
+    G = 17
+
+    def __init__(self, window=256.0, prior=0.5):
+        self.lam = 1.0 - 1.0 / window
+        self.prior = prior
+        self.taus = np.array([2.0 ** ((g - 8) / 4.0) for g in range(self.G)])
+        self.ll = np.zeros((7, self.G))
+        self.hit = np.zeros(7)
+        self.tot = np.zeros(7)
+
+    def tau(self, p):
+        score = self.ll[p] - self.prior * np.log2(self.taus) ** 2
+        return self.taus[int(np.argmax(score))]
+
+    def cover(self, p):
+        return (self.hit[p] + 1.0) / (self.tot[p] + 1.0)
+
+    def prob(self, rec, p, pk):
+        return self.cover(p) * softmax(cond_logits(rec, p, pk), self.tau(p))
+
+    def learn(self, rec, p, pk, y):
+        """one row: children position p under candidate pk (-1: the anchor), target token y"""
+        self.ll[p] *= self.lam
+        self.hit[p] *= self.lam
+        self.tot[p] *= self.lam
+        self.tot[p] += 1.0
+        k = np.where(rec["ci"][p] == y)[0]
+        if len(k) == 0:
+            return
+        self.hit[p] += 1.0
+        s = cond_logits(rec, p, pk)
+        for g, t in enumerate(self.taus):
+            z = (s - s.max()) / t
+            self.ll[p][g] += z[k[0]] - np.log(np.exp(z).sum())
+
+
+def replay_online(run, calib, budget=7, max_tok=None):
+    """replay() with the online calibration: each cycle's tree from the calibration so far, then the cycle's accepted
+    path rows teach it"""
+    P, cycles, toks = run.P0, 0, 0
+    lim = run.end - 8 if max_tok is None else min(run.end - 8, run.P0 + max_tok)
+    while P <= lim and P in run.by_P:
+        rec = run.recs[run.by_P[P]]
+        nodes, _ = best_first(rec, budget, calib.prob)
+        cont = run.cont(P, 8)
+        a = accepted(nodes, cont[:7])
+        # rows on the accepted path: the anchor (children position 0) and the accepted nodes at depths 1..a
+        pk = -1
+        for j in range(min(a, 6) + 1):
+            if j < len(cont):
+                calib.learn(rec, j, pk, cont[j])
+            if j < a:
+                w = np.where(rec["ci"][j] == cont[j])[0]
+                pk = int(w[0])
+        cycles += 1
+        toks += a + 1
+        P += a + 1
+    return cycles, toks
+
+
 def lattice_oracle(rec, cont):
     """How deep the output stays inside the top-16 lattice (the best any tree over this lattice can do)."""
     d = 0

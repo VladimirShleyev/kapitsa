@@ -371,6 +371,12 @@ int main(int argc, char** argv) {
     e->commit_and_wait();
   }
   double t_prompt = now_ms() - t0;
+  // KFlash M1: the tree's budget needs this Mac's verify cost per row count, measured once per Mac, model and
+  // precision (cached); not part of the timed prompt or decode
+  if (dfl && dfl->tree() && !dfl->costs_known() && !env_on("NI_DFLASH_STEP1") && !getenv("NI_DFLASH_LAT") &&
+      !(getenv("NI_DFLASH_COST") && !strcmp(getenv("NI_DFLASH_COST"), "0"))) {
+    dfl->measure_costs(s, *dseq, n, sp);
+  }
   FILE* fall = dump_all ? fopen(dump_all, "wb") : nullptr;
   if (fall) fwrite(m.logits(), 4, m.config().vocab, fall);
   if (m.ane_split())
@@ -636,6 +642,19 @@ int main(int argc, char** argv) {
     fprintf(stderr, "; %.2f proposals verified per cycle; acceptance by position", double(verified_sum) / std::max(cycles, 1));
     for (int i = 0; i < K; ++i) fprintf(stderr, " %.2f", reached[i] ? double(acc_pos[i]) / reached[i] : 0.0);
     fprintf(stderr, "\n");
+    if (dfl->tree()) {  // the tree's learned state (dfl_tree_learn) and costs
+      const float* c = dfl->tree_cal();
+      fprintf(stderr, "tree: %s kernels; running E(R), R = 1..8:", dfl->tree_active() ? "tree" : "chain");
+      for (int r = 0; r < 8; ++r) fprintf(stderr, " %.2f", c[160 + r]);
+      fprintf(stderr, "; chain %.2f; emitted %.2f tok/cycle; tau/cover by position:", c[168], c[169]);
+      for (int p = 0; p < 7; ++p) fprintf(stderr, " %.2f/%.2f", c[144 + p], c[152 + p]);
+      if (dfl->costs_known()) {
+        fprintf(stderr, "; cost ms R = 1..8:");
+        for (double x : dfl->tree_costs()) fprintf(stderr, " %.2f", x);
+        fprintf(stderr, ", chain %.2f", dfl->chain_cost());
+      }
+      fprintf(stderr, "\n");
+    }
     if (getenv("NI_CYCLE_TRACE") && ntr)
       fprintf(stderr, "cycle trace (ms, mean of %d): host encodes the verify %.3f | GPU idle verify->draft %.3f, draft %.3f, "
               "idle draft->verify %.3f, verify %.3f | verify commit->start %.3f, host wake-up %.3f\n", ntr, tr[0] / ntr,

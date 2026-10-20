@@ -1545,36 +1545,58 @@ struct DflSelectParams {
   }
 }
 
-// ---- DFlash 3 tree drafting (dense targets): a best-first tree of 7 nodes from the lattice ----
-// Slot 0 is the anchor; node t = 1..7 is candidate k_t of position d_t - 1 (d_t = its depth) under parent slot
-// par_t. A node's children are the 16 candidates of the next position with conditional probabilities
-// c(k | parent) = softmax_k((U_d[k] + E[d][k_par][k]) / tau_d) (the walk's scores, E row 0 under the anchor; DFlash
-// v1 drafters have E = 0), tau_d = tau (1 + slope d): the drafter's mid-range confidences are too high at depth
-// (tools/tree_sim.py measures it on lattice recordings). Each step adds the frontier node with the largest product
-// of conditional probabilities along its path (ties: the lower slot, then the lower candidate), so the 7 nodes
-// maximize the expected accepted length under that model, and slots are in insertion order (a parent before its
-// children). Writes slot t's token to tokens[out_index + t - 1] and the tree descriptor: tree[0..7] parent slot (-1
-// for the anchor), [8..15] depth, [16..23] ancestor-or-self mask (bit j = slot j), [24] the slots whose parent is
-// not the slot before them (bit t). grid: 1 x 32 (one simdgroup).
+// ---- KFlash M1: tree drafting (dense targets) ----
+// A tree of up to 7 nodes, verified in one pass of up to 8 rows (slot 0 = the anchor). The verify's interface is the
+// tree descriptor (int32 words; floats as their bits), which any path model's builder can write:
+//   [0..7]   parent slot (-1 for the anchor)               [8..15]  depth (the anchor 0)
+//   [16..23] ancestor-or-self mask (bit j = slot j)         [24]     slots whose parent is not the slot before (bit t)
+//   [25]     slots filled (1 + nodes, <= 8)                 [26]     the drafter's argmax chain's E (as [40..47] for R 8)
+//   [32..39] each slot's path log-probability (0 for the anchor)
+//   [40..47] E(R) = 1 + the summed path probabilities of slots 1 .. R - 1, R = 1..8: the tokens R rows are expected to
+//            emit (a cycle emits the accepted path plus one token)
+//   [48..55] each slot's candidate index in its position's list (this lattice's; -1 for other path models)
+// and slot t's token at tokens[P + t]. Slots are in best-first insertion order: a parent before its children, and the
+// first R slots are the best tree of R rows (a verify may take that prefix).
+//
+// This builder's path model is DFlash2's lattice: a node's children are the 16 candidates of the next position with
+// conditional probability cover_p * softmax_k((U_p[k] + E[p][k_parent][k]) / tau_p) (E row 0 under the anchor; DFlash
+// v1 drafters have E = 0). tau_p and cover_p are learned online from past cycles' verify outcomes (dfl_tree_learn, the
+// cal buffer below), so the tree never depends on the current cycle's draws. Each step adds the frontier node with the
+// largest path probability (ties: the lower slot, then the lower candidate), so the first R slots maximize the expected
+// accepted length of R rows under the model. grid: 1 x 32 (one simdgroup).
+//
+// cal (float [256], DFlash2::cal_buf_): [p * 17 + g] the log-likelihood of tau_g = 2^((g - 8) / 4) (0.25 .. 4) at
+// children position p = 0..6, [128 + p] hits (the target's token among the candidates), [136 + p] samples, [144 + p]
+// tau_p, [152 + p] cover_p, [160 + R - 1] running E(R), [168] running E of the argmax chain, [169] running tokens per
+// cycle, [170] cycles counted (<= 64).
+constant constexpr uint kCalGrid = 17;
 struct DflTreeParams {
   uint P;          // anchor position (kDflGpu: from the drafter state)
   uint out_index;  // tokens[out_index + t - 1] = slot t's token (P + 1)
-  float tau;       // the score temperature at position 0
-  float slope;     // its growth per position
+  float tau;       // mode bit 0: a fixed score temperature at position 0 (cover 1) ...
+  float slope;     // ... growing by this fraction per position (NI_DFLASH_TREE_TAU / _SLOPE, for experiments)
+  uint mode;       // bit 1: statistics only (a chain cycle: words 25-55 written, tokens and words 0-24 left alone)
 };
-// node v's children (position d, under its candidate kpar of position d - 1): lanes 0..15 compute the 16
-// conditional probabilities and store their logs best first into cl[v] / ck[v]
-NI_INLINE void dfl_tree_kids(const device float* cand_v, const device float* E, constant DflTreeParams& p, uint d,
-                             uint kpar, uint v, threadgroup float (*cl)[16], threadgroup uchar (*ck)[16], uint lane) {
+NI_INLINE float dfl_tree_score(const device float* cand_v, const device float* E, uint d, uint kpar, uint k) {
+  const float e = E[d * 256 + (d == 0 ? 0u : kpar) * 16 + k];
+  return cand_v[d * 16 + k] + (isnan(e) ? 0.0f : e);
+}
+NI_INLINE float dfl_tree_tau(const device float* cal, constant DflTreeParams& p, uint d) {
+  return (p.mode & 1u) ? p.tau * (1.0f + p.slope * float(d)) : cal[144 + d];
+}
+NI_INLINE float dfl_tree_cover(const device float* cal, constant DflTreeParams& p, uint d) {
+  return (p.mode & 1u) ? 1.0f : cal[152 + d];
+}
+// node v's children (position d, under its candidate kpar of position d - 1): lanes 0..15 compute the 16 log
+// probabilities and store them best first into cl[v] / ck[v]
+NI_INLINE void dfl_tree_kids(const device float* cand_v, const device float* E, const device float* cal,
+                             constant DflTreeParams& p, uint d, uint kpar, uint v, threadgroup float (*cl)[16],
+                             threadgroup uchar (*ck)[16], uint lane) {
   const bool on = lane < 16;
-  float s = -INFINITY;
-  if (on) {
-    const float e = E[d * 256 + (d == 0 ? 0u : kpar) * 16 + lane];
-    s = (cand_v[d * 16 + lane] + (isnan(e) ? 0.0f : e)) / (p.tau * (1.0f + p.slope * float(d)));
-  }
+  const float s = on ? dfl_tree_score(cand_v, E, d, kpar, lane) / dfl_tree_tau(cal, p, d) : -INFINITY;
   const float mx = simd_max(s);
   const float ex = on ? metal::precise::exp(s - mx) : 0.0f;
-  const float pc = ex / simd_sum(ex);
+  const float pc = dfl_tree_cover(cal, p, d) * ex / simd_sum(ex);
   const float lpc = on ? metal::precise::log(max(pc, 1e-30f)) : -INFINITY;
   uint rank = 0;
   for (ushort j = 0; j < 16; ++j) {
@@ -1590,21 +1612,24 @@ NI_INLINE void dfl_tree_kids(const device float* cand_v, const device float* E, 
 [[kernel]] void dfl_tree(const device int* cand_i [[buffer(0)]], const device float* cand_v [[buffer(1)]],
                          const device float* E [[buffer(2)]], device int* tokens [[buffer(3)]],
                          device int* tree [[buffer(4)]], constant DflTreeParams& p [[buffer(5)]],
-                         const device uint* gst [[buffer(6)]], uint lane [[thread_index_in_simdgroup]]) {
+                         const device uint* gst [[buffer(6)]], const device float* cal [[buffer(7)]],
+                         uint lane [[thread_index_in_simdgroup]]) {
   threadgroup float cl[8][16];
   threadgroup uchar ck[8][16];
   const uint P = dfl_pos(p.P, gst), out_index = p.P == kDflGpu ? P + 1 : p.out_index;
-  uint dep[8], nxt[8], anc[8];
+  const bool stats = p.mode & 2u;
+  uint dep[8], nxt[8], anc[8], kk[8];
   int par[8];
   float lp[8];
   for (uint i = 0; i < 8; ++i) {
     dep[i] = 0;
     nxt[i] = 0;
     anc[i] = 1u << i;
+    kk[i] = 0;
     par[i] = -1;
     lp[i] = 0.0f;
   }
-  dfl_tree_kids(cand_v, E, p, 0, 0, 0, cl, ck, lane);
+  dfl_tree_kids(cand_v, E, cal, p, 0, 0, 0, cl, ck, lane);
   for (uint t = 1; t < 8; ++t) {
     // the frontier: node v's best child not taken yet (nodes at depth 7 have none)
     const float val = lane < t && dep[lane] < 7 && nxt[lane] < 16 ? lp[lane] + cl[lane][nxt[lane]] : -INFINITY;
@@ -1615,40 +1640,130 @@ NI_INLINE void dfl_tree_kids(const device float* cand_v, const device float* E, 
     dep[t] = dep[v] + 1;
     par[t] = int(v);
     lp[t] = m;
+    kk[t] = k;
     anc[t] = anc[v] | (1u << t);
-    if (lane == 0) tokens[out_index + t - 1] = cand_i[(dep[t] - 1) * 16 + k];
-    if (dep[t] < 7) dfl_tree_kids(cand_v, E, p, dep[t], k, t, cl, ck, lane);
+    if (lane == 0 && !stats) tokens[out_index + t - 1] = cand_i[(dep[t] - 1) * 16 + k];
+    if (dep[t] < 7) dfl_tree_kids(cand_v, E, cal, p, dep[t], k, t, cl, ck, lane);
+  }
+  // the argmax chain (the walk's at T = 0) under the same probabilities: its E
+  float ech = 1.0f, lc = 0.0f;
+  uint kp = 0;
+  for (uint d = 0; d < 7; ++d) {
+    const float s = lane < 16 ? dfl_tree_score(cand_v, E, d, kp, lane) / dfl_tree_tau(cal, p, d) : -INFINITY;
+    const float mx = simd_max(s);
+    const uint kb = simd_min(lane < 16 && s == mx ? lane : 32u);
+    const float z = simd_sum(lane < 16 ? metal::precise::exp(s - mx) : 0.0f);
+    lc += metal::precise::log(max(dfl_tree_cover(cal, p, d) / z, 1e-30f));
+    ech += metal::precise::exp(lc);
+    kp = kb;
   }
   if (lane < 8) {
-    tree[lane] = par[lane];
-    tree[8 + lane] = int(dep[lane]);
-    tree[16 + lane] = int(anc[lane]);
+    if (!stats) {
+      tree[lane] = par[lane];
+      tree[8 + lane] = int(dep[lane]);
+      tree[16 + lane] = int(anc[lane]);
+    }
+    tree[32 + lane] = as_type<int>(lp[lane]);
+    tree[48 + lane] = lane == 0 ? -1 : int(kk[lane]);
   }
+  // E(R): prefix sums of the slots' path probabilities (lane r < 8: slots 1 .. r)
+  const float pr = lane >= 1 && lane < 8 ? metal::precise::exp(lp[min(lane, 7u)]) : 0.0f;
+  const float er = 1.0f + simd_prefix_inclusive_sum(pr);
+  if (lane < 8) tree[40 + lane] = as_type<int>(er);
   const uint jump = simd_or(lane > 0 && lane < 8 && par[min(lane, 7u)] != int(lane) - 1 ? 1u << lane : 0u);
-  if (lane == 0) tree[24] = int(jump);
+  if (lane == 0) {
+    if (!stats) tree[24] = int(jump);
+    tree[25] = 8;
+    tree[26] = as_type<int>(ech);
+  }
 }
 
-// Tree acceptance (greedy and sampled alike): verify row t holds the target's own token after slot t's path (its
-// argmax at T = 0; at T > 0 a draw of the plain sampler with the uniform of the position that token takes,
-// sample_stage2_rows_tree). From the anchor, descend into the child whose token equals the current row's token while
-// there is one: the emitted tokens are then exactly the plain decoding's (each one the plain sampler's draw given the
-// tokens before it, whatever the tree's shape, which the drafter fixed without seeing any of them). Writes the
-// accepted path's tokens to tokens[P+1 .. P+a] (they held the slots' tokens) and the token after them to
-// tokens[P+1+a]; res = {a, that token}; the drafter state for the next pass, with the path's slots in gst[4 + i]
-// (the ring commit gathers their captures); path[i] = slot of the path's i-th row (path[0] = 0, the anchor),
-// path[8] = a + 1 rows (the target folds those rows' tape and moves their K/V, Qwen35::set_verify_tree) and path[9]
-// the slots packed 4 bits each (row i at bits 4i).
-// grid: 1 x 32.
+// The lattice's calibration and the budget's running expectations, after a cycle's acceptance (one simdgroup). The
+// rows on the accepted path (the anchor's and every accepted node's) hold the target's token after a correct prefix:
+// each labels the 16 candidates of the next position under that row's candidate (all of them, verified or not); per
+// position p the log-likelihood of every grid temperature, the hits and the samples decay over ~256 samples, and
+// tau_p becomes the grid's maximum less a weak prior toward the drafter's own probabilities (0.5 (log2 tau)^2),
+// cover_p = (hits + 1) / (samples + 1). Also the running means (the last 64 cycles) of the tree's E(R), the argmax
+// chain's E and the emitted tokens: the host picks each cycle's verify rows from them (DFlash2::verify_rows).
+// mode 0: a tree cycle (path = dfl_accept_tree's, candidates from the descriptor); 1: a chain cycle (rows 0 .. a, a =
+// res[0], the walk's candidates); 2: a tree cycle of another path model (the running means only: no lattice to
+// calibrate). grid: 1 x 32.
+[[kernel]] void dfl_tree_learn(const device int* cand_i [[buffer(0)]], const device float* cand_v [[buffer(1)]],
+                               const device float* E [[buffer(2)]], const device int* tree [[buffer(3)]],
+                               const device int* path [[buffer(4)]], const device int* samp [[buffer(5)]],
+                               const device int* walk_k [[buffer(6)]], const device int* res [[buffer(7)]],
+                               device float* cal [[buffer(8)]], constant uint& mode [[buffer(9)]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+  const bool chain = mode == 1;
+  const uint n = chain ? uint(res[0]) + 1 : uint(path[8]);  // rows on the accepted path = tokens this cycle emitted
+  const float lam = 1.0f - 1.0f / 256.0f;
+  const float lg = (float(lane) - 8.0f) / 4.0f;  // lane g < 17: log2 tau_g
+  const float tau_g = metal::precise::exp2(lg);
+  for (uint j = 0; j < (mode == 2 ? 0u : min(n, 7u)); ++j) {
+    const uint slot = chain ? j : uint(path[j]);
+    const uint kpar = j == 0 ? 0u : chain ? uint(walk_k[j - 1]) : uint(tree[48 + slot]);
+    const int y = samp[slot];
+    const float s = lane < 16 ? dfl_tree_score(cand_v, E, j, kpar, lane) : -INFINITY;
+    const int c = lane < 16 ? cand_i[j * 16 + lane] : -1;
+    const uint ks = simd_min(lane < 16 && c == y ? lane : 32u);
+    const float mx = simd_max(s);
+    float z = 0.0f, zk = 0.0f;
+    for (ushort k = 0; k < 16; ++k) {
+      const float sk = (simd_shuffle(s, k) - mx) / tau_g;
+      z += metal::precise::exp(sk);
+      if (uint(k) == ks) zk = sk;
+    }
+    const float ll = ks < 32u ? zk - metal::precise::log(z) : 0.0f;
+    float cur = 0.0f;
+    if (lane < kCalGrid) {
+      cur = cal[j * kCalGrid + lane] * lam + ll;
+      cal[j * kCalGrid + lane] = cur;
+    }
+    const float score = lane < kCalGrid ? cur - 0.5f * lg * lg : -INFINITY;
+    const float best = simd_max(score);
+    const uint gb = simd_min(score == best ? lane : 32u);
+    if (lane == 0) {
+      const float h = cal[128 + j] * lam + (ks < 32u ? 1.0f : 0.0f), m = cal[136 + j] * lam + 1.0f;
+      cal[128 + j] = h;
+      cal[136 + j] = m;
+      cal[144 + j] = metal::precise::exp2((float(gb) - 8.0f) / 4.0f);
+      cal[152 + j] = (h + 1.0f) / (m + 1.0f);
+    }
+  }
+  if (lane == 0) {
+    const float cnt = min(cal[170] + 1.0f, 64.0f);
+    cal[170] = cnt;
+    for (uint r = 0; r < 8; ++r) cal[160 + r] += (as_type<float>(tree[40 + r]) - cal[160 + r]) / cnt;
+    cal[168] += (as_type<float>(tree[26]) - cal[168]) / cnt;
+    cal[169] += (float(n) - cal[169]) / cnt;
+  }
+}
+
+// Tree acceptance (greedy and sampled alike) over the first R slots (the verify's rows): verify row t holds the
+// target's own token after slot t's path (its argmax at T = 0; at T > 0 a draw of the plain sampler with the uniform
+// of the position that token takes, sample_stage2_rows_tree). From the anchor, descend into the child whose token
+// equals the current row's token while there is one: the emitted tokens are then exactly the plain decoding's (each
+// one the plain sampler's draw given the tokens before it, whatever the tree's shape, which the drafter fixed without
+// seeing any of them). Writes the accepted path's tokens to tokens[P+1 .. P+a] (they held the slots' tokens) and the
+// token after them to tokens[P+1+a]; res = {a, that token}; the drafter state for the next pass, with the path's slots
+// in gst[4 + i] (the ring commit gathers their captures); path[i] = slot of the path's i-th row (path[0] = 0, the
+// anchor), path[8] = a + 1 rows (the target folds those rows' tape and moves their K/V, Qwen35::set_verify_tree) and
+// path[9] the slots packed 4 bits each (row i at bits 4i). grid: 1 x 32.
+struct DflAcceptTreeParams {
+  uint P;  // anchor position
+  uint R;  // verify rows (slots 0 .. R - 1)
+};
 [[kernel]] void dfl_accept_tree(device int* tokens [[buffer(0)]], const device int* samp [[buffer(1)]],
                                 const device int* tree [[buffer(2)]], device int* res [[buffer(3)]],
-                                constant uint& P [[buffer(4)]], device uint* gst [[buffer(5)]],
+                                constant DflAcceptTreeParams& p [[buffer(4)]], device uint* gst [[buffer(5)]],
                                 device int* path [[buffer(6)]], uint lane [[thread_index_in_simdgroup]]) {
-  const int par = lane < 8 ? tree[lane] : -2;
+  const uint P = p.P, R = min(p.R, 8u);
+  const int par = lane < R ? tree[lane] : -2;
   const int tok = lane < 8 ? tokens[P + lane] : -1;
   uint v = 0, a = 0, mine = 0;  // lane i: the slot of the path's i-th row
   int y = samp[0];
   while (a < 7) {
-    const bool hit = lane > 0 && lane < 8 && par == int(v) && tok == y;
+    const bool hit = lane > 0 && lane < R && par == int(v) && tok == y;
     const uint c = simd_min(hit ? lane : 32u);
     if (c == 32u) break;
     ++a;

@@ -265,7 +265,12 @@ struct DflAccept {
 
 struct DflTree {
   uint32_t P, out_index;
-  float tau, slope;  // node score temperature tau (1 + slope d) at position d
+  float tau, slope;  // mode bit 0: node score temperature tau (1 + slope d) at position d instead of the learned ones
+  uint32_t mode;     // bit 1: statistics only (a chain cycle)
+};
+
+struct DflAcceptTree {
+  uint32_t P, R;  // anchor position, verify rows
 };
 
 struct KvTree {
