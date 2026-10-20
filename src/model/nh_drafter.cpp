@@ -71,6 +71,38 @@ void NhDrafter::stage_init(LiliSeq& d) {
   d.stage_hook.rows = kB;
 }
 
+void NhDrafter::encode_commit_path(Encoder& e, LiliSeq& d, int m, const Buffer& path) {
+  if (m <= 0) return;
+  const NhCapture& v = verify_hook();
+  if (!kfeat_) kfeat_ = Gpu::get().alloc(size_t(kB) * v.ld * 4, "nh_kf_feat");
+  const uint32_t ld = v.ld;
+  e.use(NemotronH::pipeline("nh_kf_gather"));
+  e.buf(0, v.feat);
+  e.buf(1, kfeat_);
+  e.buf(2, path);
+  e.val(3, ld);
+  e.dispatch(uint32_t(m), (ld + 255) / 256, 1, 256);
+  enc_commit_rows(e, d, kfeat_, m, d.ctx);
+  d.ctx += m;
+  d.hi = std::max(d.hi, d.ctx);
+}
+
+void NhDrafter::enc_kf_build(Encoder& e, NemotronH& tg, Seq& s, int P, const Buffer& cand, const Buffer& tlq, int K,
+                             const Buffer& kfp) {
+  const struct {
+    uint32_t S, K, P;
+  } bp{uint32_t(kB - 1), uint32_t(K), uint32_t(P)};
+  e.use(NemotronH::pipeline("nh_kf_build"));
+  e.buf(0, tlq);
+  e.buf(1, cand);
+  e.buf(2, kfp);
+  e.buf(3, tg.tree_buf());
+  e.buf(4, s.tok);
+  e.buf(5, tg.live_rows());
+  e.bytes(6, &bp, sizeof bp);
+  e.dispatch(1, 1, 1, 32);
+}
+
 void NhDrafter::encode_commit_staged(Encoder& e, LiliSeq& d) {
   if (d.staged <= 0) return;
   enc_commit_rows(e, d, d.stage, d.staged, d.ctx);

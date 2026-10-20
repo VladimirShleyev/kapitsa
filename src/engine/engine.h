@@ -5,6 +5,7 @@
 #include "hub/hub.h"
 #include "model/dflash2.h"
 #include "model/dory.h"
+#include "model/kflash_budget.h"
 #include "model/lilicorr.h"
 #include "model/nemotron_h.h"
 #include "model/qwen35.h"
@@ -416,6 +417,10 @@ class Engine {
   std::unique_ptr<Checkpoint> ane_ck_;  // NI_ANE: recurrent state before a split chunk (rerun on failure)
   std::unique_ptr<DFlash2> dfl_;
   std::unique_ptr<NhDrafter> lili_;  // Nemotron-H: the block drafter (LiLiCorr, DSpark)
+  // KFlash on the Nemotron-H block drafters (NI_KFLASH=1; src/model/kflash_budget.h): best-first trees of the drafter's
+  // lattice under a measured budget instead of its walk's chain
+  std::unique_ptr<KfBudget> kf_budget_;
+  Buffer kf_params_;  // KfParams the budget writes for the GPU tree builder
   std::unique_ptr<vision::Vision> vision_;  // the image encoder, for models that take images
   std::vector<int> img_pre_, img_post_;     // the tokens its processor puts around an image's rows (Nemotron: <img>)
   // `ids` with each image placeholder expanded to its image's rows (vision::expand with the encoder's marks)
