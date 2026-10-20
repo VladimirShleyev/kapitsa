@@ -1,5 +1,5 @@
 // S1: exactness of the on-GPU acceptance on synthetic inputs,
-// no model needed.
+// no model needed. (Cases are numbered in order: the chain's, then the tree's.)
 //   dflash_accept_test [trials=40000] [K=3]
 // 1. dfl_dist_rows against a CPU transcription of the plain sampler's distribution (sample_stage2_rows:
 //    top-k ordered (value desc, id asc), top-p on the untempered probabilities, tempered on the kept
@@ -12,7 +12,15 @@
 //    dynamic verify depth (dfl_depth before dfl_accept): its exact T > 0 rules (0, and 2, the earlier one) must
 //    pass; the rule that also uses the proposal's own confidence (rule 1, not used by the engine at T > 0) must fail in the depth-sensitive
 //    regime (q = p at the first proposal, q = 0.9 / 0.1 vs p = 1/2 at the second: that rule emits 0.55 / 0.45).
+// 3. KFlash tree verifies: the shared builder (kf_build) takes a best-first tree from a synthetic DFlash2 lattice
+//    (random, or aligned with the target's likely path; the identity or a random calibration; 1-8 verify rows), the
+//    target's rows of the tree's
+//    paths are sampled by sample_stage2_rows_tree (top-k, top-p, temperature as the engine's sampler, each row with
+//    the uniform of its token's position), the shared kf_accept walks them; a second cycle runs when one token came out.
+//    The joint law of the first two tokens is tested as in 2, and every trial's two tokens must equal plain decoding's
+//    with the same position-keyed uniforms (the sampler transcribed on the CPU); T = 0: equal to the argmax decoding.
 #include "metal/gpu.h"
+#include "model/kflash_budget.h"
 #include "model/kparams.h"
 #include "util/log.h"
 
@@ -261,6 +269,332 @@ void fill(Slot& s, const std::vector<int>& prefix, int P, int K, int regime, std
   }
 }
 
+// ---- tree drafting (section 3) ----
+// The target's rows: stage-1 candidates over the whole universe (kV ids), values log p(.|prefix) on p's support and
+// lower ones elsewhere, sampled by sample_stage2_rows_tree with top-k / top-p / temperature like the engine.
+constexpr int kTreeN = kV;
+void target_row(const std::vector<int>& prefix, int regime, float* v, uint32_t* id) {
+  const Dist p = p_of(prefix, regime == kPoint ? kPoint : kRandom);
+  std::mt19937_64 r(key_of(prefix) ^ 0x3333);
+  float lo = 0;
+  for (size_t i = 0; i < p.id.size(); ++i) lo = std::min(lo, std::log(p.p[i]));
+  int n = 0;
+  for (size_t i = 0; i < p.id.size(); ++i) {
+    v[n] = std::log(p.p[i]);
+    id[n++] = uint32_t(p.id[i]);
+  }
+  for (int t = 0; t < kV && n < kTreeN; ++t) {
+    if (std::find(p.id.begin(), p.id.end(), kBase + t) != p.id.end()) continue;
+    v[n] = lo - 4.0f - float(r() % 8) * 0.5f;  // (ties on purpose: the sampler orders them by id)
+    id[n++] = uint32_t(kBase + t);
+  }
+}
+
+// The plain sampler's law of a row (sample_stage2_rows, transcribed): top-k by (value desc, id asc), top-p on the
+// untempered probabilities, then the temperature on the kept prefix; T = 0: the first of that order.
+struct Law {
+  std::vector<uint32_t> id;
+  std::vector<float> p;  // the kernel's float arithmetic (unnormalized probs; kt = their sum in order)
+  float kt = 1;
+};
+Law row_law(const float* v, const uint32_t* id, int n, int K, float top_p, float temp) {
+  std::vector<std::pair<float, uint32_t>> c(n);
+  for (int i = 0; i < n; ++i) c[i] = {v[i], id[i]};
+  std::sort(c.begin(), c.end(),
+            [](auto& a, auto& b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
+  Law L;
+  if (temp <= 0) {
+    L.id = {c[0].second};
+    L.p = {1.0f};
+    return L;
+  }
+  K = std::min(K, n);
+  std::vector<float> probs(K);
+  float tot = 0;
+  for (int q = 0; q < K; ++q) {
+    probs[q] = std::exp(c[q].first - c[0].first);
+    tot += probs[q];
+  }
+  int keep = K;
+  float cum = 0;
+  for (int q = 0; q < K; ++q) {
+    cum += probs[q] / tot;
+    if (cum >= top_p) {
+      keep = q + 1;
+      break;
+    }
+  }
+  L.kt = 0;
+  for (int q = 0; q < keep; ++q) {
+    L.id.push_back(c[q].second);
+    L.p.push_back(std::exp((c[q].first - c[0].first) / temp));
+    L.kt += L.p.back();
+  }
+  return L;
+}
+uint32_t pcg(uint32_t v) {
+  const uint32_t state = v * 747796405u + 2891336453u;
+  const uint32_t word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+  return (word >> 22u) ^ word;
+}
+// the draw sample_stage2_rows makes with RNG step `key` (the position-keyed uniform)
+int law_draw(const Law& L, uint32_t seed, uint32_t key) {
+  if (L.id.size() == 1) return int(L.id[0]);
+  const float u = float(pcg(seed ^ pcg(key)) & 0xffffff) / 16777216.0f * L.kt;
+  float acc = 0;
+  for (size_t q = 0; q < L.id.size(); ++q) {
+    acc += L.p[q];
+    if (u < acc) return int(L.id[q]);
+  }
+  return int(L.id.back());
+}
+
+// A synthetic lattice (cand_i [7][16] from the universe, cand_v, edges [7][16][16]) for a cycle after `prefix`:
+// random, or aligned with the target's likely path (the walk's chain is then mostly right and the siblings are p's
+// next tokens), drawn from r (independent of the target's uniforms, as a drafter's lattice is).
+void lattice(const std::vector<int>& prefix, int regime, std::mt19937_64& r, int* ci, float* cv, float* E) {
+  std::normal_distribution<float> N(0, 1);
+  std::vector<int> path = prefix;
+  for (int d = 0; d < 7; ++d) {
+    std::vector<int> u(kV);
+    for (int i = 0; i < kV; ++i) u[i] = kBase + i;
+    std::shuffle(u.begin(), u.end(), r);
+    if (regime == kEqual) {  // aligned: p's support of the main path's prefix first, values log p + noise
+      const Dist p = p_of(path, kRandom);
+      std::vector<int> c(p.id.begin(), p.id.end());
+      for (int t : u)
+        if (c.size() < 16 && std::find(c.begin(), c.end(), t) == c.end()) c.push_back(t);
+      for (int k = 0; k < 16; ++k) {
+        ci[d * 16 + k] = c[k];
+        cv[d * 16 + k] = k < int(p.id.size()) ? std::log(p.p[k]) + 0.3f * N(r) : -6.0f + N(r);
+      }
+      path.push_back(p.id[0]);
+    } else {
+      for (int k = 0; k < 16; ++k) {
+        ci[d * 16 + k] = u[k];
+        cv[d * 16 + k] = 1.5f * N(r);
+      }
+    }
+    for (int j = 0; j < 16; ++j)
+      for (int k = 0; k < 16; ++k) E[d * 256 + j * 16 + k] = regime == kEqual ? 0.0f : 0.7f * N(r);
+  }
+}
+
+int tree_cases(long trials, uint64_t salt, int only) {
+  Gpu& g = Gpu::get();
+  struct TCase {
+    int regime;     // lattice: kRandom or kEqual (aligned); target: kRandom, or kPoint (1-2 tokens: deep paths)
+    float temp, top_p;
+    int top_k;
+    bool cal;  // a random per-depth calibration (alpha, beta) instead of the identity (the law must not depend on it)
+    int R;     // verify rows (the budget allows this count alone)
+  };
+  const std::vector<TCase> cases = {{kRandom, 0.6f, 0.95f, 20, false, 8}, {kEqual, 0.6f, 0.95f, 20, true, 8},
+                                    {kEqual, 1.0f, 1.0f, 32, true, 5},    {kPoint, 0.6f, 0.95f, 20, true, 3},
+                                    {kRandom, 0.0f, 1.0f, 1, false, 8},   {kEqual, 0.0f, 1.0f, 1, true, 6},
+                                    {kEqual, 0.6f, 0.95f, 20, true, 1}};
+  Pipeline table_p = g.pipeline("dfl_kf_table"), build_p = g.pipeline("kf_build"),
+           samp_p = g.pipeline("sample_stage2_rows_tree"), acc_p = g.pipeline("kf_accept");
+  const int B = 2048, W = kf::kWords;
+  Buffer ci = g.alloc(size_t(B) * 112 * 4), cv = g.alloc(size_t(B) * 112 * 4), E = g.alloc(size_t(B) * 1792 * 4);
+  Buffer clq = g.alloc(size_t(B) * 1792 * 4), ctok = g.alloc(size_t(B) * 1792 * 4), next = g.alloc(1792 * 4);
+  Buffer tok = g.alloc(size_t(B) * 16 * 4), tree = g.alloc(size_t(B) * W * 4), live = g.alloc(size_t(B) * 16);
+  Buffer rv = g.alloc(size_t(B) * 8 * kTreeN * 4);
+  Buffer rid = g.alloc(size_t(B) * 8 * kTreeN * 4), samp = g.alloc(size_t(B) * 8 * 4), res = g.alloc(size_t(B) * 16);
+  Buffer gst = g.alloc(size_t(B) * 64), path = g.alloc(size_t(B) * kf::kPathWords * 4);
+  {
+    const std::vector<int32_t> nx = kf::lattice_next(7, 16);
+    memcpy(next.ptr(), nx.data(), nx.size() * 4);
+  }
+  int fails = 0;
+  for (size_t cix = 0; cix < cases.size(); ++cix) {
+    if (only >= 0 && int(cix) != only) continue;
+    const TCase& cs = cases[cix];
+    const int tgt = cs.regime == kPoint ? kPoint : kRandom;
+    const int lat = cs.regime == kEqual ? kEqual : kRandom;
+    std::map<long, long> obs, obs1;
+    long done = 0, path_bad = 0, compared = 0;
+    double mean_a = 0;
+    std::mt19937_64 hr(4321 + cix * 7 + salt * 1000003);
+    KfParams kp{};
+    {  // the budget's parameters the builder reads: the identity, or a random calibration; this case's rows alone
+      std::uniform_real_distribution<float> U(0, 1);
+      for (int d = 0; d <= kf::kMaxRows; ++d) {
+        kp.alpha[d] = cs.cal ? -1.5f + 2.0f * U(hr) : 0.0f;
+        kp.beta[d] = cs.cal ? 0.5f + 1.0f * U(hr) : 1.0f;
+        kp.cost[d] = 1.0f;
+      }
+      kp.force_n = 0;
+      kp.allowed = 1u << (cs.R - 1);
+      kp.max_rows = 8;
+    }
+    // one cycle for trials [0, n) after prefix pre[i] (the anchor at position P = pre[i].size()); the emitted tokens
+    auto cycle = [&](const std::vector<std::vector<int>>& pre, const std::vector<uint32_t>& seed) {
+      const int n = int(pre.size());
+      for (int i = 0; i < n; ++i) {
+        lattice(pre[i], lat, hr, ci.as<int>() + i * 112, cv.as<float>() + i * 112, E.as<float>() + i * 1792);
+        int* tk = tok.as<int>() + i * 16;
+        for (int j = 0; j < 16; ++j) tk[j] = 0;  // tokens[0]: the first anchor (outside the universe)
+        for (size_t j = 0; j < pre[i].size(); ++j) tk[1 + j] = pre[i][j];  // the anchor at P = pre.size()
+      }
+      {  // the trees: the lattice's tables, then the shared builder
+        auto e = g.begin();
+        for (int i = 0; i < n; ++i) {
+          const uint32_t P = uint32_t(pre[i].size());
+          e->use(table_p);
+          e->buf(0, ci, size_t(i) * 448); e->buf(1, cv, size_t(i) * 448); e->buf(2, E, size_t(i) * 1792 * 4);
+          e->buf(3, clq, size_t(i) * 1792 * 4); e->buf(4, ctok, size_t(i) * 1792 * 4);
+          e->dispatch(7 * 16, 1, 1, 32);
+          const kp::KfBuild bp{16u, P, 0u, 0u};
+          e->use(build_p);
+          e->buf(0, clq, size_t(i) * 1792 * 4); e->buf(1, ctok, size_t(i) * 1792 * 4); e->buf(2, next);
+          e->val(3, kp);
+          e->buf(4, tree, size_t(i) * W * 4); e->buf(5, tok, size_t(i) * 64); e->buf(6, live, size_t(i) * 16);
+          e->val(7, bp);
+          e->dispatch(1, 1, 1, 32);
+        }
+        e->commit_and_wait();
+      }
+      for (int i = 0; i < n; ++i) {  // the target's rows: slot t's path from the tree
+        const int* tk = tok.as<int>() + i * 16;
+        const int* tr = tree.as<int>() + i * W;
+        const int P = int(pre[i].size());
+        for (int t = 0; t < 8; ++t) {
+          std::vector<int> nodes;
+          for (int v = t; v > 0; v = tr[kf::kPar + v]) nodes.push_back(tk[P + v]);
+          std::vector<int> pp = pre[i];
+          pp.insert(pp.end(), nodes.rbegin(), nodes.rend());
+          target_row(pp, tgt, rv.as<float>() + (i * 8 + t) * kTreeN, rid.as<uint32_t>() + (i * 8 + t) * kTreeN);
+        }
+      }
+      {
+        auto e = g.begin();
+        for (int i = 0; i < n; ++i) {
+          const uint32_t P = uint32_t(pre[i].size());
+          kp::SampleRows sr{uint32_t(kTreeN), uint32_t(cs.top_k), cs.temp, cs.top_p, seed[i], P, 0, 0, 0};
+          e->use(samp_p);
+          e->buf(0, rv, size_t(i) * 8 * kTreeN * 4); e->buf(1, rid, size_t(i) * 8 * kTreeN * 4);
+          e->buf(2, samp, size_t(i) * 32);
+          e->val(3, sr);
+          e->buf(4, rid); e->buf(5, tree, size_t(i) * W * 4);
+          e->dispatch(8, 1, 1, 1024);
+          const kp::KfAccept ap{P, 8u, 1u, 0u};
+          e->use(acc_p);
+          e->buf(0, samp, size_t(i) * 32); e->buf(1, tok, size_t(i) * 64); e->buf(2, tree, size_t(i) * W * 4);
+          e->buf(3, res, size_t(i) * 16);
+          e->val(4, ap);
+          e->buf(5, live, size_t(i) * 16); e->buf(6, path, size_t(i) * kf::kPathWords * 4); e->buf(7, gst, size_t(i) * 64);
+          e->dispatch(1, 1, 1, 32);
+        }
+        e->commit_and_wait();
+      }
+      std::vector<std::vector<int>> out(n);
+      for (int i = 0; i < n; ++i) {
+        const int a = res.as<int>()[i * 4], P = int(pre[i].size());
+        const int* tr = tree.as<int>() + i * W;
+        for (int j = 1; j <= a + 1; ++j) out[i].push_back(tok.as<int>()[i * 16 + P + j]);
+        if (out[i].back() != res.as<int>()[i * 4 + 1]) ++path_bad;  // the token after the path
+        if (tr[kf::kN] != cs.R || int(live.as<uint32_t>()[i * 4]) != cs.R || tr[kf::kA] != a) ++path_bad;
+        if (int(gst.as<uint32_t>()[i * 16]) != P + a + 1 || int(gst.as<uint32_t>()[i * 16 + 1]) != a + 1) ++path_bad;
+        for (int j = 0; j <= a; ++j)  // the path: rows of the accepted branch, the drafter state's and the sequence's
+          if (path.as<int>()[i * kf::kPathWords + j] != tr[kf::kPath + j] ||
+              int(gst.as<uint32_t>()[i * 16 + 4 + j]) != tr[kf::kPath + j])
+            ++path_bad;
+        mean_a += P == 0 ? a : 0;
+      }
+      return out;
+    };
+    while (done < trials) {
+      const int nb = int(std::min<long>(B, trials - done));
+      std::vector<uint32_t> seeds(nb);
+      for (int i = 0; i < nb; ++i)
+        seeds[i] = uint32_t(mix(uint64_t(done + i) + (uint64_t(cix + 100) << 40) + (salt << 48)));
+      std::vector<std::vector<int>> pre0(nb);
+      auto em = cycle(pre0, seeds);
+      std::vector<int> second;
+      for (int i = 0; i < nb; ++i)
+        if (em[i].size() < 2) second.push_back(i);
+      if (!second.empty()) {
+        std::vector<std::vector<int>> pre1;
+        std::vector<uint32_t> s1;
+        for (int i : second) {
+          pre1.push_back({em[i][0]});
+          s1.push_back(seeds[i]);
+        }
+        auto em2 = cycle(pre1, s1);
+        for (size_t j = 0; j < second.size(); ++j) em[second[j]].push_back(em2[j][0]);
+      }
+      for (int i = 0; i < nb; ++i) {
+        const int t1 = em[i][0], t2 = em[i][1];
+        obs[long(t1) * 100000 + t2]++;
+        obs1[t1]++;
+        // pathwise: plain decoding with position-keyed uniforms writes the same two tokens
+        float v[kTreeN];
+        uint32_t id[kTreeN];
+        target_row({}, tgt, v, id);
+        const int p1 = law_draw(row_law(v, id, kTreeN, cs.top_k, cs.top_p, cs.temp), seeds[i], 0);
+        target_row({p1}, tgt, v, id);
+        const int p2 = law_draw(row_law(v, id, kTreeN, cs.top_k, cs.top_p, cs.temp), seeds[i], 1);
+        ++compared;
+        if (p1 != t1 || p2 != t2) ++path_bad;
+      }
+      done += nb;
+    }
+    // expected law of (t1, t2)
+    std::map<long, double> ex, ex1;
+    float v[kTreeN];
+    uint32_t id[kTreeN];
+    target_row({}, tgt, v, id);
+    const Law l0 = row_law(v, id, kTreeN, cs.top_k, cs.top_p, cs.temp);
+    for (size_t i = 0; i < l0.id.size(); ++i) {
+      const double p0 = l0.p[i] / l0.kt;
+      ex1[long(l0.id[i])] += p0;
+      target_row({int(l0.id[i])}, tgt, v, id);
+      const Law l1 = row_law(v, id, kTreeN, cs.top_k, cs.top_p, cs.temp);
+      for (size_t j = 0; j < l1.id.size(); ++j) ex[long(l0.id[i]) * 100000 + long(l1.id[j])] += p0 * l1.p[j] / l1.kt;
+    }
+    double st, pv, st1, pv1;
+    int dof, dof1;
+    long out, out1;
+    chi2(obs, ex, trials, &st, &dof, &pv, &out);
+    chi2(obs1, ex1, trials, &st1, &dof1, &pv1, &out1);
+    const bool greedy = cs.temp <= 0;
+    const bool ok = (greedy || (pv > 0.01 && pv1 > 0.01)) && out == 0 && out1 == 0 && path_bad == 0;
+    printf("[S1 tree] lattice %-8s target %-6s T=%.1f top-p %.2f top-k %d %s, %d rows: %ld trials, mean a %.2f; "
+           "joint chi2 %.1f (%d dof) p=%.3f; first token p=%.3f; outside support %ld; plain-decoding mismatches %ld of "
+           "%ld: %s\n",
+           lat == kEqual ? "aligned" : "random", tgt == kPoint ? "1-2" : "random", cs.temp, cs.top_p, cs.top_k,
+           cs.cal ? "calibrated" : "identity", cs.R, trials, mean_a / trials, st, dof, pv, pv1, out + out1, path_bad,
+           compared, ok ? "PASS" : "FAIL");
+    if (!ok) ++fails;
+  }
+  return fails;
+}
+
+// The shared budget's calibration fit (KfBudget::fit): records drawn from a known per-depth calibration recover it.
+int fit_check(uint64_t salt) {
+  std::mt19937_64 r(99 + salt);
+  std::uniform_real_distribution<float> ul(-6.0f, -0.01f), u01(0.0f, 1.0f);
+  int bad = 0;
+  for (int t = 0; t < 6; ++t) {
+    const float ta = -1.2f + 0.4f * float(t), tb = 0.6f + 0.25f * float(t);
+    std::vector<float> x;
+    std::vector<uint8_t> y;
+    for (int i = 0; i < 2048; ++i) {
+      const float lq = ul(r), xi = KfBudget::logit_q(lq);
+      x.push_back(xi);
+      y.push_back(u01(r) < 1.0f / (1.0f + std::exp(-(ta + tb * xi))));
+    }
+    float a = 0.0f, b = 1.0f;
+    KfBudget::fit(x, y, a, b, 8);
+    const bool ok = std::fabs(a - ta) < 0.3f && std::fabs(b - tb) < 0.25f;
+    if (!ok) ++bad;
+    printf("[fit] alpha %.2f beta %.2f from 2048 records drawn with alpha %.2f beta %.2f: %s\n", a, b, ta, tb,
+           ok ? "PASS" : "FAIL");
+  }
+  return bad ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -300,7 +634,8 @@ int main(int argc, char** argv) {
       for (uint32_t row = 0; row < R; ++row) {
         std::vector<std::pair<float, uint32_t>> c(n);
         for (uint32_t i = 0; i < n; ++i) c[i] = {cv.as<float>()[row * n + i], ci.as<uint32_t>()[row * n + i]};
-        std::sort(c.begin(), c.end(), [](auto& a, auto& b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
+        std::sort(c.begin(), c.end(),
+            [](auto& a, auto& b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
         float probs[32], tot = 0;
         for (uint32_t q = 0; q < Kk; ++q) {
           probs[q] = std::exp(c[q].first - c[0].first);
@@ -463,6 +798,10 @@ int main(int argc, char** argv) {
            out + out1, ok ? "PASS" : "FAIL", expect_fail ? (ok ? " (biased rule NOT detected)" : " (biased rule detected, as expected)") : "");
     if (ok == expect_fail) ++fails;
   }
+  // ---- 3. KFlash tree verifies: kf_build + sample_stage2_rows_tree + kf_accept ----
+  if (only < 0 || only >= int(cases.size()))
+    fails += tree_cases(trials, salt, only < 0 ? -1 : only - int(cases.size()));
+  if (only < 0) fails += fit_check(salt);
   printf(fails ? "FAILED: %d\n" : "ALL PASSED\n", fails);
   return fails ? 1 : 0;
 }

@@ -312,6 +312,7 @@ class Qwen35 : public Model {
   // its rows again, so the hook must stay armed until the chunk has completed or been rerun.
   void set_capture(const CaptureHook* h) { cap_ = h; }
   const QLinear& embed_table() const { return embed_; }
+  const std::string& model_dir() const { return dir_; }
   const QLinear& lm_head() const { return lm_head_; }
   // Drafter's dynamic verify depth (DFlash2, MoE only): while set, the 8-row verify routes experts only
   // for rows < min(R, rows[0]) (uint read by the GPU); later rows' outputs are garbage and must not be used.
@@ -320,6 +321,18 @@ class Qwen35 : public Model {
   // passes for 1-2-row experts): a row's logits then depend only on the rows before it, not on how the
   // other rows route. A speculative sampler that needs p(. | prefix) exactly sets it (~3% slower verify).
   void set_verify_moe_exact(bool on) { v8_moe_exact_ = on; }
+  // KFlash tree verifies: while set, the 8-row verify's rows are a tree (tree = the KFlash tree descriptor,
+  // src/kernels/kflash.h: parents, depths, ancestor-or-self masks): row t's token takes position pos + depth(t) (RoPE,
+  // its sample's uniform), its attention sees the history and its ancestors' rows, its GDN conv window and recurrent
+  // state are its ancestors' fold. The rows' K/V stay in cache rows pos + t and their tape in rows t until the
+  // acceptance (kf_accept) writes the accepted path to s.pend_path, moves its K/V (encode_kv_tree_compact) and sets
+  // s.pend_tree: the next pass (or encode_flush) folds tape rows pend_path[0 .. n_pend).
+  void set_verify_tree(const Buffer* tree) { v8_tree_ = tree; }
+  // the 8-row verify can run a tree (its attention on attn8m, the split GDN step)
+  bool verify_tree_ok() const;
+  // After a tree verify at pos: the K/V rows of the accepted path (the descriptor's, kf_accept) move to positions
+  // pos + i (every attention layer)
+  void encode_kv_tree_compact(Encoder& e, Seq& s, int pos, const Buffer& tree);
   // dev (tools/bench_verify8): the last verify's MoE expert passes again with layer li's weights (timing only)
   void moe8_replay(Encoder& e, int li, int mask);
   // The 8-row verify GEMMs, for other 8-row passes (the DFlash2 drafter). Inputs are X8 tables
@@ -533,6 +546,7 @@ class Qwen35 : public Model {
   const CaptureHook* cap_ = nullptr;
   const Buffer* v8_rlim_ = nullptr;
   bool v8_moe_exact_ = false;
+  const Buffer* v8_tree_ = nullptr;
   std::deque<Tensor> owned_;
   std::vector<Buffer> owned_bufs_;
 

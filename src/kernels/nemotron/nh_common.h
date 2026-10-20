@@ -101,3 +101,5 @@ struct NhGnormParams {
   uint D, G;
   float eps;
 };
+
+// (the KFlash tree descriptor's layout, kKf*, comes from src/kernels/kflash.h, shared with every backend)
