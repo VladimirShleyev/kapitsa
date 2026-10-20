@@ -224,7 +224,8 @@ def calib_prob(tab, tau=1.0):
 
 
 class OnlineCalib:
-    """The engine's online calibration of the lattice's node probabilities (dfl_tree_learn): per children position p,
+    """A per-position temperature learner (an alternative the engine does not use; KfCalib is the shared one): per
+    children position p,
     a log-likelihood over a temperature grid (tau_g = 2^((g - 8) / 4), g = 0..16: 0.25 .. 4) and the coverage (how
     often the target's token is among the 16 candidates), learned from the rows on each cycle's accepted path (the
     anchor's and every accepted node's: the target's token after a correct prefix), all 16 candidates labeled by that

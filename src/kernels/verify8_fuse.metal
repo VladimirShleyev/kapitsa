@@ -131,11 +131,10 @@ NI_INLINE void gdn_prep_verify8_impl(const device float* qkv, const device float
   for (uint t = 0; t < 8; ++t) in[t] = t < p.R ? qkv[t * C + c] : 0.0f;
   // fold pending rows into the committed window
   float w3[3] = {conv_state[0 * C + c], conv_state[1 * C + c], conv_state[2 * C + c]};
-  const uint pk = TREE && p.pidx ? uint(path[9]) : 0u;  // tree: the pending rows' tape rows, 4 bits each
   for (uint t = 0; t < p.n_pend; ++t) {
     w3[0] = w3[1];
     w3[1] = w3[2];
-    w3[2] = pend_qkv[(TREE && p.pidx ? (pk >> (4 * t)) & 15u : t) * C + c];
+    w3[2] = pend_qkv[(TREE && p.pidx ? uint(path[t]) : t) * C + c];
   }
   for (uint r = 0; r < 3; ++r) conv_state[r * C + c] = w3[r];
   float w0 = conv_w[c * 4 + 0], w1 = conv_w[c * 4 + 1], w2 = conv_w[c * 4 + 2], wq = conv_w[c * 4 + 3];
@@ -146,7 +145,7 @@ NI_INLINE void gdn_prep_verify8_impl(const device float* qkv, const device float
     float in3 = in[t];
     pend_qkv[t * C + c] = in3;
     if (TREE && p.tree && t > 0) {
-      const uint pr = uint(tree[t]);
+      const uint pr = uint(tree[kKfPar + t]);
       h0 = gdn_pick8(tw1, pr);
       h1 = gdn_pick8(tw2, pr);
       h2 = gdn_pick8(in, pr);

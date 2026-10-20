@@ -5,7 +5,8 @@
 //     random siblings and subtrees) accept exactly that branch; decoding tree after tree writes plain decoding's
 //     tokens, greedy and sampled (T = 0.8, top-k 20, top-p 0.95, a seed: the plain sampler's position-keyed draws);
 //     the state afterwards decodes on as plain decoding's does
-//  3. the tree builder (nh_kf_build) against a CPU reference on random lattices, calibrations and cost tables
+//  3. the tree builder (the shared kf_build on the lattice's tables) against a CPU reference on random lattices,
+//     calibrations and cost tables
 //  4. with a drafter (<dir>/dflash): its ring after committing a tree verify's accepted path (encode_commit_path)
 //     equals its ring after committing the same tokens verified as a chain; then whole KFlash decoding loops (the
 //     drafter's tree under the budget) write plain decoding's tokens, greedy and sampled
@@ -264,24 +265,34 @@ void test_builder(NemotronH& m, Seq& s) {
     kp.cost[0] = 1.0f;
     for (int n = 1; n <= 8; ++n) kp.cost[n] = trial % 4 == 0 ? 1.0f : 1.0f + 0.03f * float(n - 1) * float(1 + trial % 7);
     kp.force_n = trial % 10 == 9 ? 1 + rnd(8) : 0;
-    Buffer bt = g.alloc(tlq.size() * 4, "t_tlq"), bc = g.alloc(cand.size() * 4, "t_cand"),
-           bk = g.alloc(sizeof(KfParams), "t_kp");
+    kp.allowed = 0xffu;  // every row count 1 .. 8 (a MoE target's rows cost experts)
+    kp.max_rows = R8;
+    // the shared builder's children tables: tokens per children-row, the lattice's constant successors
+    std::vector<int> ctok(size_t(S * K * K));
+    for (int sl = 0; sl < S; ++sl)
+      for (int pp = 0; pp < K; ++pp)
+        for (int c = 0; c < K; ++c) ctok[size_t((sl * K + pp) * K + c)] = cand[size_t(sl * K + c)];
+    const std::vector<int32_t> next = kf::lattice_next(S, K);
+    Buffer bt = g.alloc(tlq.size() * 4, "t_tlq"), bc = g.alloc(ctok.size() * 4, "t_ctok"),
+           bn = g.alloc(next.size() * 4, "t_next"), bk = g.alloc(sizeof(KfParams), "t_kp");
     memcpy(bt.ptr(), tlq.data(), tlq.size() * 4);
-    memcpy(bc.ptr(), cand.data(), cand.size() * 4);
+    memcpy(bc.ptr(), ctok.data(), ctok.size() * 4);
+    memcpy(bn.ptr(), next.data(), next.size() * 4);
     memcpy(bk.ptr(), &kp, sizeof kp);
     const int P = 20;
     const struct {
-      uint32_t S, K, P;
-    } bp{uint32_t(S), uint32_t(K), uint32_t(P)};
+      uint32_t K, P, root, pad;
+    } bp{uint32_t(K), uint32_t(P), 0u, 0u};
     auto e = g.begin();
-    e->use(NemotronH::pipeline("nh_kf_build"));
+    e->use(NemotronH::pipeline("kf_build"));
     e->buf(0, bt);
     e->buf(1, bc);
-    e->buf(2, bk);
-    e->buf(3, m.tree_buf());
-    e->buf(4, s.tok);
-    e->buf(5, m.live_rows());
-    e->bytes(6, &bp, sizeof bp);
+    e->buf(2, bn);
+    e->buf(3, bk);
+    e->buf(4, m.tree_buf());
+    e->buf(5, s.tok);
+    e->buf(6, m.live_rows());
+    e->bytes(7, &bp, sizeof bp);
     e->dispatch(1, 1, 1, 32);
     e->commit_and_wait();
     float gap;
@@ -306,6 +317,7 @@ void test_builder(NemotronH& m, Seq& s) {
     }
     g.release(bt);
     g.release(bc);
+    g.release(bn);
     g.release(bk);
   }
   check(bad == 0, "builder: %d of 300 random lattices identical to the CPU reference, %d differ at near-ties (< 1e-4), %d differ",

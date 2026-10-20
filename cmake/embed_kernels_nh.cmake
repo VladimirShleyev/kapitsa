@@ -1,6 +1,8 @@
 # Concatenates src/kernels/common.h + src/kernels/nemotron/*.h + *.metal into one C++ string literal: the
 # Nemotron-H kernels, a library of their own compiled when a Nemotron model loads (Gpu::compile_extra).
 file(READ ${SRC_DIR}/common.h COMMON)
+file(READ ${SRC_DIR}/kflash.h KFLASH)
+string(APPEND COMMON "\n// ---- kflash.h ----\n${KFLASH}")
 file(GLOB HEADERS ${SRC_DIR}/nemotron/*.h)
 list(SORT HEADERS)
 set(ALL "${COMMON}\n")

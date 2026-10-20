@@ -4,6 +4,7 @@
 // encodes one drafting pass (anchor + 7 mask rows -> 7 proposals) into a command buffer.
 // Opt-in: nothing here is constructed unless a drafter directory is given.
 #pragma once
+#include "model/kflash_budget.h"
 #include "model/qwen35.h"
 
 #include <algorithm>
@@ -179,38 +180,23 @@ class DFlash2 {
   void gpu_state_reset(int P);
   void encode_cycle_draft_gpu(Encoder& e, Seq& s, DFlashSeq& d, int P_max, const SamplingParams& sp);
   int accepted() const { return acc_.as<int>()[0]; }
-  // proposals the last completed cycle verified (K, or the dynamic depth's choice; a tree: its nodes)
+  // proposals the last completed cycle verified (K, or the dynamic depth's choice; a tree: its live nodes)
   int verified(int K) const {
-    return use_tree_ ? last_rows_ - 1 : dyn_tau_ > 0 ? std::min(K, int(kdyn_.as<uint32_t>()[0])) : K;
+    return tree_ ? tree_buf_.as<int>()[kf::kN] - 1 : dyn_tau_ > 0 ? std::min(K, int(kdyn_.as<uint32_t>()[0])) : K;
   }
-  // KFlash M1, tree drafting (dense targets; NI_DFLASH_TREE=0/1 overrides): the single-stream cycles (encode_cycle*)
-  // can verify a best-first tree of up to 7 nodes from the lattice instead of the walk's chain (dfl_tree,
-  // Qwen35::set_verify_tree, dfl_accept_tree), greedy and sampled alike: the emitted tokens are the plain decoding's (at
-  // T > 0 its sampler's draws with each position's uniform). The lattice's node probabilities are calibrated online
-  // from the verify's outcomes (dfl_tree_learn); each run of cycles verifies a tree or the chain, and each cycle as
-  // many rows, as the most expected tokens per ms of measured verify cost say (verify_rows, pick_kernels).
-  // encode_draft (the batched path) keeps the walk.
+  // KFlash on the dense targets (NI_DFLASH_TREE=0/1 overrides): the single-stream cycles (encode_cycle*) verify a
+  // best-first tree over the lattice (the shared builder kf_build on this drafter's children tables, dfl_kf_table)
+  // instead of the walk's chain, under the shared budget (KfBudget: the lattice's probabilities calibrated against
+  // the verify's own acceptances, the verify's cost per row count measured on this Mac), and accept it with the shared
+  // kf_accept: greedy and sampled alike the emitted tokens are plain decoding's (at T > 0 its sampler's draws with
+  // each position's uniform). The verify's rows are whole 8-row tiles (one today). encode_draft (the batched path)
+  // keeps the walk.
   bool tree() const { return tree_; }
   void set_tree(bool on);
-  bool tree_active() const { return use_tree_; }  // the coming cycles verify trees (else the walk's chain)
-  const int* tree_desc() const { return tree_buf_.as<int>(); }  // dfl_tree's descriptor (spec_dflash.metal)
-  const float* tree_cal() const { return cal_buf_.as<float>(); }  // dfl_tree_learn's state (spec_dflash.metal)
-  // The verify's measured cost on this Mac for this target, drafter and precision: GPU ms of a cycle (drafting pass,
-  // tree verify of R rows, acceptance) for R = 1..8, and of the walk's chain of 8 rows; cached in
-  // hub::home_dir()/verify-cost.txt (key: chip, macOS build, the weights' identity, drafter bits and head). Empty until
-  // read or measured.
-  const std::vector<double>& tree_costs() const { return cost_tree_; }
-  double chain_cost() const { return cost_chain_; }
-  bool costs_known() const { return !cost_tree_.empty() && cost_chain_ > 0; }
-  // Measures and caches them with s at anchor P (prefilled, nothing pending, d.ctx == P): host-driven cycles that
-  // write only scratch rows (tokens, K/V and tape rows past P) and leave the calibration alone. ~6 cycles per R.
-  void measure_costs(Seq& s, DFlashSeq& d, int P, const SamplingParams& sp);
-  // The verify rows of the coming tree cycle: the R with the most expected tokens per ms, E(R) / c(R) (the running
-  // E(R) dfl_tree_learn keeps, the measured costs); 8 until both are known. NI_DFLASH_TREE_ROWS forces it.
-  int verify_rows() const;
-  // Tree or chain kernels for the coming cycles, by the same rule (best tree R vs the chain's running E over their
-  // costs); the host calls it when cycles start (gpu_state_reset, encode_prefill_commit do).
-  void pick_kernels();
+  const int* tree_desc() const { return tree_buf_.as<int>(); }  // the tree descriptor (kflash.h) of the last cycle
+  KfBudget* budget() const { return kf_budget_.get(); }
+  // after each tree cycle completed: the cycle's GPU ms for the budget (the loop calls it after its wait)
+  void observe(double ms);
   // proposals verified per cycle: NI_DFLASH_VERIFY (1..7), default 7
   static int verify_depth();
   // dynamic verify depth threshold (dfl_depth; MoE targets only): 0.5 by default, NI_DFLASH_DYN=tau, 0 = off
@@ -274,12 +260,8 @@ class DFlash2 {
   // encode_commit's projections of m rows of `src` (bf16 [8][n_slots * H]; the verify captures capt_ by default);
   // gather: rows gst[4 + r] of src (a tree cycle's accepted path)
   void enc_commit_from(Encoder& e, DFlashSeq& d, int m, const Buffer& src, bool gather = false);
-  // tree_mode: 0 the walk; 1 the tree (no walk); 2 the walk and the tree's statistics (a chain cycle that keeps the
-  // learner's running expectations current)
   void encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const SamplingParams& sp, bool gpu,
-                         int tree_mode = 0);
-  void encode_tree_learn(Encoder& e, Seq& s, bool chain);
-  void load_costs();
+                         bool tree = false);
   void dbg(Encoder& e, const std::string& name, const Buffer& src, size_t bytes);
 
   Qwen35& tg_;
@@ -306,16 +288,12 @@ class DFlash2 {
   float dyn_tau_t_ = 0.0f;  // T > 0
   uint32_t dyn_rule_ = 0;   // dfl_depth rule (NI_DFLASH_DYN_RULE)
   bool exact_moe_ = true;  // T > 0 on MoE targets: row-independent expert numerics (NI_DFLASH_EXACT_MOE=0 off)
-  // tree drafting (see tree()): the descriptor dfl_tree writes (int32 [64]), the learner's state (float [256]); a
-  // fixed node-score temperature tau (1 + slope d) instead of the learned ones (NI_DFLASH_TREE_TAU, experiments)
-  bool tree_ = false, use_tree_ = false;
+  // KFlash (see tree()): the tree descriptor (int32 [kf::kWords]), the lattice's children tables (clq float
+  // [7][16][16], ctok int, the constant successors), the builder's live-row word, the budget
+  bool tree_ = false;
   bool gst_tree_ = false;  // the drafter state's rows are a tree acceptance's path (gst[4 ..]): commits gather them
-  Buffer tree_buf_, cal_buf_;
-  float tree_tau_ = 0.0f, tree_slope_ = 0.0f;
-  int last_rows_ = kB;
-  std::vector<double> cost_tree_;
-  double cost_chain_ = 0;
-  std::string cost_key_;
+  Buffer tree_buf_, kf_clq_, kf_tok_, kf_next_, kf_live_;
+  std::unique_ptr<KfBudget> kf_budget_;
   // T > 0: the walk samples its chain at T_q = walk_tf_ * T (NI_DFLASH_QT; 0 = argmax chain with one-hot q)
   float walk_tf_ = 1.0f;
   // MLP and LM head on the target's 8-row verify GEMMs (Qwen35::enc_gu8 / enc_qmm8 with the verify's V8Knobs;

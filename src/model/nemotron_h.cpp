@@ -1256,7 +1256,7 @@ std::unique_ptr<Seq> NemotronH::new_seq(int limit, int initial) {
       s->pend_qkv.push_back(Buffer{});
     }
   }
-  s->pend_path = g.alloc(16 * 4, "nh_pend_path");  // (KFlash tree verifies: the accepted path, nh_accept_tree)
+  s->pend_path = g.alloc(size_t(kf::kPathWords) * 4, "nh_pend_path");  // (KFlash tree verifies: the accepted path)
   const int cap = initial < 0 ? limit : std::min(initial, limit);
   if (cap > 0 && !reserve(*s, cap)) fatal("insufficient memory for a %d-token KV cache", cap);
   reset(*s);
@@ -2360,18 +2360,19 @@ void NemotronH::encode_accept_tree(Encoder& e, Seq& s, int pos, const SamplingPa
   for (int r = 0; r < kMaxRows; ++r)
     enc_sample(e, logits_.view(size_t(r) * cfg_.vocab * 4, size_t(cfg_.vocab) * 4), samp_, r, sp, uint32_t(pos), &tree_,
                size_t(kf::kDep) * 4);
-  struct {
-    uint32_t P, K;
-  } ap{uint32_t(pos), uint32_t(kMaxRows - 1)};
-  e.use(pipe("nh_accept_tree"));
+  const struct {
+    uint32_t P, R, gst, pad;
+  } ap{uint32_t(pos), uint32_t(kMaxRows), 0u, 0u};
+  e.use(pipe("kf_accept"));  // (shared: src/kernels/kflash.h)
   e.buf(0, samp_);
   e.buf(1, s.tok);
-  e.buf(2, acc_);
-  e.buf(3, tree_);
+  e.buf(2, tree_);
+  e.buf(3, acc_);
   e.bytes(4, &ap, sizeof ap);
   e.buf(5, live());
   e.buf(6, s.pend_path);
-  e.dispatch(1, 1, 1, 1);
+  e.buf(7, live_all_);  // (no drafter state written: gst 0)
+  e.dispatch(1, 1, 1, 32);
   // the accepted path's K/V into place (positions pos + 1 .. pos + a)
   const KvP kp{uint32_t(kMaxRows), uint32_t(pos), uint32_t(s.cap), uint32_t(cfg_.hkv), uint32_t(cfg_.hd)};
   for (int i = 0; i < cfg_.layers; ++i) {

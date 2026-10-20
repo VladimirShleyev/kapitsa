@@ -1570,8 +1570,8 @@ NI_INLINE half v8e_b(uint i, uint mm, uint r, uint c) {
 // operand of P V), with flash-decoding chunks over the history. Writes attn_rows_partial's layout
 // (unnormalized o, natural-log max m, sum l), reduced by attn_rows_reduce. Row t sees positions
 // <= pos0 + t. chunk must be a multiple of 32. grid (nchunks, Hkv), 64 * G threads (<= 1024).
-// TREE (attn8m_partial_tree, DFlash2 tree drafting): the rows are a tree whose node t sits in cache row pos0 + t;
-// row t sees the history (< pos0) and the rows of its ancestors and itself (tree[16 + t], dfl_tree's
+// TREE (attn8m_partial_tree, KFlash tree verifies): the rows are a tree whose node t sits in cache row pos0 + t;
+// row t sees the history (< pos0) and the rows of its ancestors and itself (tree[kKfMask + t], the KFlash tree
 // ancestor-or-self mask), not the rows before it.
 template <bool TREE>
 NI_INLINE void attn8m_partial_impl(const device float* q, const device half* kc, const device half* vc,
@@ -1590,7 +1590,7 @@ NI_INLINE void attn8m_partial_impl(const device float* q, const device half* kc,
   const uint fcol = (qd & 2) * 2 + (lane % 2) * 2;
   const uint t = frow;                              // this lane's row
   const uint qpos = p.pos0 + t;
-  const uint anc = TREE && t < R ? uint(tree[16 + t]) : 0u;  // tree: the block rows this row sees
+  const uint anc = TREE && t < R ? uint(tree[kKfMask + t]) : 0u;  // tree: the block rows this row sees
   const uint start = chunk * p.chunk;
   const uint kend = min(start + p.chunk, p.pos0 + R);
   const uint ntiles = (kend - start + BK - 1) / BK;
@@ -1721,8 +1721,8 @@ NI_INLINE void attn8m_partial_impl(const device float* q, const device half* kc,
   attn8m_partial_impl<true>(q, kc, vc, part_o, part_ml, p, R, tree, kvm, tg, tid, sg, lane);
 }
 
-// ---- DFlash2 tree drafting: q / k norm + RoPE and the K/V cache write of a tree verify's rows ----
-// attn_prep / attn_prep_m (same buffers 0-10, MropeParams from mm.metal) for a tree (tree = dfl_tree's descriptor at
+// ---- KFlash tree verifies: q / k norm + RoPE and the K/V cache write of a tree verify's rows ----
+// attn_prep / attn_prep_m (same buffers 0-10, MropeParams from mm.metal) for a tree (tree = the KFlash tree descriptor at
 // buffer 11): row t's K and V go to cache row pos + t, but q and k rotate at the position its token takes, pos +
 // depth(t) (rows past the images' positions: + delta, as attn_prep_m). grid: x = Hq + 2 Hkv, y = rows; head_dim
 // threads.
@@ -1739,7 +1739,7 @@ NI_INLINE void attn8m_partial_impl(const device float* q, const device half* kc,
   threadgroup float row[512];
   const uint h = tg.x, t = tg.y, D = p.D;
   const uint pos = p.pos + t;                    // cache row
-  const uint tpos = p.pos + uint(tree[8 + t]);  // the position of its token
+  const uint tpos = p.pos + uint(tree[kKfDep + t]);  // the position of its token
   if (h >= p.Hq + p.Hkv) {  // value head: plain copy into the cache
     uint hv = h - p.Hq - p.Hkv;
     vc[(hv * p.max_seq + pos) * D + tid] = half(vr[(t * p.Hkv + hv) * D + tid]);
@@ -1771,20 +1771,20 @@ NI_INLINE void attn8m_partial_impl(const device float* q, const device half* kc,
   else kc[((h - p.Hq) * p.max_seq + pos) * D + tid] = half(x);
 }
 
-// After a tree verify's acceptance: the accepted path's K / V rows (path[i] = its i-th row's cache row - pos, path[8]
-// rows, dfl_accept_tree) move to the rows of their positions pos + i, in order (a row's destination is below every
-// later row's source). grid (1, 2 Hkv) x D: K heads, then V heads.
+// After a tree verify's acceptance: the accepted path's K / V rows (tree[kKfPath + i] = its i-th row's cache row -
+// pos, a = tree[kKfA] drafts; kf_accept) move to the rows of their positions pos + i, in order (a row's destination
+// is below every later row's source). grid (1, 2 Hkv) x D: K heads, then V heads.
 struct KvTreeParams {
   uint pos, Hkv, D, max_seq;
 };
 [[kernel]] void kv_tree_compact(device half* kc [[buffer(0)]], device half* vc [[buffer(1)]],
-                                const device int* path [[buffer(2)]], constant KvTreeParams& p [[buffer(3)]],
+                                const device int* tree [[buffer(2)]], constant KvTreeParams& p [[buffer(3)]],
                                 uint2 tg [[threadgroup_position_in_grid]], uint d [[thread_index_in_threadgroup]]) {
   const uint h = tg.y % p.Hkv;
   device half* c = (tg.y < p.Hkv ? kc : vc) + size_t(h) * p.max_seq * p.D + d;
-  const uint n = uint(path[8]);
-  for (uint i = 1; i < n; ++i) {
-    const uint s = uint(path[i]);
+  const uint a = uint(tree[kKfA]);
+  for (uint i = 1; i <= a; ++i) {
+    const uint s = uint(tree[kKfPath + i]);
     if (s != i) c[size_t(p.pos + i) * p.D] = c[size_t(p.pos + s) * p.D];
   }
 }
@@ -1909,7 +1909,7 @@ struct SwigluX8Params {
 // 1024 threads left it underused). The per-head tape rows k and g (read by every block for the fold) are written
 // by the block that arrives last at the counter cnt[h] (it also resets it): every block has read the old ones by
 // then. Raw outputs o -> out [R][Hv][128] (fp32); gdn_gnorm_x8 applies the gated RMSNorm. grid (Hv, blocks).
-// TREE (gdn_step_verify8s_tree, DFlash2 tree drafting): the rows are a tree (p.tree; row t's parent tree[t]) and the
+// TREE (gdn_step_verify8s_tree, KFlash tree verifies): the rows are a tree (p.tree; row t's parent tree[t]) and the
 // pending rows a tree cycle's accepted path (p.pidx: tape rows path[0 .. n_pend)). A row whose parent is the row
 // before it continues from that row's state; any other row first rebuilds its parent's state from the base (kept in
 // registers): the folds of its ancestors' tape entries (st = st g + k d, rows in slot order = root to leaf; d: the tape
@@ -1927,9 +1927,8 @@ NI_INLINE void gdn_step_verify8s_impl(const device float* q, const device float*
   device float* S = state + h * D * D;
   float4 st[4];
   for (int r = 0; r < 4; ++r) st[r] = *(device float4*)(S + (row0 + r) * D + lane * 4);
-  const uint pk = TREE && p.pidx ? uint(path[9]) : 0u;  // tree: the pending rows' tape rows, 4 bits each
   for (uint t0 = 0; t0 < p.n_pend; ++t0) {
-    const uint t = TREE && p.pidx ? (pk >> (4 * t0)) & 15u : t0;
+    const uint t = TREE && p.pidx ? uint(path[t0]) : t0;
     float4 kk = *(const device float4*)(pend_k + (t * p.Hv + h) * D + lane * 4);
     float gg = pend_g[t * p.Hv + h];
     for (int r = 0; r < 4; ++r) st[r] = st[r] * gg + kk * pend_d[(t * p.Hv + h) * D + row0 + r];
@@ -1940,7 +1939,7 @@ NI_INLINE void gdn_step_verify8s_impl(const device float* q, const device float*
   if (tid == 0) last = atomic_fetch_add_explicit(&cnt[h], 1u, memory_order_relaxed) == ntg.y - 1 ? 1u : 0u;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const bool writer = last != 0;  // every block of the head has read the old k / g tape
-  const uint rebuild = TREE && p.tree ? uint(tree[24]) : 0u;  // tree: rows whose parent is not the row before them
+  const uint rebuild = TREE && p.tree ? uint(tree[kKfJump]) : 0u;  // tree: rows whose parent is not the row before them
   float4 st0[4];  // tree: the base state
   if (TREE)
     for (int r = 0; r < 4; ++r) st0[r] = st[r];
@@ -1948,7 +1947,7 @@ NI_INLINE void gdn_step_verify8s_impl(const device float* q, const device float*
     if (TREE && ((rebuild >> t) & 1u)) {
       simdgroup_barrier(mem_flags::mem_device);  // this simdgroup's tape rows of the earlier rows
       for (int r = 0; r < 4; ++r) st[r] = st0[r];
-      const uint anc = uint(tree[16 + t]);
+      const uint anc = uint(tree[kKfMask + t]);
       for (uint j = 0; j < t; ++j) {
         if (!((anc >> j) & 1u)) continue;
         const float4 kj = *(const device float4*)(k + (j * p.Hk + hk) * D + lane * 4);

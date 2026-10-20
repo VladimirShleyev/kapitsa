@@ -3,8 +3,6 @@
 // Techniques: MLX af4g64 quantization of the drafter at load, the per-row window bound of the draft
 // attention, exact-code MMA operands, a separate block K/V scratch.
 #include "model/dflash2.h"
-#include "ane/ffn_split.h"
-#include "hub/hub.h"
 #include "model/kparams.h"
 #include "util/bf16.h"
 #include "util/log.h"
@@ -19,7 +17,6 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
-#include <sstream>
 #include <fstream>
 #include <thread>
 #include <unordered_map>
@@ -442,22 +439,17 @@ DFlash2::DFlash2(Qwen35& target, const std::string& dir, int bits) : tg_(target)
   if (dyn_tau_ > 0) logi("DFlash2: dynamic verify depth, tau %.3f (T = 0) / %.3f (T > 0)", dyn_tau_, dyn_tau_t_);
   if (const char* v = getenv("NI_DFLASH_EXACT_MOE")) exact_moe_ = atoi(v) != 0;
   if (const char* v = getenv("NI_DFLASH_QT")) walk_tf_ = std::max(0.0f, float(atof(v)));
-  // KFlash M1, tree drafting on dense targets (MoE targets keep the chain: there a row's experts are its cost, and the
-  // dynamic depth spends them; NI_DFLASH_TREE=0/1 overrides). The node probabilities are learned online
-  // (dfl_tree_learn); NI_DFLASH_TREE_TAU / _SLOPE fix a score temperature instead (experiments). The verify's cost per
-  // row count comes from this Mac (measure_costs, cached).
+  // KFlash on dense targets (MoE targets keep the chain: there a row's experts are its cost, and the dynamic depth
+  // spends them; NI_DFLASH_TREE=0/1 overrides). The budget's cache key: this model, drafter and chip.
   {
-    if (const char* t = getenv("NI_DFLASH_TREE_TAU")) tree_tau_ = std::max(0.05f, float(atof(t)));
-    if (const char* t = getenv("NI_DFLASH_TREE_SLOPE")) tree_slope_ = std::max(0.0f, float(atof(t)));
+    std::string key = tg_.model_dir().substr(tg_.model_dir().find_last_of('/') + 1) + "-" +
+                      dir.substr(dir.find_last_of('/') + 1) + "-b" + std::to_string(bits_) + "-" + Gpu::get().name();
+    for (char& c : key)
+      if (!isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '.') c = '_';
+    kf_budget_ = std::make_unique<KfBudget>(key);
+    kf_budget_->set_rows(1u << (kB - 1), kB);  // the dense verify: whole 8-row tiles, one today
     const char* v = getenv("NI_DFLASH_TREE");
     set_tree(v && *v ? atoi(v) != 0 : !tg_.config().moe);
-    // the cost cache's key: this Mac and macOS, the target's and the drafter's weights, the drafter's precision and head
-    std::string chip = Gpu::get().name();
-    for (char& ch : chip)
-      if (ch == ' ' || ch == '|') ch = '_';
-    cost_key_ = chip + "|" + ane::os_build() + "|" + ane::model_key(tg_.model_dir()) + "|" + ane::model_key(dir) +
-                "|b" + std::to_string(bits_) + "h" + std::to_string(head_n_);
-    load_costs();
   }
   if (cfg_.v1)
     logi("DFlash drafter (v1) %s: blocks of %d rows (trained %d), context window %d positions (trained %d)",
@@ -524,11 +516,17 @@ void DFlash2::alloc_buffers() {
   }
   gst_ = g.alloc(64, "dfl_gpu_state");  // [0] anchor, [1] rows to commit, [2] their first position, [4 + i] tree path
   memset(gst_.ptr(), 0, gst_.size);
-  tree_buf_ = g.alloc(64 * 4, "dfl_tree");
+  tree_buf_ = g.alloc(size_t(kf::kWords) * 4, "dfl_kf_tree");
   memset(tree_buf_.ptr(), 0, tree_buf_.size);
-  cal_buf_ = g.alloc(256 * 4, "dfl_tree_cal");
-  memset(cal_buf_.ptr(), 0, cal_buf_.size);
-  for (int p = 0; p < 7; ++p) cal_buf_.as<float>()[144 + p] = cal_buf_.as<float>()[152 + p] = 1.0f;  // tau 1, cover 1
+  kf_clq_ = g.alloc(7 * 16 * 16 * 4, "dfl_kf_clq");
+  kf_tok_ = g.alloc(7 * 16 * 16 * 4, "dfl_kf_tok");
+  kf_next_ = g.alloc(7 * 16 * 16 * 4, "dfl_kf_next");
+  {
+    const std::vector<int32_t> nx = kf::lattice_next(7, 16);
+    memcpy(kf_next_.ptr(), nx.data(), nx.size() * 4);
+  }
+  kf_live_ = g.alloc(16, "dfl_kf_live");
+  kf_live_.as<uint32_t>()[0] = uint32_t(kB);
   kdyn_ = g.alloc(16, "dfl_kdyn");
   kdyn_.as<uint32_t>()[0] = 7;
   kdyn_.as<uint32_t>()[1] = 8;
@@ -541,7 +539,7 @@ void DFlash2::alloc_buffers() {
   for (Buffer* b : {&h_, &n_, &xh_, &xs_, &xh2_, &xs2_, &hh_, &gu_g_, &gu_u_, &hs_, &dyn_, &q_, &kv_, &Q_, &Kb_, &Vb_, &part_o_, &part_ml_, &u_,
                     &logits_, &sel_, &tk_v_, &tk_i_, &cand_v_, &cand_i_, &edges_, &walk_s_, &qprob_, &walk_k_, &capt_,
                     &y8_, &c8_, &kv8_, &cdbg_, &rope_cs_, &dist_id_, &dist_p_, &dist_keep_, &acc_, &kdyn_, &gst_,
-                    &tree_buf_, &cal_buf_})
+                    &tree_buf_, &kf_clq_, &kf_tok_, &kf_next_, &kf_live_})
     resident_ += b->size;
 }
 
@@ -1068,7 +1066,6 @@ void DFlash2::set_prompt_captures(const uint16_t* rows_bf16, int rows) {
 }
 
 void DFlash2::encode_prefill_commit(Encoder& e, DFlashSeq& d) {
-  pick_kernels();  // a request's cycles follow: tree or chain kernels for them
   const uint32_t H = uint32_t(cfg_.H), nH = hook_pf_.ld;
   if (pf_rows_ == 0) {
     d.ctx = pf_n_;
@@ -1150,131 +1147,14 @@ void DFlash2::encode_commit(Encoder& e, DFlashSeq& d, int m) { enc_commit_from(e
 void DFlash2::set_tree(bool on) {
   // NI_DFLASH_VERIFY below 7 keeps the chain
   tree_ = on && tg_.block_drafter_ok() && tg_.verify_tree_ok() && verify_depth() == kB - 1;
-  use_tree_ = tree_;
   if (on && !tree_)
     logi("DFlash2: tree drafting needs all 8 verify rows and the 8-row verify's attn8m and split GDN paths; the chain "
          "stays");
-  if (tree_ && tree_tau_ > 0)
-    logi("DFlash2: tree drafting, fixed score temperature %.2f (+%.0f%% per position)", tree_tau_, 100 * tree_slope_);
-  else if (tree_)
-    logi("DFlash2: tree drafting (best-first from the lattice; node probabilities learned from the verify's outcomes)");
+  if (tree_) logi("KFlash: tree drafting on the DFlash2 lattice (budget cache %s)", kf_budget_ ? "on" : "off");
 }
 
-// ---- the tree's budget: the verify's measured cost per row count (KFlash M1) ----
-
-static std::string cost_path() { return hub::home_dir() + "/verify-cost.txt"; }
-
-void DFlash2::load_costs() {
-  std::ifstream f(cost_path());
-  std::string line;
-  while (std::getline(f, line)) {  // "kapitsa-verify-cost-1 <key> c_1 .. c_8 c_chain" (ms); the last line wins
-    std::istringstream ls(line);
-    std::string tag, key;
-    ls >> tag >> key;
-    if (tag != "kapitsa-verify-cost-1" || key != cost_key_) continue;
-    std::vector<double> c(kB);
-    double ch = 0;
-    bool ok = true;
-    for (double& x : c) ok = ok && bool(ls >> x) && x > 0;
-    ok = ok && bool(ls >> ch) && ch > 0;
-    if (ok) {
-      cost_tree_ = c;
-      cost_chain_ = ch;
-    }
-  }
-}
-
-void DFlash2::measure_costs(Seq& s, DFlashSeq& d, int P, const SamplingParams& sp) {
-  if (!tree_ || s.n_pend != 0 || d.ctx != P) return;
-  if (!s.pend_path) s.pend_path = Gpu::get().alloc(64, "pend_path");
-  Gpu& g = Gpu::get();
-  const double t0 = now_ms();
-  // one cycle as the decode loop encodes it (one command buffer: drafting pass, verify of R rows, acceptance), GPU ms;
-  // the tree's acceptance writes scratch rows only (tokens and K/V past P, the drafter state the loop resets)
-  auto cycle = [&](bool tree, int R) {
-    auto e = g.begin();
-    encode_draft_impl(*e, s, d, P, sp, false, tree ? 1 : 0);
-    arm_verify(P);
-    if (tree) {
-      tg_.set_verify_tree(&tree_buf_);
-      tg_.encode_verify(*e, s, P, R, sp, uint32_t(P), true);
-      tg_.set_verify_tree(nullptr);
-      disarm();
-      const kp::DflAcceptTree ap{uint32_t(P), uint32_t(R)};
-      e->use(dpipe("dfl_accept_tree"));
-      e->buf(0, s.tok); e->buf(1, tg_.verify_samples()); e->buf(2, tree_buf_); e->buf(3, acc_);
-      e->val(4, ap);
-      e->buf(5, gst_); e->buf(6, s.pend_path);
-      e->dispatch(1, 1, 1, 32);
-      tg_.encode_kv_tree_compact(*e, s, P);
-    } else {
-      tg_.encode_verify(*e, s, P, R, sp, uint32_t(P), true);
-      disarm();
-      encode_accept(*e, s, P, R - 1, sp);
-    }
-    e->commit_and_wait();
-    return e->gpu_ms();
-  };
-  auto median = [&](bool tree, int R) {
-    cycle(tree, R);  // warm-up
-    std::vector<double> v;
-    for (int i = 0; i < 5; ++i) v.push_back(cycle(tree, R));
-    std::sort(v.begin(), v.end());
-    return v[v.size() / 2];
-  };
-  std::vector<double> c(kB);
-  for (int R = 1; R <= kB; ++R) c[R - 1] = median(true, R);
-  const double ch = median(false, kB);
-  cost_tree_ = c;
-  cost_chain_ = ch;
-  gpu_state_reset(P);
-  std::error_code ec;
-  std::filesystem::create_directories(hub::home_dir(), ec);
-  if (std::ofstream f{cost_path(), std::ios::app}) {
-    f << "kapitsa-verify-cost-1 " << cost_key_;
-    for (double x : c) f << " " << x;
-    f << " " << ch << "\n";
-  }
-  std::string row;
-  for (double x : c) row += " " + std::to_string(x).substr(0, 6);
-  logi("DFlash2: verify cost on this Mac (GPU ms per cycle, tree of R = 1..8 rows):%s; chain of 8: %.3f (measured in "
-       "%.1f s, cached in %s)", row.c_str(), ch, (now_ms() - t0) / 1000, cost_path().c_str());
-}
-
-int DFlash2::verify_rows() const {
-  static const int forced = getenv("NI_DFLASH_TREE_ROWS") ? std::clamp(atoi(getenv("NI_DFLASH_TREE_ROWS")), 1, kB) : 0;
-  if (forced) return forced;
-  const float* c = cal_buf_.as<float>();
-  if (!costs_known() || c[170] < 1) return kB;
-  int best = kB;
-  double bv = -1;
-  for (int R = 1; R <= kB; ++R) {
-    const double v = c[160 + R - 1] / cost_tree_[size_t(R - 1)];
-    if (v > bv) {
-      bv = v;
-      best = R;
-    }
-  }
-  return best;
-}
-
-void DFlash2::pick_kernels() {
-  use_tree_ = tree_;
-  const float* c = cal_buf_.as<float>();
-  if (!tree_ || !costs_known() || c[170] < 1) return;
-  double best = 0;
-  for (int R = 1; R <= kB; ++R) best = std::max(best, double(c[160 + R - 1]) / cost_tree_[size_t(R - 1)]);
-  use_tree_ = best >= c[168] / cost_chain_;
-}
-
-void DFlash2::encode_tree_learn(Encoder& e, Seq& s, bool chain) {
-  const uint32_t mode = chain ? 1u : 0u;
-  e.use(dpipe("dfl_tree_learn"));
-  e.buf(0, cand_i_); e.buf(1, cand_v_); e.buf(2, edges_); e.buf(3, tree_buf_);
-  e.buf(4, chain || !s.pend_path ? acc_ : s.pend_path);
-  e.buf(5, tg_.verify_samples()); e.buf(6, walk_k_); e.buf(7, acc_); e.buf(8, cal_buf_);
-  e.val(9, mode);
-  e.dispatch(1, 1, 1, 32);
+void DFlash2::observe(double ms) {
+  if (tree_ && kf_budget_) kf_budget_->observe(tree_buf_.as<int32_t>(), ms);
 }
 
 void DFlash2::stage_init(DFlashSeq& d) {
@@ -1389,7 +1269,7 @@ void DFlash2::encode_draft(Encoder& e, Seq& s, DFlashSeq& d, int P, const Sampli
 }
 
 void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const SamplingParams& sp, bool gpu,
-                                int tree_mode) {
+                                bool tree) {
   // gpu: the anchor position comes from the drafter state (gst_); P is only its upper bound here
   if (!gpu && P != d.ctx) fatal("DFlash2 draft: anchor position %d but the ring holds %d positions", P, d.ctx);
   if (P + kB >= s.cap) fatal("DFlash2 draft: context full (%d)", s.cap);
@@ -1623,18 +1503,23 @@ void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const S
       e.buf(7, gst_);
       e.dispatch(7, 8, 1, 256);  // 8 threadgroups per position (7 x 1: +0.006 to +0.018 ms per pass)
     }
-    // the best-first tree into tokens[P+1 ..] (slot order) and its descriptor (tree_mode 1: no walk), or only its
-    // statistics next to the walk's chain (tree_mode 2)
-    auto tree = [&](bool stats) {
-      const kp::DflTree tp{Pk, uint32_t(P + 1), tree_tau_, tree_slope_, (tree_tau_ > 0 ? 1u : 0u) | (stats ? 2u : 0u)};
-      e.use(dpipe("dfl_tree"));
-      e.buf(0, cand_i_); e.buf(1, cand_v_); e.buf(2, edges_); e.buf(3, s.tok); e.buf(4, tree_buf_);
-      e.val(5, tp);
-      e.buf(6, gst_); e.buf(7, cal_buf_);
+    if (tree) {  // KFlash: the lattice's children tables, then the shared best-first builder (no walk)
+      e.use(dpipe("dfl_kf_table"));
+      e.buf(0, cand_i_); e.buf(1, cand_v_); e.buf(2, edges_); e.buf(3, kf_clq_); e.buf(4, kf_tok_);
+      e.dispatch(7 * 16, 1, 1, 32);
+      KfParams kp{};
+      kf_budget_->write(kp);
+      // the GPU-driven anchor: the builder's P is unknown to the host, so the tokens' base comes from the drafter state
+      // (kf_build reads P from its params: the host passes P; a GPU-driven pass passes the sentinel and the kernel reads
+      // gst) -- see kf_build_gpu below
+      const kp::KfBuild bp{16u, Pk, 0u, 0u};
+      e.use(dpipe(gpu ? "kf_build_gpu" : "kf_build"));
+      e.buf(0, kf_clq_); e.buf(1, kf_tok_); e.buf(2, kf_next_);
+      e.val(3, kp);
+      e.buf(4, tree_buf_); e.buf(5, s.tok); e.buf(6, kf_live_);
+      e.val(7, bp);
+      if (gpu) e.buf(8, gst_);
       e.dispatch(1, 1, 1, 32);
-    };
-    if (tree_mode == 1) {
-      tree(false);
       return;
     }
     kp::DflSelect p{Pk, sp.temperature, sp.seed, uint32_t(P + 1), sp.temperature * walk_tf_};
@@ -1644,7 +1529,6 @@ void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const S
     e.val(7, p);
     e.buf(8, gst_);
     e.dispatch(1, 1, 1, 32);
-    if (tree_mode == 2) tree(true);
   }
 }
 
@@ -1683,33 +1567,29 @@ void DFlash2::encode_accept(Encoder& e, Seq& s, int P, int K, const SamplingPara
 
 void DFlash2::encode_cycle_draft(Encoder& e, Seq& s, DFlashSeq& d, int P, int m_prev, const SamplingParams& sp) {
   if (m_prev) encode_commit(e, d, m_prev);
-  encode_draft_impl(e, s, d, P, sp, false, !tree_ ? 0 : use_tree_ ? 1 : 2);
+  encode_draft_impl(e, s, d, P, sp, false, tree_);
 }
 
 void DFlash2::encode_cycle_verify(Encoder& e, Seq& s, int P, int K, const SamplingParams& sp) {
-  if (use_tree_) {
-    // the tree's first R slots (anchor + R - 1 nodes) with captures; the acceptance walks the rows' own tokens (argmax,
-    // or the plain sampler's draw keyed by the token's position), writes the path, moves its K/V into place, and
-    // leaves the path for the target's next fold (s.pend_tree) and the next ring commit (gst[4 ..]); the learner then
-    // reads the cycle's outcome
-    if (!s.pend_path) s.pend_path = Gpu::get().alloc(64, "pend_path");
-    const int R = verify_rows();
-    last_rows_ = R;
+  if (tree_) {
+    // the tree's rows (one 8-row tile) with captures; the shared acceptance walks the rows' own tokens (argmax, or the
+    // plain sampler's draw keyed by the token's position), writes the path and the budget's records, and leaves the
+    // path for the K/V compaction, the target's next fold (s.pend_tree) and the next ring commit (gst[4 ..])
+    if (!s.pend_path) s.pend_path = Gpu::get().alloc(size_t(kf::kPathWords) * 4, "pend_path");
     tg_.set_verify_tree(&tree_buf_);
     tg_.set_verify_moe_exact(exact_moe_ && sp.temperature > 0);  // (a tree forced onto a MoE target)
     arm_verify(P);
-    tg_.encode_verify(e, s, P, R, sp, uint32_t(P), /*v8=*/true);
+    tg_.encode_verify(e, s, P, kB, sp, uint32_t(P), /*v8=*/true);
     disarm();
     tg_.set_verify_moe_exact(false);
     tg_.set_verify_tree(nullptr);
-    const kp::DflAcceptTree ap{uint32_t(P), uint32_t(R)};
-    e.use(dpipe("dfl_accept_tree"));
-    e.buf(0, s.tok); e.buf(1, tg_.verify_samples()); e.buf(2, tree_buf_); e.buf(3, acc_);
+    const kp::KfAccept ap{uint32_t(P), uint32_t(kB), 1u, 0u};
+    e.use(dpipe("kf_accept"));
+    e.buf(0, tg_.verify_samples()); e.buf(1, s.tok); e.buf(2, tree_buf_); e.buf(3, acc_);
     e.val(4, ap);
-    e.buf(5, gst_); e.buf(6, s.pend_path);
+    e.buf(5, kf_live_); e.buf(6, s.pend_path); e.buf(7, gst_);
     e.dispatch(1, 1, 1, 32);
-    tg_.encode_kv_tree_compact(e, s, P);
-    if (tree_tau_ <= 0) encode_tree_learn(e, s, false);
+    tg_.encode_kv_tree_compact(e, s, P, tree_buf_);
     s.pend_tree = true;
     gst_tree_ = true;
     return;
@@ -1734,9 +1614,6 @@ void DFlash2::encode_cycle_verify(Encoder& e, Seq& s, int P, int K, const Sampli
   tg_.set_verify_row_limit(nullptr);
   tg_.set_verify_moe_exact(false);
   encode_accept(e, s, P, K, sp);
-  // a chain cycle of a tree-capable drafter: the learner keeps reading the outcomes (the drafting half wrote the
-  // tree's statistics next to the walk), so the next runs of cycles can pick the tree again
-  if (tree_ && tree_tau_ <= 0) encode_tree_learn(e, s, true);
 }
 
 void DFlash2::gpu_state_reset(int P) {
@@ -1744,12 +1621,11 @@ void DFlash2::gpu_state_reset(int P) {
   g[0] = uint32_t(P);
   g[1] = 0;
   g[2] = uint32_t(P);
-  pick_kernels();  // cycles start here: tree or chain kernels for them
 }
 
 void DFlash2::encode_cycle_draft_gpu(Encoder& e, Seq& s, DFlashSeq& d, int P_max, const SamplingParams& sp) {
   encode_commit(e, d, -1);  // the rows the last acceptance kept (none after gpu_state_reset)
-  encode_draft_impl(e, s, d, P_max, sp, true, !tree_ ? 0 : use_tree_ ? 1 : 2);
+  encode_draft_impl(e, s, d, P_max, sp, true, tree_);
 }
 
 void DFlash2::encode_cycle(Encoder& e, Seq& s, DFlashSeq& d, int P, int m_prev, int K, const SamplingParams& sp) {

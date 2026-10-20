@@ -402,9 +402,9 @@ NI_INLINE void topk256_row(const device float* logits, const device float* share
 // recorded (k, g, delta) per row, a rank-1 update each) and stores the new base, then evaluates
 // the R new rows without writing the state, recording their tape. Accepted rows are folded in by
 // the next call, rejected ones are simply never applied. R = 0 just flushes the pending rows.
-// DFlash2 tree drafting (Qwen35::set_verify_tree): the R rows are a tree, row t's parent row tree[t] (dfl_tree's
-// descriptor; row 0, the anchor, has none): a row's conv window and recurrent state are its ancestors' fold. Its
-// accepted path's rows are folded by the next pass in path order: tape rows path[0 .. n_pend) (pidx; dfl_accept_tree).
+// KFlash tree verifies (Qwen35::set_verify_tree): the R rows are a tree, row t's parent row tree[kKfPar + t] (the KFlash
+// tree descriptor, kflash.h; row 0, the anchor, has none): a row's conv window and recurrent state are its ancestors' fold. Its
+// accepted path's rows are folded by the next pass in path order: tape rows path[0 .. n_pend) (pidx; kf_accept).
 struct GdnVerifyParams {
   uint R;
   uint n_pend;
@@ -445,7 +445,7 @@ NI_INLINE void gdn_prep_verify_impl(const device float* qkv, const device float*
     float in3 = qkv[t * C + c];
     pend_qkv[t * C + c] = in3;
     if (TREE && p.tree && t > 0) {  // the parent's window shifted by the parent's input
-      const uint pr = uint(tree[t]);
+      const uint pr = uint(tree[kKfPar + t]);
       h0 = tw1[pr];
       h1 = tw2[pr];
       h2 = tin[pr];
@@ -489,8 +489,8 @@ NI_INLINE void gdn_prep_verify_impl(const device float* qkv, const device float*
   gdn_prep_verify_impl<false>(qkv, a, bb, conv_state, conv_w, A_log, dt_bias, q_out, k_out, v_out, g_out, beta_out,
                               pend_qkv, p, nullptr, nullptr, tg, tid, scratch);
 }
-// tree rows (p.tree) and / or pending rows on a tree's path (p.pidx): tree = dfl_tree's descriptor, path =
-// dfl_accept_tree's (encode_flush folds a tree cycle's accepted rows with it)
+// tree rows (p.tree) and / or pending rows on a tree's path (p.pidx): tree = the KFlash tree descriptor, path =
+// kf_accept's (encode_flush folds a tree cycle's accepted rows with it)
 [[kernel]] void gdn_prep_verify_tree(const device float* qkv [[buffer(0)]], const device float* a [[buffer(1)]],
                                      const device float* bb [[buffer(2)]], device float* conv_state [[buffer(3)]],
                                      const device bfloat* conv_w [[buffer(4)]],
@@ -581,7 +581,7 @@ NI_INLINE void gdn_step_verify_impl(const device float* q, const device float* k
   }
 NI_GDN_STEP_VERIFY(gdn_step_verify, false)
 NI_GDN_STEP_VERIFY(gdn_step_verify_sg, true)
-// pending rows on a tree cycle's path (encode_flush after DFlash2 tree drafting): path = dfl_accept_tree's
+// pending rows on a tree cycle's path (encode_flush after a KFlash tree cycle): path = kf_accept's
 [[kernel]] void gdn_step_verify_pidx(const device float* q [[buffer(0)]], const device float* k [[buffer(1)]],
                                      const device float* v [[buffer(2)]], const device float* g [[buffer(3)]],
                                      const device float* beta [[buffer(4)]], device float* state [[buffer(5)]],
@@ -714,7 +714,7 @@ NI_INLINE void sample_stage2_rows_impl(const device float* cv, const device uint
   sample_stage2_rows_impl(cv, ci, tokens, p, table, r, r, tid, ntg, sv, si, topv, topi);
 }
 // A tree verify's rows (DFlash2 tree drafting): row r draws with the uniform of the position its token takes, step +
-// depth of node r (tree[8 + r], dfl_tree's descriptor), the same uniform plain decoding's row at that position draws:
+// depth of node r (tree[kKfDep + r], the KFlash tree descriptor), the same uniform plain decoding's row at that position draws:
 // siblings share it, and only one of them can lie on the accepted path.
 [[kernel]] void sample_stage2_rows_tree(const device float* cv [[buffer(0)]], const device uint* ci [[buffer(1)]],
                                         device int* tokens [[buffer(2)]], constant SampleRowsParams& p [[buffer(3)]],
@@ -726,7 +726,7 @@ NI_INLINE void sample_stage2_rows_impl(const device float* cv, const device uint
   threadgroup uint si[32];
   threadgroup float topv[64];
   threadgroup uint topi[64];
-  sample_stage2_rows_impl(cv, ci, tokens, p, table, r, uint(tree[8 + r]), tid, ntg, sv, si, topv, topi);
+  sample_stage2_rows_impl(cv, ci, tokens, p, table, r, uint(tree[kKfDep + r]), tid, ntg, sv, si, topv, topi);
 }
 
 // ---- qmvr v2: x rows staged in threadgroup memory (half), 4 weight rows per simdgroup ----

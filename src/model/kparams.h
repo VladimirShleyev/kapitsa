@@ -263,14 +263,13 @@ struct DflAccept {
   uint32_t dyn;  // 1: K = min(K, kdyn[0]) (dynamic verify depth)
 };
 
-struct DflTree {
-  uint32_t P, out_index;
-  float tau, slope;  // mode bit 0: node score temperature tau (1 + slope d) at position d instead of the learned ones
-  uint32_t mode;     // bit 1: statistics only (a chain cycle)
+// the shared KFlash tree kernels (src/kernels/kflash.h): kf_build / kf_build_gpu and kf_accept
+struct KfBuild {
+  uint32_t K, P, root, pad;
 };
 
-struct DflAcceptTree {
-  uint32_t P, R;  // anchor position, verify rows
+struct KfAccept {
+  uint32_t P, R, gst, pad;
 };
 
 struct KvTree {

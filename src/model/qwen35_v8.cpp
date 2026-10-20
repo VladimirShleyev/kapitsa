@@ -801,7 +801,7 @@ void Qwen35::encode_verify8(Encoder& e, Seq& s, int pos, int R, const SamplingPa
   const int VD = cfg_.lin_hv * cfg_.lin_dv;
   enc_embed(e, s.tok, pos, R, x_);
   // DFlash2 tree drafting: the rows are a tree (v8_tree_) and / or the pending rows a tree cycle's accepted path
-  // (s.pend_tree): the *_tree kernels (dfl_tree's descriptor, the path in s.pend_path)
+  // (s.pend_tree): the *_tree kernels (the KFlash tree descriptor, the path in s.pend_path)
   const bool tree = v8_tree_ != nullptr, ptree = s.pend_tree && s.n_pend > 0;
   if ((tree || ptree) && !s.pend_path) fatal("encode_verify8: a tree verify without the sequence's path buffer");
   const Buffer& tree_buf = tree ? *v8_tree_ : s.pend_path;
@@ -908,12 +908,12 @@ bool Qwen35::verify_tree_ok() const {
   return split && attn_mma && cfg_.hq / cfg_.hkv <= 16 && cfg_.head_dim == 256;
 }
 
-void Qwen35::encode_kv_tree_compact(Encoder& e, Seq& s, int pos) {
+void Qwen35::encode_kv_tree_compact(Encoder& e, Seq& s, int pos, const Buffer& tree) {
   const kp::KvTree p{uint32_t(pos), uint32_t(cfg_.hkv), uint32_t(cfg_.head_dim), uint32_t(s.cap)};
   for (int i = 0; i < cfg_.layers; ++i) {
     if (cfg_.is_linear[i]) continue;
     e.use(pipe8("kv_tree_compact"));
-    e.buf(0, s.kc[i]); e.buf(1, s.vc[i]); e.buf(2, s.pend_path);
+    e.buf(0, s.kc[i]); e.buf(1, s.vc[i]); e.buf(2, tree);
     e.val(3, p);
     e.dispatch(1, 2 * cfg_.hkv, 1, cfg_.head_dim);
   }

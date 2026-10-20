@@ -428,7 +428,7 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
   const std::string mode = lili_ ? std::string(lili_->name()) + " speculative decoding (7-token blocks)"
                          : nh_ngram_ > 0 ? "prompt-lookup speculative decoding (up to " + std::to_string(nh_ngram_) +
                                                " drafts per cycle)"
-                         : dfl_ && dfl_->tree() ? std::string("DFlash2 speculative decoding (a tree of 7 drafts per cycle)")
+                         : dfl_ && dfl_->tree() ? std::string("KFlash speculative decoding (DFlash2 lattice, tree verify)")
                          : dfl_ ? "DFlash2 speculative decoding (verify " + std::to_string(DFlash2::verify_depth()) + " of 7)"
                          : spec_ ? "MTP speculative decoding depth " + std::to_string(opts_.spec_depth)
                          : dory_spec_ > 0 ? "speculative decoding (" +
@@ -2135,9 +2135,6 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
         next_draft->commit();
       }
     };
-    // KFlash M1: the tree's budget needs this Mac's verify cost per row count; the first request a model serves measures
-    // it (~6 cycles per row count, a few seconds once; cached per Mac, model and precision)
-    if (go && dfl_->tree() && !dfl_->costs_known() && s.n_pend == 0 && d.ctx == P) dfl_->measure_costs(s, d, P, sp);
     if (go) start_cycles();
     bool parked = false;     // the request parked after the last cycle (no drafting half committed)
     bool park_last = false;  // the last cycle committed no drafting half though there was room: it meant to park
@@ -2175,6 +2172,7 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
         next_draft->commit();
       }
       e2->wait();
+      dfl_->observe(e2->gpu_ms());  // KFlash: the budget reads the cycle's outcome and the verify's cost
       const int a = dfl_->accepted();
       a_last = a;
       const int* tk = s.tokens();
@@ -2240,6 +2238,7 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
     q35_->encode_flush(*e3, s);
     e3->commit_and_wait();
     fed_until = P;
+    if (dfl_->tree() && dfl_->budget() && req_cycles > 0) logi("%s", dfl_->budget()->summary().c_str());
   } else if (dory_spec_ > 0) {
     // Dory speculative decoding (per-loop KV). Prompt lookup: when the last tokens occurred earlier in the
     // conversation, the tokens that followed them are the drafts, and one pass of the full loop count verifies them
