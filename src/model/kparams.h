@@ -132,6 +132,7 @@ struct GdnVerify {
   uint32_t R, n_pend, Hk, Hv, C;
   float eps;
   uint32_t tree = 0, pidx = 0;  // the *_tree kernels: rows form a tree / pending rows are a tree cycle's path
+  uint32_t pin = 0;             // gdn_step_verify8s_tree: the recurrence's update in one explicit form (gdn_update)
 };
 
 struct SampleRows {

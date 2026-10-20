@@ -436,22 +436,33 @@ void Qwen35::enc_attn8(Encoder& e, const Seq& s, const Layer& L, const Buffer& k
   // history chunks (flash decoding): ~8 threadgroups per core over the kv heads, >= 64 keys each,
   // at most 1024 / R (partials buffer)
   static const int tg_target = env_int("NI_V8_ATTN_TGS", 160);
-  const uint32_t Lmax = uint32_t(pos + R), gran = mma ? 32 : 16;
+  // NI_V8_TREE_ATTN=0: the tree block's keys inside the MMA tiles (attn8m_partial_tree), whose rounding follows the
+  // rows' slots; else the MMA tiles take the history alone and attn8_tree_block the block, one more chunk
+  static const bool tree_block = env_int("NI_V8_TREE_ATTN", 1) != 0;
+  const bool block = tree && tree_block;
+  const uint32_t Lmax = uint32_t(pos + R), gran = mma ? 32 : 16, extra = block ? 1u : 0u;
   const uint32_t want = std::max<uint32_t>(1, (uint32_t(tg_target) + cfg_.hkv - 1) / cfg_.hkv);
   uint32_t chunk = std::max<uint32_t>(64, (Lmax + want - 1) / want);
   chunk = (chunk + gran - 1) / gran * gran;
-  while ((Lmax + chunk - 1) / chunk * uint32_t(R) > 1024) chunk += gran;
+  while (((Lmax + chunk - 1) / chunk + extra) * uint32_t(R) > 1024) chunk += gran;
   const uint32_t nch = (Lmax + chunk - 1) / chunk;
   kp::AttnRows rp{uint32_t(cfg_.hq), uint32_t(cfg_.hkv), uint32_t(pos), chunk, uint32_t(cap),
-                  1.0f / std::sqrt(float(cfg_.head_dim)), nch};
+                  1.0f / std::sqrt(float(cfg_.head_dim)), nch + extra};
   const uint32_t Ru = uint32_t(R);
   if (mma) {
-    e.use(pipe8(tree ? "attn8m_partial_tree" : "attn8m_partial"));
+    e.use(pipe8(block ? "attn8m_partial_hist" : tree ? "attn8m_partial_tree" : "attn8m_partial"));
     e.buf(0, qo_); e.buf(1, kc); e.buf(2, vc); e.buf(3, part_o_); e.buf(4, part_ml_);
     e.val(5, rp);
     e.val(6, Ru);
-    if (tree) e.buf(7, *v8_tree_);
+    if (tree && !block) e.buf(7, *v8_tree_);
     e.dispatch(nch, cfg_.hkv, 1, 64 * G);
+    if (block) {
+      e.use(pipe8("attn8_tree_block"));
+      e.buf(0, qo_); e.buf(1, kc); e.buf(2, vc); e.buf(3, part_o_); e.buf(4, part_ml_);
+      e.val(5, rp);
+      e.buf(6, *v8_tree_);
+      e.dispatch(cfg_.hq, R, 1, 32);
+    }
   } else {
     static const int rb_env = env_int("NI_V8_ATTN_RB", 0);
     const int RB = std::max(1, std::min(rb_env ? rb_env : 32 / G, R));
@@ -805,8 +816,10 @@ void Qwen35::encode_verify8(Encoder& e, Seq& s, int pos, int R, const SamplingPa
   const bool tree = v8_tree_ != nullptr, ptree = s.pend_tree && s.n_pend > 0;
   if ((tree || ptree) && !s.pend_path) fatal("encode_verify8: a tree verify without the sequence's path buffer");
   const Buffer& tree_buf = tree ? *v8_tree_ : s.pend_path;
+  // NI_V8_TREE_PIN=0: the GDN step's update left to the compiler's contraction (gdn_update)
+  static const bool tree_pin = env_int("NI_V8_TREE_PIN", 1) != 0;
   kp::GdnVerify gv{uint32_t(R), uint32_t(s.n_pend), uint32_t(cfg_.lin_hk), uint32_t(cfg_.lin_hv), C, cfg_.eps,
-                   tree ? 1u : 0u, ptree ? 1u : 0u};
+                   tree ? 1u : 0u, ptree ? 1u : 0u, (tree || ptree) && tree_pin ? 1u : 0u};
   bool table_ready = false;  // the previous layer's MoE combine wrote this layer's input-norm table
   for (int i = 0; i < cfg_.layers; ++i) {
     const Layer& L = layers_[i];
