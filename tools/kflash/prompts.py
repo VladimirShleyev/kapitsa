@@ -147,6 +147,56 @@ def agent_syn(trace, files, rng, n_train, n_held):
     return out
 
 
+# Unseen agent turns (--unseen): task phrasings and a tool flow (grep, then read) that the training set never uses,
+# on held-out files only, to measure what the decoder learned beyond the training templates
+UNSEEN_TASKS = [
+    "Which functions in {path} are never called from inside that file?",
+    "I keep getting an exception from `{fn}` in {path} on some inputs. What is wrong and how do I fix it?",
+    "Rewrite `{fn}` in {path} with early returns instead of nested conditionals.",
+    "Make `{fn}` in {path} safe to call from several threads at once.",
+    "Write a short section for the docs that explains what {path} provides.",
+    "Replace the magic numbers in `{fn}` ({path}) with named constants.",
+    "Could `{fn}` in {path} ever loop forever or recurse without end? Check, and fix it if so.",
+    "Pull the error handling out of `{fn}` in {path} into a helper and reuse it.",
+    "Port `{fn}` from {path} to TypeScript in a new file next to it.",
+    "Add a verbose mode that reports what `{fn}` in {path} does at each step.",
+    "`{fn}` in {path} is hard to test. Restructure it so its logic can be tested without I/O.",
+    "Find every place in {path} that could raise on a None value and guard it.",
+]
+
+
+def agent_unseen(trace, files, rng, n):
+    sys_prompt = trace["messages"][0]["content"].replace("qwen3.6-35b-a3b", "qwen3.5-4b")
+    tools = trace["tool_sets"][0]
+    out = []
+    order = [i for i in range(len(files)) if held_by("file:" + files[i][0], 0.1)]
+    rng.shuffle(order)
+    for fi in order[:n]:
+        path, text, lang = files[fi]
+        start, lines = excerpt(text, rng, 60, 220)
+        fn = rng.choice(functions(lines, lang) or ["main"])
+        apath = "/work/repo/" + path
+        task = rng.choice(UNSEEN_TASKS).format(path=apath, fn=fn)
+        g_id = "call_" + hashlib.sha1(("g" + path + task).encode()).hexdigest()[:24]
+        r_id = "call_" + hashlib.sha1(("r" + path + task).encode()).hexdigest()[:24]
+        hits = [(start + i, ln) for i, ln in enumerate(lines) if fn in ln][:6] or [(start, lines[0])]
+        grep_out = f"Found {len(hits)} matches\n{apath}:\n" + "\n".join(f"  Line {k}: {ln.strip()}" for k, ln in hits)
+        body = f"Read file {apath}, lines {start}-{start + len(lines) - 1}\n" + "\n".join(
+            f"{start + i}: {ln}" for i, ln in enumerate(lines))
+        args = {"path": apath} if start == 1 else {"path": apath, "offset": start, "limit": len(lines)}
+        msgs = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": task},
+                {"role": "assistant", "content": None, "tool_calls": [{"id": g_id, "type": "function", "function": {
+                    "name": "grep", "arguments": json.dumps({"pattern": fn, "path": "/work/repo"}, separators=(",", ":"))}}]},
+                {"role": "tool", "tool_call_id": g_id, "content": grep_out},
+                {"role": "assistant", "content": None, "tool_calls": [{"id": r_id, "type": "function", "function": {
+                    "name": "read", "arguments": json.dumps(args, separators=(",", ":"))}}]},
+                {"role": "tool", "tool_call_id": r_id, "content": body}]
+        out.append({"id": f"agent_unseen-{len(out)}", "messages": msgs, "tools": tools,
+                    "template_kwargs": {"enable_thinking": False}, "max_tokens": 768, "temperature": 0.0, "seed": 0,
+                    "meta": {"domain": "agent_unseen", "split": "heldout", "src": path}})
+    return out
+
+
 WRITE_TASKS = [
     "an LRU cache with O(1) get and put", "a function that parses ISO-8601 durations like P3DT4H", "a thread-safe bounded queue",
     "a command-line tool that counts word frequencies in a set of files", "binary search over a rotated sorted array",
@@ -360,10 +410,18 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--scale", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--unseen", type=int, default=0, help="only N unseen agent turns (held-out files, new templates)")
     a = ap.parse_args()
     rng = random.Random(a.seed)
     trace = json.load(open(TRACE))
     files = code_files()
+    if a.unseen:
+        reqs = agent_unseen(trace, files, random.Random(a.seed + 1), a.unseen)
+        with open(a.out, "w") as f:
+            for r in reqs:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        print(f"{len(reqs)} unseen agent requests -> {a.out}")
+        return
     s = a.scale
     base = (agent_trace_requests(trace) + agent_syn(trace, files, rng, int(420 * s), int(40 * s)) +
             code_requests(files, rng, int(330 * s), int(280 * s)) + chat_requests(rng, int(280 * s)) +

@@ -95,32 +95,77 @@ Per domain, the best decoder tree against the best calibrated v1 tree, in accept
 | 16 | +27.5% | +24.8% | +0.7% | -1.3% | +6.6% | -2.1% | +5.0% |
 | 32 | +22.9% | +23.3% | +2.7% | +1.2% | +7.9% | -1.4% | +6.5% |
 
-- The decoder clears the decision bar (about +10% accepted tokens per cycle over trees on the published drafter alone)
-  on coding-agent turns at every row count, +23-30%. On the mixed held-out set it does not: +2.7 / +5.0 / +6.5% at
-  8 / 16 / 32 rows, because code and chat are flat or slightly worse.
+- The gain follows how much the held-out answers share with the training answers. Share of each held-out answer's
+  8-grams that occur in some training answer: agent (requests 6 and 18 of the opencode session whose other 16 requests
+  were trained on) 58%, agent_syn (held-out files, but the training's task templates and tool flow) 51%, math (templated
+  problems) 42%, code 7%, chat 3.5%. The gain orders the same way: +30%, +28%, +4%, -2%, -5% at 8 rows.
 - M1's calibrations move the v1 trees by under 0.2%; the backbone's raw marginals already rank well for best-first.
 - The decoder's own q ranks better than its acceptance head; the head is under-confident (predicted 0.75 vs actual 0.87
   at the chain's pick, ECE 0.118: it was trained with sampled answers, evaluated on greedy ones), which M1's online
   logistic calibration corrects at run time.
 - Quantized to 4-bit group 64 as the engine runs it, the decoder is within 0.1% of bf16.
 
+### Unseen agent turns
+
+To separate learned templates from generalization: 48 agent turns that share nothing with training but the harness
+(`prompts.py --unseen`): held-out files only, task phrasings the training never used, and a tool flow it never saw (a
+grep, then a read), answered greedily by the target. Their answers still share 41% of their 8-grams with training
+answers (the harness's tool-call syntax), against 51% for the template-matched set. 2650 cycles:
+
+| verify rows | best v1 tree (calibrated) | best decoder tree | gain, tokens/cycle | gain, accepted/cycle |
+| --- | --- | --- | --- | --- |
+| 8 | 3.398 | 3.980 | +17.1% | +24.3% |
+| 16 | 3.727 | 4.343 | +16.5% | +22.6% |
+| 32 | 3.959 | 4.578 | +15.6% | +20.9% |
+| chain (8) | 3.052 | 3.682 | +20.6% | +30.7% |
+
+So the agent gain is not overlap with training requests: on coding-agent turns the decoder clears the decision bar
+(about +10% accepted tokens per cycle over trees on the published drafter alone) twice over, at every row count. DFlash
+v1, trained on generic text, drafts this harness's tool-call text poorly (its chain: 3.05 tokens per cycle here against
+3.7 on code), and the decoder learns it from the target's own answers. On new code and chat the decoder adds nothing
+(-5% to +3%), and over the whole held-out mix it stays under the bar (+2.7 / +5.0 / +6.5%).
+
 ## In the engine
 
-M3's Metal decoder (`NI_KFLASH=1`, branch claude/zen-nightingale-c62aa7) with these weights, greedy, interleaved
-A B B A on the M4 Pro (A = DFlash v1's chain, B = the decoder's chain):
+M3's Metal decoder (branch claude/zen-nightingale-c62aa7 at fc2a4a4: projections at 4-bit group 64, trees ranked by
+the decoder's q) with these weights, greedy, interleaved A B B A on the M4 Pro, every output identical to plain decoding.
+A = DFlash v1 (its chain with NI_DFLASH_TREE=0, else the lattice's best-first tree, M1's default), B = the decoder
+(NI_KFLASH=1); the budget's calibration caches were warm in both arms. Four unseen agent turns (the longest answers of the
+set above) and the speed benchmark's code and prose prompts:
 
-| prompt | tokens per cycle | decode tok/s | outputs |
+| prompt (answer tokens) | chain tok/cycle | chain tok/s | tree tok/cycle | tree tok/s |
+| --- | --- | --- | --- | --- |
+| agent_unseen-2 (768) | 5.218 -> 5.364 | 270.4 -> 268.4 (-0.7%) | 5.383 -> 5.620 | 275.1 -> 279.4 (+1.5%) |
+| agent_unseen-43 (743) | 4.240 -> 4.443 | 217.6 -> 219.4 (+0.8%) | 4.652 -> 4.963 | 234.2 -> 242.6 (+3.6%) |
+| agent_unseen-11 (423) | 3.546 -> 3.802 | 184.7 -> 188.2 (+1.9%) | 3.854 -> 4.199 | 196.8 -> 207.4 (+5.4%) |
+| agent_unseen-37 (394) | 4.010 -> 3.930 | 211.9 -> 198.5 (-6.3%) | 4.296 -> 4.319 | 222.1 -> 216.4 (-2.5%) |
+| code_27b (512) | 2.954 -> 2.971 | 178.4 -> 170.3 (-4.5%) | 3.308 -> 3.276 | 192.8 -> 183.9 (-4.6%) |
+| p700 prose (512) | 4.867 -> 4.867 | 283.3 -> 273.8 (-3.4%) | 4.986 -> 5.110 | 284.6 -> 281.9 (-0.9%) |
+
+The engine reproduces the offline replay sequence by sequence (decoder chain at 4-bit, offline vs engine: 3.811 / 3.802,
+4.449 / 4.443, 3.940 / 3.930, 5.333 / 5.364). These long agent turns (edits and explanations) gain little, and the
+offline replay says why. Over the 48 unseen agent turns, the decoder chain's gain by answer length:
+
+| answer | turns | DFlash v1 chain | decoder chain (4-bit) |
 | --- | --- | --- | --- |
-| agent request 12 (held out) | 4.649 -> 5.435 | 205.9 -> 231.1 (+12.2%) | identical |
-| agent request 18 (held out) | 3.014 -> 3.294 | 131.4 -> 138.8 (+5.6%) | identical |
-| code_27b | 3.329 -> 3.144 | 194.9 -> 176.7 (-9.3%) | identical |
-| p700 prose | 4.986 -> 4.937 | 288.4 -> 271.8 (-5.8%) | identical |
+| under 150 tokens (32 of 33 are pure tool calls) | 33 | 2.272 | 3.270 (+43.9%) |
+| 150-300 tokens | 7 | 3.022 | 3.402 (+12.6%) |
+| over 300 tokens | 8 | 4.079 | 4.210 (+3.2%) |
+
+So what the decoder learned is the harness's tool-call syntax (tags, parameter names, paths and values copied from the
+context), which DFlash v1 drafts badly; prose and code inside long turns gain about what new code does, nothing. A
+previous A/B on agent requests 12 and 18 compared trees, not chains, on requests that share the training conversation;
+it is withdrawn.
 
 ## Next
 
+- The decision: on coding-agent turns the decoder clears the bar (+21-24% accepted tokens per cycle over calibrated v1
+  trees on unseen turns), but the gain is the tool-call syntax, worth +44% on tool-call turns and +3% on long ones; on
+  everything else it adds nothing, and over the mixed held-out set it stays under the bar (+3-7%). As trained here it is
+  a tool-call specialist, not a better drafter.
 - Data, not passes: the training loss on seen sequences fell to a third of the held-out loss. More distinct code, chat
   and reasoning answers (their text can come from any server; the target's distributions and the drafter's features
   along them are computed here), agent weight 1 instead of 2, and a larger greedy term for greedy decoding.
-- Trees on the decoder's q at the row budget M1 measures per Mac; on bf16 targets (about 32 free rows on M1-M4) the
-  32-row numbers above are the relevant ones.
+- The copy candidates of the spec (context continuations added to C_p) would give the decoder the material for long
+  agent turns, which copy from the files they read.
 - The same pipeline for the 35B and 27B (M4), where answer generation dominates the cost here.
