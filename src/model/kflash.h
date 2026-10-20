@@ -187,8 +187,9 @@ class KFlash {
   Buffer tree_tok() const { return t_tok_; }
   Buffer tree_next() const { return t_next_; }
   // NI_KFLASH_PASSES, or the defaults: the chain walk's speculative passes (7: the sequential walk's chain, bitwise;
-  // 0: single-row steps) and the tree's decoder passes (3: on the trained 4B, agent requests gained as much as with 7,
-  // code lost less)
+  // 0: single-row steps) and the tree's decoder passes (3: with the first trained 4B decoder the trees changed little
+  // past 2-3 passes and code_27b paid every extra step; the agent requests measured then share its training
+  // conversation, so the cap needs a recheck on unseen agent turns)
   int chain_passes() const { return passes_ < 0 ? 7 : passes_; }
   int tree_passes() const { return passes_ > 0 ? std::min(passes_, 16) : 3; }
   const QLinear* weight(const std::string& name) const {
