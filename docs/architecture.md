@@ -31,7 +31,9 @@ they decode.
    with `NI_KFLASH=1`, the drafter's candidates are verified as a best-first tree instead of one chain: each verify row
    attends to its ancestors only, the recurrent layers run from its own branch's state, and the longest branch that
    agrees with the target is kept, so the reply is plain decoding's. The tree's size follows this Mac's measured cost
-   per verify row count and the drafter's probabilities as calibrated against its own acceptances. The 35B-A3B, whose
+   per verify row count and the drafter's probabilities as calibrated against its own acceptances: on the dense Qwen
+   models each cycle verifies 8, 16 or 32 rows (whole 8-row tiles; the GPU runs the tiles the drafting pass chose,
+   with no host round trip), as many as pay in expected tokens per millisecond on this Mac. The 35B-A3B, whose
    verify pays per row for its experts, keeps its chain. With a KFlash candidate decoder in the Qwen model's `kflash/`
    folder (`NI_KFLASH=1`; no trained one is published yet), the decoder scores the drafter's candidates given each
    node's whole path and the same builder takes the tree from its scores (a chain: it walks the chain). Plain

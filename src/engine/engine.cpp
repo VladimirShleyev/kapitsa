@@ -2127,13 +2127,16 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
     req_cycles = 0;
     bool go = handle(s.tokens()[n]);
     std::unique_ptr<Encoder> next_draft;  // committed drafting half of the coming cycle
+    // the KV room a cycle wants: the next anchor (at most P + 8) and its verify's rows (KFlash trees: up to 32; with
+    // less room the drafting pass verifies fewer, DFlash2::tree_cap_)
+    const int vrows = dfl_->tree() ? std::max(DFlash2::kB, dfl_->tree_rows()) : DFlash2::kB;
     // The drafting half from the anchor P with nothing in flight (after the prefill, and when the request's turn
     // comes back after parking), with KV cache room for the first cycles (it grows between cycles below): nothing may
     // use the old buffers, so the deferred prompt work completes first
     auto start_cycles = [&] {
-      if (P + 8 + 8 + DFlash2::kB + 3 > s.cap && s.cap < s.limit) {
+      if (P + 8 + 8 + vrows + 3 > s.cap && s.cap < s.limit) {
         if (mtp_e) mtp_e->wait();
-        grow_kv(std::min(s.limit, P + 8 + 8 + DFlash2::kB + 3), [] {});
+        grow_kv(std::min(s.limit, P + 8 + 8 + vrows + 3), [] {});
       }
       if (P + 8 + DFlash2::kB + 2 < s.cap) {
         // host write of the drafter state: nothing in flight reads it (the prefill is done; its deferred
@@ -2162,11 +2165,11 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
       dfl_->encode_cycle_verify(*e2, s, P, K, sp);
       e2->commit();
       bool kv_wait = false;  // no KV room for the next cycle while other requests' caches hold the memory
-      if (P + 8 + 8 + DFlash2::kB + 3 > s.cap && s.cap < s.limit) {
+      if (P + 8 + 8 + vrows + 3 > s.cap && s.cap < s.limit) {
         // the KV cache grows here: the verify in flight (and the drafting half before it) complete first, so
         // this cycle's drafting half is not overlapped with it
         e2->wait();
-        kv_wait = !reserve_kv(slot, std::min(s.limit, P + 8 + 8 + DFlash2::kB + 3), true) && active_ > 1;
+        kv_wait = !reserve_kv(slot, std::min(s.limit, P + 8 + 8 + vrows + 3), true) && active_ > 1;
       }
       // another request waits for the GPU, this one for memory (start_cycles waits for it), or it joins the batch: no
       // drafting half behind this verify, park after it

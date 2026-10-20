@@ -22,6 +22,11 @@
 //                    verify of n rows is expected to emit (the accepted path plus one), n = 1 .. nodes built
 //   [kKfJump]        bit r set: row r's parent is not row r - 1 (a verify may replay such a row's ancestry)
 //   [kKfNodes]       rows built m (1 + the nodes taken), n <= m
+//   [kKfCap]         the verify's row capacity this cycle (KfParams::cap, else max_rows): a backend that verifies
+//                    counts past 8 as one wide verify may verify an 8-row tree of a wider build with its 8-row verify
+//   [kKfObs + i]     what the budget reads of this cycle, copied by kf_accept (the next cycle's builder may rewrite the
+//                    words above before the host reads them): i = 0 live rows, 1 capacity, 2 rows built, 3 .. 5 E(8),
+//                    E(16), E(32) (0 past the rows built)
 #ifdef __METAL_VERSION__
 #define KF_WORD(name, v) constant constexpr uint kKf##name = v
 typedef uint kf_uint;
@@ -50,6 +55,8 @@ KF_WORD(Score, 260);
 KF_WORD(E, 292);
 KF_WORD(Jump, 325);
 KF_WORD(Nodes, 326);
+KF_WORD(Cap, 327);
+KF_WORD(Obs, 328);
 KF_WORD(Words, 336);
 KF_WORD(PathWords, 40);  // Seq::pend_path: the accepted path's rows (int32), up to kKfMaxRows + 1
 #undef KF_WORD
@@ -65,7 +72,7 @@ struct KfParams {
   kf_int force_n;
   kf_uint allowed;
   kf_int max_rows;
-  kf_int pad;
+  kf_int cap;  // the verify's row capacity this cycle (0: max_rows); the allowed counts stay within it
 };
 #ifndef __METAL_VERSION__
 // A lattice's children table (the first-order drafters: DFlash2, LiLiCorr, DSpark): children-row (s * K + p) holds
@@ -208,6 +215,7 @@ NI_INLINE void kf_build_impl(const device float* clq, const device int* ctok, co
     tree[kKfN] = int(n);
     tree[kKfNodes] = int(m);
     tree[kKfJump] = int(jump);
+    tree[kKfCap] = kp.cap > 0 ? kp.cap : int(R);
     live[0] = n;
   }
 }
@@ -291,6 +299,13 @@ struct KfAcceptP {
     res[1] = y;
     tree[kKfA] = int(a);
     tree[kKfNrec] = int(nrec);
+    const int m = tree[kKfNodes];
+    tree[kKfObs + 0] = int(n);
+    tree[kKfObs + 1] = tree[kKfCap];
+    tree[kKfObs + 2] = m;
+    tree[kKfObs + 3] = m >= 8 ? tree[kKfE + 8] : 0;
+    tree[kKfObs + 4] = m >= 16 ? tree[kKfE + 16] : 0;
+    tree[kKfObs + 5] = m >= 32 ? tree[kKfE + 32] : 0;
     if (p.gst) {
       gst[0] = p.P + a + 1;
       gst[1] = a + 1;

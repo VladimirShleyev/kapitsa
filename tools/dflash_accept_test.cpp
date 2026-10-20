@@ -13,8 +13,8 @@
 //    pass; the rule that also uses the proposal's own confidence (rule 1, not used by the engine at T > 0) must fail in the depth-sensitive
 //    regime (q = p at the first proposal, q = 0.9 / 0.1 vs p = 1/2 at the second: that rule emits 0.55 / 0.45).
 // 3. KFlash tree verifies: the shared builder (kf_build) takes a best-first tree from a synthetic DFlash2 lattice
-//    (random, or aligned with the target's likely path; the identity or a random calibration; 1-8 verify rows), the
-//    target's rows of the tree's
+//    (random, or aligned with the target's likely path; the identity or a random calibration; 1-8 verify rows, the
+//    wide verifies' 16 and 32, and the size rule choosing among 8 | 16 | 32 by cost), the target's rows of the tree's
 //    paths are sampled by sample_stage2_rows_tree (top-k, top-p, temperature as the engine's sampler, each row with
 //    the uniform of its token's position), the shared kf_accept walks them; a second cycle runs when one token came out.
 //    The joint law of the first two tokens is tested as in 2, and every trial's two tokens must equal plain decoding's
@@ -444,20 +444,26 @@ int tree_cases(long trials, uint64_t salt, int only) {
     float temp, top_p;
     int top_k;
     bool cal;  // a random per-depth calibration (alpha, beta) instead of the identity (the law must not depend on it)
-    int R;     // verify rows (the budget allows this count alone)
+    int R;     // verify rows (the budget allows this count alone); 0: the size rule over 8 | 16 | 32 (the wide
+               // verifies' counts) with costs that make every count win in some trials
   };
   const std::vector<TCase> cases = {{kRandom, 0.6f, 0.95f, 20, false, 8}, {kEqual, 0.6f, 0.95f, 20, true, 8},
                                     {kEqual, 1.0f, 1.0f, 32, true, 5},    {kPoint, 0.6f, 0.95f, 20, true, 3},
                                     {kRandom, 0.0f, 1.0f, 1, false, 8},   {kEqual, 0.0f, 1.0f, 1, true, 6},
-                                    {kEqual, 0.6f, 0.95f, 20, true, 1}};
+                                    {kEqual, 0.6f, 0.95f, 20, true, 1},   {kEqual, 0.6f, 0.95f, 20, true, 16},
+                                    {kRandom, 0.6f, 0.95f, 20, false, 32}, {kPoint, 0.6f, 0.95f, 20, true, 32},
+                                    {kEqual, 1.0f, 1.0f, 32, true, 32},   {kEqual, 0.0f, 1.0f, 1, true, 32},
+                                    {kRandom, 0.0f, 1.0f, 1, false, 16},  {kEqual, 0.6f, 0.95f, 20, true, 0},
+                                    {kEqual, 0.0f, 1.0f, 1, true, 0},     {kRandom, 0.6f, 0.95f, 20, false, 0}};
   Pipeline table_p = g.pipeline("dfl_kf_table"), build_p = g.pipeline("kf_build"),
            samp_p = g.pipeline("sample_stage2_rows_tree"), acc_p = g.pipeline("kf_accept");
-  const int B = 2048, W = kf::kWords;
+  const int B = 2048, W = kf::kWords, RM = kf::kMaxRows;
+  constexpr int TS = 48;  // tokens per trial: the anchor's position P <= 1, its rows P .. P + 31, the token after them
   Buffer ci = g.alloc(size_t(B) * 112 * 4), cv = g.alloc(size_t(B) * 112 * 4), E = g.alloc(size_t(B) * 1792 * 4);
   Buffer clq = g.alloc(size_t(B) * 1792 * 4), ctok = g.alloc(size_t(B) * 1792 * 4), next = g.alloc(1792 * 4);
-  Buffer tok = g.alloc(size_t(B) * 16 * 4), tree = g.alloc(size_t(B) * W * 4), live = g.alloc(size_t(B) * 16);
-  Buffer rv = g.alloc(size_t(B) * 8 * kTreeN * 4);
-  Buffer rid = g.alloc(size_t(B) * 8 * kTreeN * 4), samp = g.alloc(size_t(B) * 8 * 4), res = g.alloc(size_t(B) * 16);
+  Buffer tok = g.alloc(size_t(B) * TS * 4), tree = g.alloc(size_t(B) * W * 4), live = g.alloc(size_t(B) * 16);
+  Buffer rv = g.alloc(size_t(B) * RM * kTreeN * 4);
+  Buffer rid = g.alloc(size_t(B) * RM * kTreeN * 4), samp = g.alloc(size_t(B) * RM * 4), res = g.alloc(size_t(B) * 16);
   Buffer gst = g.alloc(size_t(B) * 64), path = g.alloc(size_t(B) * kf::kPathWords * 4);
   {
     const std::vector<int32_t> nx = kf::lattice_next(7, 16);
@@ -470,10 +476,12 @@ int tree_cases(long trials, uint64_t salt, int only) {
     const int tgt = cs.regime == kPoint ? kPoint : kRandom;
     const int lat = cs.regime == kEqual ? kEqual : kRandom;
     std::map<long, long> obs, obs1;
-    long done = 0, path_bad = 0, compared = 0;
+    long done = 0, path_bad = 0, compared = 0, by_rows[kf::kMaxRows + 1] = {};
     double mean_a = 0;
     std::mt19937_64 hr(4321 + cix * 7 + salt * 1000003);
     KfParams kp{};
+    const bool rule = cs.R == 0;  // the size rule over 8 | 16 | 32
+    const int cap = rule ? RM : std::max(8, cs.R);  // the verify's rows (the builder's max)
     {  // the budget's parameters the builder reads: the identity, or a random calibration; this case's rows alone
       std::uniform_real_distribution<float> U(0, 1);
       for (int d = 0; d <= kf::kMaxRows; ++d) {
@@ -482,16 +490,20 @@ int tree_cases(long trials, uint64_t salt, int only) {
         kp.cost[d] = 1.0f;
       }
       kp.force_n = 0;
-      kp.allowed = 1u << (cs.R - 1);
-      kp.max_rows = 8;
+      kp.allowed = rule ? (1u << 7) | (1u << 15) | (1u << 31) : 1u << (cs.R - 1);
+      kp.max_rows = cap;
+      if (rule) {  // wider verifies cost more, so a tree's breadth decides (each count gets picked)
+        kp.cost[16] = 1.25f;
+        kp.cost[32] = 1.6f;
+      }
     }
     // one cycle for trials [0, n) after prefix pre[i] (the anchor at position P = pre[i].size()); the emitted tokens
     auto cycle = [&](const std::vector<std::vector<int>>& pre, const std::vector<uint32_t>& seed) {
       const int n = int(pre.size());
       for (int i = 0; i < n; ++i) {
         lattice(pre[i], lat, hr, ci.as<int>() + i * 112, cv.as<float>() + i * 112, E.as<float>() + i * 1792);
-        int* tk = tok.as<int>() + i * 16;
-        for (int j = 0; j < 16; ++j) tk[j] = 0;  // tokens[0]: the first anchor (outside the universe)
+        int* tk = tok.as<int>() + i * TS;
+        for (int j = 0; j < TS; ++j) tk[j] = 0;  // tokens[0]: the first anchor (outside the universe)
         for (size_t j = 0; j < pre[i].size(); ++j) tk[1 + j] = pre[i][j];  // the anchor at P = pre.size()
       }
       {  // the trees: the lattice's tables, then the shared builder
@@ -506,22 +518,23 @@ int tree_cases(long trials, uint64_t salt, int only) {
           e->use(build_p);
           e->buf(0, clq, size_t(i) * 1792 * 4); e->buf(1, ctok, size_t(i) * 1792 * 4); e->buf(2, next);
           e->val(3, kp);
-          e->buf(4, tree, size_t(i) * W * 4); e->buf(5, tok, size_t(i) * 64); e->buf(6, live, size_t(i) * 16);
+          e->buf(4, tree, size_t(i) * W * 4); e->buf(5, tok, size_t(i) * TS * 4); e->buf(6, live, size_t(i) * 16);
           e->val(7, bp);
           e->dispatch(1, 1, 1, 32);
         }
         e->commit_and_wait();
       }
-      for (int i = 0; i < n; ++i) {  // the target's rows: slot t's path from the tree
-        const int* tk = tok.as<int>() + i * 16;
+      for (int i = 0; i < n; ++i) {  // the target's rows: slot t's path from the tree (the verify's rows, all cap)
+        const int* tk = tok.as<int>() + i * TS;
         const int* tr = tree.as<int>() + i * W;
         const int P = int(pre[i].size());
-        for (int t = 0; t < 8; ++t) {
+        for (int t = 0; t < cap; ++t) {
           std::vector<int> nodes;
           for (int v = t; v > 0; v = tr[kf::kPar + v]) nodes.push_back(tk[P + v]);
           std::vector<int> pp = pre[i];
           pp.insert(pp.end(), nodes.rbegin(), nodes.rend());
-          target_row(pp, tgt, rv.as<float>() + (i * 8 + t) * kTreeN, rid.as<uint32_t>() + (i * 8 + t) * kTreeN);
+          target_row(pp, tgt, rv.as<float>() + (size_t(i) * RM + t) * kTreeN,
+                     rid.as<uint32_t>() + (size_t(i) * RM + t) * kTreeN);
         }
       }
       {
@@ -530,14 +543,14 @@ int tree_cases(long trials, uint64_t salt, int only) {
           const uint32_t P = uint32_t(pre[i].size());
           kp::SampleRows sr{uint32_t(kTreeN), uint32_t(cs.top_k), cs.temp, cs.top_p, seed[i], P, 0, 0, 0};
           e->use(samp_p);
-          e->buf(0, rv, size_t(i) * 8 * kTreeN * 4); e->buf(1, rid, size_t(i) * 8 * kTreeN * 4);
-          e->buf(2, samp, size_t(i) * 32);
+          e->buf(0, rv, size_t(i) * RM * kTreeN * 4); e->buf(1, rid, size_t(i) * RM * kTreeN * 4);
+          e->buf(2, samp, size_t(i) * RM * 4);
           e->val(3, sr);
           e->buf(4, rid); e->buf(5, tree, size_t(i) * W * 4);
-          e->dispatch(8, 1, 1, 1024);
-          const kp::KfAccept ap{P, 8u, 1u, 0u};
+          e->dispatch(uint32_t(cap), 1, 1, 1024);
+          const kp::KfAccept ap{P, uint32_t(cap), 1u, 0u};
           e->use(acc_p);
-          e->buf(0, samp, size_t(i) * 32); e->buf(1, tok, size_t(i) * 64); e->buf(2, tree, size_t(i) * W * 4);
+          e->buf(0, samp, size_t(i) * RM * 4); e->buf(1, tok, size_t(i) * TS * 4); e->buf(2, tree, size_t(i) * W * 4);
           e->buf(3, res, size_t(i) * 16);
           e->val(4, ap);
           e->buf(5, live, size_t(i) * 16); e->buf(6, path, size_t(i) * kf::kPathWords * 4); e->buf(7, gst, size_t(i) * 64);
@@ -549,9 +562,25 @@ int tree_cases(long trials, uint64_t salt, int only) {
       for (int i = 0; i < n; ++i) {
         const int a = res.as<int>()[i * 4], P = int(pre[i].size());
         const int* tr = tree.as<int>() + i * W;
-        for (int j = 1; j <= a + 1; ++j) out[i].push_back(tok.as<int>()[i * 16 + P + j]);
+        for (int j = 1; j <= a + 1; ++j) out[i].push_back(tok.as<int>()[i * TS + P + j]);
         if (out[i].back() != res.as<int>()[i * 4 + 1]) ++path_bad;  // the token after the path
-        if (tr[kf::kN] != cs.R || int(live.as<uint32_t>()[i * 4]) != cs.R || tr[kf::kA] != a) ++path_bad;
+        // the rows: the case's count, or the rule's pick among 8 | 16 | 32 (each must be the argmax of E(n) / cost[n])
+        const int nr = tr[kf::kN];
+        if (rule) {
+          float best = -1;
+          int want = 0;
+          for (int nn : {8, 16, 32})
+            if (nn <= tr[kf::kNodes]) {
+              float En;
+              memcpy(&En, &tr[kf::kE + nn], 4);
+              if (En / kp.cost[nn] > best) best = En / kp.cost[nn], want = nn;
+            }
+          if (nr != want) ++path_bad;
+        } else if (nr != cs.R) {
+          ++path_bad;
+        }
+        if (nr >= 1 && nr <= kf::kMaxRows) ++by_rows[nr];
+        if (int(live.as<uint32_t>()[i * 4]) != nr || tr[kf::kA] != a) ++path_bad;
         if (int(gst.as<uint32_t>()[i * 16]) != P + a + 1 || int(gst.as<uint32_t>()[i * 16 + 1]) != a + 1) ++path_bad;
         for (int j = 0; j <= a; ++j)  // the path: rows of the accepted branch, the drafter state's and the sequence's
           if (path.as<int>()[i * kf::kPathWords + j] != tr[kf::kPath + j] ||
@@ -617,11 +646,14 @@ int tree_cases(long trials, uint64_t salt, int only) {
     chi2(obs1, ex1, trials, &st1, &dof1, &pv1, &out1);
     const bool greedy = cs.temp <= 0;
     const bool ok = (greedy || (pv > 0.01 && pv1 > 0.01)) && out == 0 && out1 == 0 && path_bad == 0;
-    printf("[S1 tree] lattice %-8s target %-6s T=%.1f top-p %.2f top-k %d %s, %d rows: %ld trials, mean a %.2f; "
+    char rows[64];
+    if (rule) snprintf(rows, sizeof rows, "rule 8|16|32 (%ld/%ld/%ld)", by_rows[8], by_rows[16], by_rows[32]);
+    else snprintf(rows, sizeof rows, "%d rows", cs.R);
+    printf("[S1 tree] lattice %-8s target %-6s T=%.1f top-p %.2f top-k %d %s, %s: %ld trials, mean a %.2f; "
            "joint chi2 %.1f (%d dof) p=%.3f; first token p=%.3f; outside support %ld; plain-decoding mismatches %ld of "
            "%ld: %s\n",
            lat == kEqual ? "aligned" : "random", tgt == kPoint ? "1-2" : "random", cs.temp, cs.top_p, cs.top_k,
-           cs.cal ? "calibrated" : "identity", cs.R, trials, mean_a / trials, st, dof, pv, pv1, out + out1, path_bad,
+           cs.cal ? "calibrated" : "identity", rows, trials, mean_a / trials, st, dof, pv, pv1, out + out1, path_bad,
            compared, ok ? "PASS" : "FAIL");
     if (!ok) ++fails;
   }

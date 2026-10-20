@@ -467,9 +467,33 @@ DFlash2::DFlash2(Qwen35& target, const std::string& dir, int bits) : tg_(target)
     for (char& c : key)
       if (!isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '.') c = '_';
     kf_budget_ = std::make_unique<KfBudget>(key);
-    kf_budget_->set_rows(1u << (kB - 1), kB);  // the dense verify: whole 8-row tiles, one today
     const char* v = getenv("NI_DFLASH_TREE");
     set_tree(v && *v ? atoi(v) != 0 : !tg_.config().moe);
+    // the verify's row counts: whole 8-row tiles, 8 | 16 | 32 where the target runs wide tree verifies
+    // (Qwen35::verify_wide_ok), else one tile; NI_KFLASH_ROWS=<list of 8, 16, 32> restricts them (e.g. "8" = M1's
+    // single tile, "16" = always 16 rows)
+    uint32_t allowed = 1u << (kB - 1);
+    if (tree_ && tg_.verify_wide_ok()) allowed |= (1u << 15) | (1u << 31);
+    if (const char* r = getenv("NI_KFLASH_ROWS"); r && *r) {
+      uint32_t want = 0;
+      for (const char* c = r; *c;) {
+        const int n = atoi(c);
+        if (n == 8 || n == 16 || n == 32) want |= 1u << (n - 1);
+        else fatal("NI_KFLASH_ROWS=%s: row counts 8, 16 or 32", r);
+        while (*c && *c != ',') ++c;
+        if (*c == ',') ++c;
+      }
+      if (want & ~allowed) logi("KFlash: NI_KFLASH_ROWS=%s: this target's tree verify runs 8 rows", r);
+      allowed = (want & allowed) ? want & allowed : allowed & (1u << (kB - 1));
+    }
+    tree_rows_ = 32 - __builtin_clz(allowed);  // the widest allowed count
+    kf_budget_->set_rows(allowed, tree_rows_);
+    kf_budget_->set_wide(tree_rows_ > kB);  // counts past 8: one wide verify; the budget also picks its capacity
+    if (tree_ && tree_rows_ > kB) {
+      tg_.set_tree_rows(tree_rows_);
+      logi("KFlash: tree verifies of %s rows (the size rule picks per cycle)",
+           allowed == ((1u << 7) | (1u << 15) | (1u << 31)) ? "8, 16 or 32" : r_list(allowed).c_str());
+    }
   }
   if (cfg_.v1)
     logi("DFlash drafter (v1) %s: blocks of %d rows (trained %d), context window %d positions (trained %d)",
@@ -550,7 +574,7 @@ void DFlash2::alloc_buffers() {
   kdyn_ = g.alloc(16, "dfl_kdyn");
   kdyn_.as<uint32_t>()[0] = 7;
   kdyn_.as<uint32_t>()[1] = 8;
-  capt_ = g.alloc(8 * nH * 2, "dfl_capt");
+  capt_ = g.alloc(size_t(kf::kMaxRows) * nH * 2, "dfl_capt");  // a tree verify's rows (up to 32)
   y8_ = g.alloc(8 * H * 4, "dfl_y8");
   c8_ = g.alloc(8 * H * 4, "dfl_c8");
   kv8_ = g.alloc(8 * KV * 4, "dfl_kv8");
@@ -751,6 +775,17 @@ size_t DFlash2::plan_bytes(const std::string& dir, const Qwen35Config& target, s
   if (at_prefill) *at_prefill = pf;
   // ring: [layers][8 kv heads][2048 slots][128] bf16, K and V (DFlash2::new_seq)
   if (per_slot) *per_slot = NL * 8 * kWin * 128 * 2 * 2;
+  // KFlash's wide tree verifies on dense targets (32 rows): the captures, the target's logits, candidates and X8
+  // tables of 32 rows (Qwen35::set_tree_rows), and per slot the verify tape's 24 more rows (Qwen35::grow_tape)
+  const char* tv = getenv("NI_DFLASH_TREE");
+  if (!target.moe && !(tv && *tv && !atoi(tv))) {
+    b += 24 * nH * 2 + 24 * V * 4 + 2 * 24 * (V / 2048 + 2) * 64 * 4 + (size_t(12) << 20);
+    size_t lin = 0;
+    for (const bool l : target.is_linear) lin += l ? 1 : 0;
+    const size_t C = 2 * size_t(target.lin_hk) * target.lin_dk + size_t(target.lin_hv) * target.lin_dv;
+    const size_t row = C + size_t(target.lin_hv) * (target.lin_dk + target.lin_dv + 1);
+    if (per_slot) *per_slot += lin * 24 * row * 4;
+  }
   return w + b + pf;
 }
 
@@ -1159,16 +1194,23 @@ void DFlash2::encode_prefill_commit(Encoder& e, DFlashSeq& d) {
 
 void DFlash2::end_prefill() { tg_.set_capture(nullptr); }
 
-void DFlash2::arm_verify(int P) {
+void DFlash2::arm_verify(int P, int rows) {
   hook_vf_.dst = capt_;
   hook_vf_.pos_base = P;
-  hook_vf_.rows = kB;
+  hook_vf_.rows = rows;
   tg_.set_capture(&hook_vf_);
 }
 
 void DFlash2::disarm() { tg_.set_capture(nullptr); }
 
 void DFlash2::encode_commit(Encoder& e, DFlashSeq& d, int m) { enc_commit_from(e, d, m, capt_, gst_tree_); }
+
+std::string DFlash2::r_list(uint32_t allowed) {
+  std::string r;
+  for (int n = 1; n <= kf::kMaxRows; ++n)
+    if ((allowed >> (n - 1)) & 1u) r += (r.empty() ? "" : ", ") + std::to_string(n);
+  return r;
+}
 
 void DFlash2::set_tree(bool on) {
   // NI_DFLASH_VERIFY below 7 keeps the chain
@@ -1548,6 +1590,16 @@ void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const S
       e.dispatch(7 * 16, 1, 1, 32);
       KfParams kp{};
       kf_budget_->write(kp);
+      // the verify's capacity this cycle: the budget's (8, or the widest count when the per-cycle choice among them
+      // pays), as far as the context holds it (rows P .. P + R - 1 of a verify at P < s.cap - R - 1; the build's rows
+      // too: their tokens go to tokens[P + r]); the verify encodes it (tree_cap_), the builder's rule picks the live rows
+      const int room = std::max(kB, (s.cap - P - 2) / kB * kB);
+      if (kp.max_rows > room) kp.max_rows = room;
+      tree_cap_ = std::min(kp.cap > 0 ? int(kp.cap) : int(kp.max_rows), int(kp.max_rows));
+      if (tree_cap_ < kf::kMaxRows) kp.allowed &= (1u << tree_cap_) - 1u;
+      if (!kp.allowed) kp.allowed = 1u << (tree_cap_ - 1);
+      if (kp.force_n > tree_cap_) kp.force_n = 0;
+      kp.cap = tree_cap_;
       // with the candidate decoder (sel 1) the lattice's tree is only its first guess: every row the verify holds,
       // the lattice's own probabilities; the decoder then has the builder take the tree from its scores (the budget's
       // parameters, calibrated on the decoder's probabilities)
@@ -1627,18 +1679,20 @@ void DFlash2::encode_cycle_draft(Encoder& e, Seq& s, DFlashSeq& d, int P, int m_
 
 void DFlash2::encode_cycle_verify(Encoder& e, Seq& s, int P, int K, const SamplingParams& sp) {
   if (tree_) {
-    // the tree's rows (one 8-row tile) with captures; the shared acceptance walks the rows' own tokens (argmax, or the
-    // plain sampler's draw keyed by the token's position), writes the path and the budget's records, and leaves the
-    // path for the K/V compaction, the target's next fold (s.pend_tree) and the next ring commit (gst[4 ..])
+    // the tree's rows (the drafting pass's capacity tree_cap_: 8, or 16 / 32 rows whose live tiles the GPU runs, as the
+    // size rule chose them) with captures; the shared acceptance walks the rows' own tokens (argmax, or the plain
+    // sampler's draw keyed by the token's position), writes the path and the budget's records, and leaves the path for
+    // the K/V compaction, the target's next fold (s.pend_tree) and the next ring commit (gst[4 ..])
     if (!s.pend_path) s.pend_path = Gpu::get().alloc(size_t(kf::kPathWords) * 4, "pend_path");
+    const int R = tree_cap_;
     tg_.set_verify_tree(&tree_buf_);
     tg_.set_verify_moe_exact(exact_moe_ && sp.temperature > 0);  // (a tree forced onto a MoE target)
-    arm_verify(P);
-    tg_.encode_verify(e, s, P, kB, sp, uint32_t(P), /*v8=*/true);
+    arm_verify(P, R);
+    tg_.encode_verify(e, s, P, R, sp, uint32_t(P), /*v8=*/true);
     disarm();
     tg_.set_verify_moe_exact(false);
     tg_.set_verify_tree(nullptr);
-    const kp::KfAccept ap{uint32_t(P), uint32_t(kB), 1u, 0u};
+    const kp::KfAccept ap{uint32_t(P), uint32_t(R), 1u, 0u};
     e.use(dpipe("kf_accept"));
     e.buf(0, tg_.verify_samples()); e.buf(1, s.tok); e.buf(2, tree_buf_); e.buf(3, acc_);
     e.val(4, ap);
@@ -1695,7 +1749,7 @@ void DFlash2::prewarm_pipelines() {
   Gpu& g = Gpu::get();
   // spec_dflash.metal (dfl_*), verify8.metal (qmm8*, x8_*, moe8*, attn8*, gdn_step_verify8) and the verify's
   // shared kernels; the prompt commit's prefill GEMMs
-  static const char* prefixes[] = {"dfl_", "qmm8", "x8_", "moe8", "attn8", "gdn_step_verify8", "gdn_prep_verify",
+  static const char* prefixes[] = {"dfl_", "qmm8", "x8_", "moe8", "attn8", "gdn_step_verify8", "gdn_prep_verify", "v8_tree",
                                    "attn_prep", "attn_rows_reduce", "topk_stage1_rows", "sample_stage2_rows",
                                    "qmm_b4_m64_n64", "qmm_b4_m32_n32", "qmm_b8_m64_n64", "qmm_b8_m32_n32", "copy_u32"};
   // the KFlash decoder's kernels (spec_kflash.metal) only when it is on

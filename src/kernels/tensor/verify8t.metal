@@ -37,12 +37,21 @@ struct Qmm8tParams {  // = Qmm8Params (verify8.metal)
   uint tg_begin[5];
 };
 
-// PF: prefetch the next group's codes and coefficients before this group's product
+// PF: prefetch the next group's codes and coefficients before this group's product.
+// Row tiles as qmm8 (verify8.metal v8_tiles: KFlash tree verifies of 16 / 32 rows): tg_begin[nseg] threadgroups per
+// 8-row tile, tiles fastest; tile t reads T table rows 8 t .. 8 t + 7 and their sums, and writes those rows.
 template <int NT, int PF, int MAXKS>
 NI_INLINE void qmm8t_impl(const device uint* const thread* Wv, const device ushort* const thread* Sv,
                           const device ushort* const thread* Bv, device float* const thread* Yv,
                           const device half* T, const device float* sums, constant Qmm8tParams& p,
-                          threadgroup float* red, uint tg, uint sg, uint lane) {
+                          threadgroup float* red, uint tg, uint sg, uint lane, uint ntgs) {
+  const uint per = p.tg_begin[p.nseg], nt = ntgs > per ? ntgs / per : 1u;
+  const uint tile = nt > 1 ? tg % nt : 0u;
+  if (nt > 1) {
+    tg /= nt;
+    T += tile * 8 * p.K;
+    sums += tile * (p.K / 64) * 8;
+  }
   uint si = 0;
   while (si + 1 < p.nseg && tg >= p.tg_begin[si + 1]) ++si;
   const uint N = p.N[si], n0 = (tg - p.tg_begin[si]) * NT, gpr = p.K / 64, wpr = p.K / 8;
@@ -130,7 +139,7 @@ NI_INLINE void qmm8t_impl(const device uint* const thread* Wv, const device usho
     if (n >= N) continue;
     _Pragma("clang loop unroll(full)")
     for (int kk = 0; kk < 4; ++kk) {
-      const uint t = t0 + kk;
+      const uint t = 8 * tile + t0 + kk;
       if (t < p.R) {
         device float* dst = Y + t * y_ld + n;
         *dst = add ? *dst + acc[j * 4 + kk] : acc[j * 4 + kk];
@@ -150,13 +159,14 @@ NI_INLINE void qmm8t_impl(const device uint* const thread* Wv, const device usho
                        const device ushort* B3 [[buffer(14)]], device float* Y3 [[buffer(15)]],              \
                        const device half* T [[buffer(16)]], const device float* sums [[buffer(17)]],         \
                        constant Qmm8tParams& p [[buffer(18)]], uint tg [[threadgroup_position_in_grid]],     \
-                       uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
+                       uint ntgs [[threadgroups_per_grid]], uint sg [[simdgroup_index_in_threadgroup]],      \
+                       uint lane [[thread_index_in_simdgroup]]) {                                            \
     threadgroup float red[(MAXKS - 1) * (NT / 2) * 32];                                                      \
     const device uint* Wv[4] = {W0, W1, W2, W3};                                                              \
     const device ushort* Sv[4] = {S0, S1, S2, S3};                                                            \
     const device ushort* Bv[4] = {B0, B1, B2, B3};                                                            \
     device float* Yv[4] = {Y0, Y1, Y2, Y3};                                                                   \
-    qmm8t_impl<NT, PF, MAXKS>(Wv, Sv, Bv, Yv, T, sums, p, red, tg, sg, lane);                                 \
+    qmm8t_impl<NT, PF, MAXKS>(Wv, Sv, Bv, Yv, T, sums, p, red, tg, sg, lane, ntgs);                           \
   }
 
 NI_QMM8T(qmm8t_b4_nt16, 16, 0, 8)
