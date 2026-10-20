@@ -36,6 +36,7 @@ class DSpark : public NhDrafter {
   void disarm() override;
   void encode_commit(Encoder& e, LiliSeq& d, int m) override;
   void encode_draft(Encoder& e, Seq& s, LiliSeq& d, int P) override;
+  void encode_draft_tree(Encoder& e, Seq& s, LiliSeq& d, int P, const Buffer& kfp) override;
 
  private:
   struct DLayer {
@@ -51,6 +52,8 @@ class DSpark : public NhDrafter {
   const NhCapture& verify_hook() const override { return hook_v_; }
   void enc_commit_rows(Encoder& e, LiliSeq& d, const Buffer& feat, int R, int pos0) override;
   void lin(Encoder& e, const NhMat& W, const Buffer& x, const Buffer& y, int M, int epi, bool scaled = false);
+  // the drafting pass up to each slot's top-K candidates (cand_, clp_)
+  void encode_pass(Encoder& e, Seq& s, LiliSeq& d, int P);
 
   NemotronH& tg_;
   std::string path_;
@@ -72,6 +75,7 @@ class DSpark : public NhDrafter {
   int pf_n_ = 0, pf_lo_ = 0;
   Buffer pfeat_, pfeat_h_, vfeat_;
   Buffer x_, n_, t2_, q_, k_, v_, ao_, gt_, upb_, hfin_, logits_, cv_, ci_, ms_, cand_, clp_, qlp_, picks_;
+  Buffer tlq_;  // KFlash: [S][K][K] log q of each candidate after each candidate of the slot before (nh_dsp_table)
   Buffer cg_, cgh_, ck_, cv2_, rscale_, xh_;
 };
 
