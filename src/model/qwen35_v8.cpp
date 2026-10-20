@@ -885,9 +885,11 @@ void Qwen35::encode_verify8(Encoder& e, Seq& s, int pos, int R, const SamplingPa
   const uint32_t V = uint32_t(cfg_.vocab), chunk = 2048, ntg = (V + chunk - 1) / chunk;
   const uint32_t K = sp.temperature > 0 ? uint32_t(std::clamp(sp.top_k <= 0 ? 32 : sp.top_k, 1, 32)) : 1u;
   kp::TopkStage ts{V, K, chunk};
-  e.use(pipe8("topk_stage1_rows"));
+  // a tree: its live rows alone (tree[kKfN])
+  e.use(pipe8(tree ? "topk_stage1_rows_tree" : "topk_stage1_rows"));
   e.buf(0, logits_); e.buf(1, cand_v_); e.buf(2, cand_i_);
   e.val(3, ts);
+  if (tree) e.buf(4, *v8_tree_);
   e.dispatch(ntg, R, 1, 256);
   kp::SampleRows sr{ntg * K, K, sp.temperature, sp.top_p, sp.seed, step, 0, 0, 0};
   // a tree's row r draws with the uniform of its token's position, step + depth(r)

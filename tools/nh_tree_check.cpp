@@ -225,12 +225,13 @@ RefTree build_ref(const std::vector<float>& tlq, const std::vector<int>& cand, c
   }
   if (kp.force_n > 0) {
     t.n = std::min(kp.force_n, t.m);
-  } else {
-    float E = 1.0f, best = E / kp.cost[1];
+  } else {  // E(n) - rate cost[n] (rate 0: E(n) / cost[n])
+    auto val = [&](float E, int n) { return kp.rate > 0.0f ? E - kp.rate * kp.cost[n] : E / kp.cost[n]; };
+    float E = 1.0f, best = val(E, 1);
     t.n = 1;
     for (int r = 1; r < t.m; ++r) {
       E += std::exp(t.score[r]);
-      const float v = E / kp.cost[r + 1];
+      const float v = val(E, r + 1);
       if (v > best) best = v, t.n = r + 1;
     }
   }
@@ -265,6 +266,7 @@ void test_builder(NemotronH& m, Seq& s) {
     kp.cost[0] = 1.0f;
     for (int n = 1; n <= 8; ++n) kp.cost[n] = trial % 4 == 0 ? 1.0f : 1.0f + 0.03f * float(n - 1) * float(1 + trial % 7);
     kp.force_n = trial % 10 == 9 ? 1 + rnd(8) : 0;
+    kp.rate = trial % 2 ? 0.0f : 0.1f + 0.01f * float(rnd(40));  // the rate rule on even trials
     kp.allowed = 0xffu;  // every row count 1 .. 8 (a MoE target's rows cost experts)
     kp.max_rows = R8;
     // the shared builder's children tables: tokens per children-row, the lattice's constant successors

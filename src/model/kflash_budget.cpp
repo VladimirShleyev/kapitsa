@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sys/stat.h>
@@ -71,13 +72,49 @@ void KfBudget::fit(const std::vector<float>& x, const std::vector<uint8_t>& y, f
 
 void KfBudget::observe(const int32_t* t, double ms) {
   std::lock_guard<std::mutex> lk(mu_);
-  const int n = std::clamp(int(t[kf::kN]), 1, kf::kMaxRows);
+  // the rows the acceptance walked (kObs: kN may already be the next cycle's choice), else kN (a descriptor no
+  // acceptance wrote)
+  const int n = std::clamp(int(t[kf::kObs] > 0 ? t[kf::kObs] : t[kf::kN]), 1, kf::kMaxRows);
   ++cycles_;
+  ++ncycles_[n];
   rows_sum_ += n;
-  // the cost of n rows: a running mean over the last ~16 cycles that verified n rows
-  if (ncost_[n] == 0) cost_[n] = ms;
-  else cost_[n] += (ms - cost_[n]) / double(std::min(ncost_[n] + 1, 16));
-  ++ncost_[n];
+  if (t[kf::kObs] > 0) {  // the tokens the builder expected (E(n)) against the cycle's: its accepted drafts + 1
+    float e;
+    memcpy(&e, &t[kf::kObs + 1], 4);
+    if (e >= 1.0f && e <= float(kf::kMaxRows) + 1.0f) {
+      epred_ += e;
+      etok_ += double(std::clamp(int(t[kf::kA]), 0, kf::kMaxRows) + 1);
+      ++ne_;
+    }
+  }
+  // the costs: this process's first cycle sets the base (with a cached table, from a count it holds: write forces one
+  // first; until then the counts measured keep absolute offsets); a count's first cycle sets its offset; later cycles
+  // move the base by half of what they cost above the table and their count's offset by a running mean's step (its
+  // last ~32 cycles), so a change of every count's cost (the context's length) goes to the base (all but ~6%)
+  if (!based_ && (!loaded_ || (ncost_[n] > 0 && !((pre_ >> n) & 1u)))) {
+    base_ = ncost_[n] > 0 ? ms - off_[n] : ms;
+    if (ncost_[n] == 0) off_[n] = 0.0, ncost_[n] = 1;
+    for (int m = 1; m < kD; ++m)
+      if ((pre_ >> m) & 1u) off_[m] -= base_;
+    pre_ = 0;
+    based_ = true;
+  } else if (!based_) {  // a count the cache does not hold, before the base: its offset absolute for now
+    off_[n] = ncost_[n] == 0 ? ms : off_[n] + (ms - off_[n]) / double(std::min(ncost_[n] + 1, 32));
+    ++ncost_[n];
+    pre_ |= uint64_t(1) << n;
+  } else if (ncost_[n] == 0) {
+    off_[n] = ms - base_;
+    ncost_[n] = 1;
+  } else {
+    const double e = ms - (base_ + off_[n]);
+    base_ += 0.5 * e;
+    off_[n] += e / double(std::min(ncost_[n] + 1, 32));
+    ++ncost_[n];
+  }
+  // the rate: the recent cycles' tokens per ms (sums decaying by 1/64 a cycle)
+  rtok_ = rtok_ * (63.0 / 64.0) + double(std::clamp(int(t[kf::kA]), 0, kf::kMaxRows) + 1);
+  rms_ = rms_ * (63.0 / 64.0) + ms;
+  ++nrate_;
   const int nrec = std::clamp(int(t[kf::kNrec]), 0, kf::kMaxRows);
   for (int i = 0; i < nrec; ++i) {
     const int d = t[kf::kRecDep + i];
@@ -108,28 +145,42 @@ void KfBudget::write(KfParams& p) const {
     p.alpha[d] = alpha_[d];
     p.beta[d] = beta_[d];
   }
-  // exploration: every allowed row count measured twice before the table decides
-  int force = 0;
-  for (int n = 1; n <= max_rows_; ++n)
-    if (((allowed_ >> (n - 1)) & 1u) && ncost_[n] < 2) {
-      force = n;
-      break;
+  // NI_KFLASH_FORCE=n (tests): every cycle verifies n rows (-1: the allowed counts in turn, cycle by cycle)
+  static const int forced = getenv("NI_KFLASH_FORCE") ? std::clamp(atoi(getenv("NI_KFLASH_FORCE")), -1, max_rows_) : 0;
+  int force = std::max(forced, 0);
+  if (forced < 0)
+    for (int i = 0; i < max_rows_ && !force; ++i) {
+      const int n = 1 + (cycles_ + i) % max_rows_;
+      if ((allowed_ >> (n - 1)) & 1u) force = n;
     }
+  // with a cached table and a choice of counts, this process's first cycles verify a count it holds (they set the
+  // base); then every allowed count kExplore times
+  if (!force && !based_ && loaded_ && __builtin_popcount(allowed_) > 1)
+    for (int n = max_rows_; n >= 1 && !force; --n)
+      if (((allowed_ >> (n - 1)) & 1u) && ncost_[n] > 0 && !((pre_ >> n) & 1u)) force = n;
+  for (int n = 1; n <= max_rows_ && !force; ++n)
+    if (((allowed_ >> (n - 1)) & 1u) && ncost_[n] < kExplore) force = n;
   p.force_n = force;
   p.allowed = allowed_;
   p.max_rows = max_rows_;
-  p.pad = 0;
+  p.rate = nrate_ >= 16 && rms_ > 0 ? float(rtok_ / rms_) : 0.0f;
   p.cost[0] = 1.0f;
-  for (int n = 1; n < kD; ++n) p.cost[n] = cost_[n] > 0 ? float(cost_[n]) : 1.0f;
+  for (int n = 1; n < kD; ++n) p.cost[n] = ncost_[n] > 0 ? float(std::max(base_ + off_[n], 0.01)) : 1.0f;
 }
 
 std::string KfBudget::summary() const {
   std::lock_guard<std::mutex> lk(mu_);
   char b[1024];
-  int o = snprintf(b, sizeof b, "KFlash: %d cycles, %.2f rows per cycle; cost ms by rows", cycles_,
+  int o = snprintf(b, sizeof b, "KFlash: %d cycles, %.2f rows per cycle; cycles by rows", cycles_,
                    cycles_ ? rows_sum_ / cycles_ : 0.0);
+  for (int n = 1; n < kD && o < int(sizeof b) - 16; ++n)
+    if (ncycles_[n]) o += snprintf(b + o, sizeof b - o, " %d:%d", n, ncycles_[n]);
+  if (ne_) o += snprintf(b + o, sizeof b - o, "; tokens per cycle expected %.3f, got %.3f", epred_ / ne_, etok_ / ne_);
+  if (rms_ > 0) o += snprintf(b + o, sizeof b - o, "; rate %.4f tok/ms", rtok_ / rms_);
+  o += snprintf(b + o, sizeof b - o, "; cost ms by rows");
   for (int n = 1; n <= max_rows_ && o < int(sizeof b) - 16; ++n)
-    if ((allowed_ >> (n - 1)) & 1u) o += snprintf(b + o, sizeof b - o, " %d:%.2f", n, cost_[n]);
+    if ((allowed_ >> (n - 1)) & 1u)
+      o += snprintf(b + o, sizeof b - o, " %d:%.2f", n, ncost_[n] ? base_ + off_[n] : 0.0);
   o += snprintf(b + o, sizeof b - o, "; calibration (alpha, beta) by depth");
   for (int d = 1; d <= std::min(max_rows_, 8) && o < int(sizeof b) - 24; ++d)
     o += snprintf(b + o, sizeof b - o, " (%.2f, %.2f)", alpha_[d], beta_[d]);
@@ -145,9 +196,9 @@ void KfBudget::load() {
     const auto& c = j.at("cost");
     const auto& a = j.at("alpha");
     const auto& bb = j.at("beta");
-    if (j.value("cost_of", "") == kCostOf)
+    if (j.value("cost_of", "") == kCostOf)  // (offsets above base 0: the costs at the save)
       for (int n = 1; n < kD && n < int(c.size()); ++n)
-        if (c[size_t(n)].get<double>() > 0) cost_[n] = c[size_t(n)].get<double>(), ncost_[n] = 2;
+        if (c[size_t(n)].get<double>() > 0) off_[n] = c[size_t(n)].get<double>(), ncost_[n] = kExplore, loaded_ = true;
     for (int d = 1; d < kD && d < int(a.size()) && d < int(bb.size()); ++d) {
       alpha_[d] = a[size_t(d)].get<float>();
       beta_[d] = bb[size_t(d)].get<float>();
@@ -164,7 +215,10 @@ void KfBudget::save(int fresh) {
   mkdir(dir.c_str(), 0755);
   nlohmann::json j;
   j["cost_of"] = kCostOf;
-  j["cost"] = std::vector<double>(cost_, cost_ + kD);
+  std::vector<double> cost(kD, 0.0);  // the costs now
+  for (int n = 1; n < kD; ++n)
+    if (ncost_[n] && !((pre_ >> n) & 1u)) cost[size_t(n)] = std::max(base_ + off_[n], 0.01);
+  j["cost"] = cost;
   j["alpha"] = std::vector<float>(alpha_, alpha_ + kD);
   j["beta"] = std::vector<float>(beta_, beta_ + kD);
   // written whole beside it, then renamed over it: a process ended mid-write (kill -9 after a stop signal), or another

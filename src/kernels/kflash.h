@@ -22,6 +22,9 @@
 //                    verify of n rows is expected to emit (the accepted path plus one), n = 1 .. nodes built
 //   [kKfJump]        bit r set: row r's parent is not row r - 1 (a verify may replay such a row's ancestry)
 //   [kKfNodes]       rows built m (1 + the nodes taken), n <= m
+//   [kKfObs + i]     what the budget reads of the cycle the acceptance walked, copied by kf_accept (in a double-
+//                    buffered loop the next cycle's builder may rewrite the words before the host reads them): i = 0
+//                    its live rows n, 1 its E(n) (float bits)
 #ifdef __METAL_VERSION__
 #define KF_WORD(name, v) constant constexpr uint kKf##name = v
 typedef uint kf_uint;
@@ -50,6 +53,7 @@ KF_WORD(Score, 260);
 KF_WORD(E, 292);
 KF_WORD(Jump, 325);
 KF_WORD(Nodes, 326);
+KF_WORD(Obs, 328);
 KF_WORD(Words, 336);
 KF_WORD(PathWords, 40);  // Seq::pend_path: the accepted path's rows (int32), up to kKfMaxRows + 1
 #undef KF_WORD
@@ -57,15 +61,15 @@ KF_WORD(PathWords, 40);  // Seq::pend_path: the accepted path's rows (int32), up
 // What the budget (src/model/kflash_budget.h, KfBudget) gives the builder each cycle, from past cycles only:
 // the per-depth calibration of the path model's probabilities (p = sigmoid(alpha_d + beta_d logit(q)); 0 and 1 give q
 // itself), the measured cost of a cycle that verifies n rows (its GPU ms), which row counts the backend's verify runs
-// at a cost of their own (allowed: bit n - 1), the verify's row capacity, and the cost table's exploration (force_n >
-// 0: verify that many).
+// at a cost of their own (allowed: bit n - 1), the verify's row capacity, the cost table's exploration (force_n > 0:
+// verify that many) and the tokens per ms the recent cycles gave (rate; 0: none yet).
 struct KfParams {
   float alpha[33], beta[33];  // depth d = 1 .. 32 (index d)
   float cost[33];             // n = 1 .. 32 rows (index n), ms
   kf_int force_n;
   kf_uint allowed;
   kf_int max_rows;
-  kf_int pad;
+  float rate;
 };
 #ifndef __METAL_VERSION__
 // A lattice's children table (the first-order drafters: DFlash2, LiLiCorr, DSpark): children-row (s * K + p) holds
@@ -84,6 +88,10 @@ using kf::KfParams;
 }
 #else
 
+// The live rows of a tree verify of R rows (the builder's n, at least 1): a verify's row-scaled work beyond them is
+// skipped (their outputs are garbage; no live row reads them).
+NI_INLINE uint kf_live(const device int* tree, uint R) { return min(R, uint(max(tree[kKfN], 1))); }
+
 // ---- the tree builder: best-first over a path model's children tables ----
 // The path model is three tables over "children-rows" (any indexing the model likes): clq[row][c] the log-probability
 // of child c given the node the row belongs to, ctok[row][c] its token, cnext[row][c] the children-row of that child
@@ -92,8 +100,9 @@ using kf::KfParams;
 // A node's score is the sum over its root path of log p, p = sigmoid(alpha_d + beta_d logit(q)) the calibrated
 // probability that the target accepts a node of depth d whose model probability is q. Nodes are taken in decreasing
 // score (a child never scores above its parent, so rows are in insertion order; ties: the earlier frontier entry) up
-// to the verify's capacity; the live rows n maximize E(n) / cost[n] over the allowed n (force_n: that n; no allowed n
-// within the rows built: all of them). The nodes' tokens go to tokens[P + r], the descriptor to tree, n to live[0].
+// to the verify's capacity; the live rows n maximize E(n) - rate cost[n] over the allowed n (a row is worth the tokens
+// per ms it costs at the long-run rate; rate 0: E(n) / cost[n]; force_n: that n; no allowed n within the rows built:
+// all of them). The nodes' tokens go to tokens[P + r], the descriptor to tree, n to live[0].
 // grid: 1 x 32 threads. Threadgroup memory: 12 KB + (every chip).
 struct KfBuildP {
   uint K;     // children per row (<= 32)
@@ -181,14 +190,15 @@ NI_INLINE void kf_build_impl(const device float* clq, const device int* ctok, co
   }
   if (lane == 0) {
     const uint m = nodes;
-    float E = 1.0f, best = -1.0f;
+    float E = 1.0f, best = -INFINITY;
     uint n = 0;
     tree[kKfE] = 0;
     for (uint nn = 1; nn <= m; ++nn) {
       if (nn > 1) E += metal::precise::exp(ns[nn - 1]);
       tree[kKfE + nn] = as_type<int>(E);
-      if (((kp.allowed >> (nn - 1)) & 1u) && E / kp.cost[nn] > best) {
-        best = E / kp.cost[nn];
+      const float v = kp.rate > 0.0f ? E - kp.rate * kp.cost[nn] : E / kp.cost[nn];
+      if (((kp.allowed >> (nn - 1)) & 1u) && v > best) {
+        best = v;
         n = nn;
       }
     }
@@ -242,9 +252,9 @@ struct KfLatticeP {
 // then exactly plain decoding's, whatever the tree (which the drafter fixed before any sample was drawn). Writes
 // tokens[P + 1 .. P + a] = the path's tokens and tokens[P + 1 + a] = its last row's sample; res = {a, that token}; the
 // path (kKfA, kKfPath, and path[i] = Seq::pend_path for the next pass's pending rows); the calibration records (every
-// live node whose parent is on the path: depth, log q, 1 if it is on the path); with p.gst, the drafter state of a
-// GPU-driven loop (gst[0] = P + a + 1, gst[1] = a + 1, gst[2] = P, gst[4 + i] = path[i]: DFlash2's). The live rows
-// are min(tree[kKfN], live[0], p.R). grid: 1 x 32.
+// live node whose parent is on the path: depth, log q, 1 if it is on the path), the live rows and their E (kKfObs);
+// with p.gst, the drafter state of a GPU-driven loop (gst[0] = P + a + 1, gst[1] = a + 1, gst[2] = P, gst[4 + i] =
+// path[i]: DFlash2's). The live rows are min(tree[kKfN], live[0], p.R). grid: 1 x 32.
 struct KfAcceptP {
   uint P;    // anchor position
   uint R;    // the verify's rows
@@ -291,6 +301,8 @@ struct KfAcceptP {
     res[1] = y;
     tree[kKfA] = int(a);
     tree[kKfNrec] = int(nrec);
+    tree[kKfObs] = int(n);
+    tree[kKfObs + 1] = tree[kKfE + n];
     if (p.gst) {
       gst[0] = p.P + a + 1;
       gst[1] = a + 1;

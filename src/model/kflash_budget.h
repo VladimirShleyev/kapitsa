@@ -7,11 +7,15 @@
 //    Before any records, alpha 0 and beta 1: p = q.
 //  - cost: a cycle's GPU time with n verify rows, measured on the Mac it runs on: its drafting half's command buffer
 //    and its verify's, in ms, whichever tool runs the cycles (ni_run, the server), so the cache means one thing
-//    whoever wrote it. The first cycles try every allowed n twice (unless the cache already holds a table for this
-//    model, drafter and chip), then a running mean per n.
-// The builder takes the allowed n that maximizes expected tokens per ms: (1 + the summed calibrated path probabilities
-// of the first n - 1 nodes) / cost[n]. Which n a backend allows is what its verify kernels run at a cost of their own:
-// whole 8-row tiles on the dense Qwen models (one tile today), every row count on MoE targets, whose rows cost experts.
+//    whoever wrote it. The first cycles try every allowed n three times (unless the cache already holds a table for
+//    this model, drafter and chip). A cost is a base that every cycle moves (the context's length: the 35B's cycles
+//    cost ~7 ms more at 21k tokens than at 100, whatever n) plus n's own offset, a running mean of what its cycles
+//    cost above the base; each process sets the base by its first cycle (a count the cache holds).
+// The builder takes the allowed n that maximizes E(n) - rate cost[n], E(n) the tokens a verify of n rows is expected
+// to emit (1 + the summed calibrated path probabilities of the first n - 1 nodes) and rate the tokens per ms the
+// recent cycles gave (their long-run rate, which a row must beat to pay: the base cancels); before 16 cycles of this
+// process, E(n) / cost[n]. Which n a backend allows is what its verify kernels run at a cost of their own: whole
+// 8-row tiles on the dense Qwen models (one tile today), every row count on MoE targets, whose rows cost experts.
 // The cache file (KAPITSA_HOME/kflash/<key>.json) keeps the table and the calibration: written when the budget ends
 // and on save() (the engine saves between requests, the server when it is stopped).
 #pragma once
@@ -40,10 +44,12 @@ class KfBudget {
   // last save. From any thread (the server saves on its stop signal while a request may be in its cycles).
   void save(int fresh = 1);
   static constexpr int kSaveEvery = 256;  // the engine's save after a request: a server killed hard loses less
-  // for logs: rows chosen on average, the calibration, the cost table
+  // for logs: rows chosen on average and the cycles by rows, the calibration, the cost table
   std::string summary() const;
   int cycles() const { return cycles_; }
-  double cost(int n) const { return n >= 1 && n <= kf::kMaxRows ? cost_[n] : 0.0; }
+  // n rows' cost now (ms; 0: not measured)
+  double cost(int n) const { return n >= 1 && n <= kf::kMaxRows && ncost_[n] ? base_ + off_[n] : 0.0; }
+  static constexpr int kExplore = 3;  // cycles per allowed count before the rule decides
   float alpha(int d) const { return alpha_[d]; }
   float beta(int d) const { return beta_[d]; }
 
@@ -61,8 +67,17 @@ class KfBudget {
   std::vector<uint8_t> y_[kD];
   size_t head_[kD] = {};
   float alpha_[kD], beta_[kD];
-  double cost_[kD] = {};
-  int ncost_[kD] = {};
+  double base_ = 0;        // the costs' base (ms) and the counts' offsets above it: cost(n) = base_ + off_[n]
+  double off_[kD] = {};    // (loaded: the cache's costs, base 0 at its save)
+  bool based_ = false;     // this process set the base (its first cycle; with a cached table: a count it holds)
+  bool loaded_ = false;    // the cache held a cost table
+  uint64_t pre_ = 0;       // counts this process measured before its base (offsets absolute until then)
+  int ncost_[kD] = {};     // cycles that measured n (loaded: kExplore)
+  double rtok_ = 0, rms_ = 0;  // the recent cycles' tokens and ms (decaying sums): the rate
+  int nrate_ = 0;
+  int ncycles_[kD] = {};  // cycles by rows (the summary)
+  double epred_ = 0, etok_ = 0;  // the summary: E(n) the builder expected, the tokens the cycles gave (cycles with E)
+  int ne_ = 0;
   uint32_t allowed_ = 0xffu;
   int max_rows_ = 8;
   int cycles_ = 0, since_fit_ = 0, force_ = 0, saved_ = 0;  // saved_: cycles_ at the last save

@@ -808,7 +808,8 @@ struct Moe8PlanParams {
   uint layer;   // stats[layer] = distinct routed experts, for diagnostics
   uint small;   // experts with <= small rows take the scalar passes (0: none, max 2)
   uint sgu_gx, sdn_gx;
-  uint rlim;    // 1: route only rows < min(R, rows[0]) (a drafter's dynamic verify depth; later rows are dropped)
+  uint rlim;    // 1: only rows < min(R, rows[0]) (a drafter's dynamic verify depth, a KFlash tree's live rows): the
+                // router's top-k, the routed experts and the shared expert; later rows are dropped (garbage)
   uint split;   // experts with small < rows <= split become ceil(rows / 2) small tiles (>= small; MMA-exact passes)
   uint shs;     // 1: the shared expert as ceil(R / 2) small tiles (expert 0xffffffff) after the routed ones, no MMA tile
   uint sep;     // 1: the split experts' (and the shared expert's) tiles in list B (sm2, ntiles[2]: MMA-exact passes)
@@ -845,10 +846,10 @@ NI_INLINE void v8_put_tiles(device uint* sm, uint s0, uint n, uint e, thread con
   threadgroup uint ids[64];
   threadgroup uint cnt[4][32];
   threadgroup uint total[4];
-  const uint R = p.rlim ? min(p.R, rows_lim[0]) : p.R;
+  const uint R = p.rlim ? max(min(p.R, rows_lim[0]), 1u) : p.R;
   const uint n = R * p.k;
   if (p.topk) {
-    if (sg < p.R) topk256_row(rlog, slog, ridx, rwts, tp, sg, lane, ids);
+    if (sg < R) topk256_row(rlog, slog, ridx, rwts, tp, sg, lane, ids);
   } else if (tid < n) {
     ids[tid] = ridx[tid];
   }
@@ -898,18 +899,18 @@ NI_INLINE void v8_put_tiles(device uint* sm, uint s0, uint n, uint e, thread con
   }
   if (na) v8_put_tiles(sm, cnt[1][sg] + pre_a, na, e, my);
   if (nb) v8_put_tiles(sm2, cnt[2][sg] + pre_b, nb, e, my);
-  const uint U = total[0], nsh = p.shs ? (p.R + 1) / 2 : 0u;
+  const uint U = total[0], nsh = p.shs ? (R + 1) / 2 : 0u;
   const uint SA = total[1] + (p.shs && !p.sep ? nsh : 0u), SB = total[2] + (p.shs && p.sep ? nsh : 0u);
   if (p.shs) {  // the shared expert: rows 0 .. R - 1 (its slot: k), expert 0xffffffff
     device uint* l = p.sep ? sm2 : sm;
     const uint s0 = p.sep ? total[2] : total[1];
     if (tid < nsh) l[s0 + tid] = 0xffffffffu;
     if (tid < 2 * nsh) {
-      l[kV8SM + 2 * s0 + tid] = tid < p.R ? tid : 0xffffffffu;
-      l[3 * kV8SM + 2 * s0 + tid] = tid < p.R ? p.k : 0xffffffffu;
+      l[kV8SM + 2 * s0 + tid] = tid < R ? tid : 0xffffffffu;
+      l[3 * kV8SM + 2 * s0 + tid] = tid < R ? p.k : 0xffffffffu;
     }
   } else if (tid < 8) {
-    slot[U * 8 + tid] = tid < p.R ? p.k : 0xffffffffu;
+    slot[U * 8 + tid] = tid < R ? p.k : 0xffffffffu;
   }
   if (tid == 0) {
     if (!p.shs) tiles[U] = 0xffffffffu;
@@ -1909,11 +1910,11 @@ struct SwigluX8Params {
 // 1024 threads left it underused). The per-head tape rows k and g (read by every block for the fold) are written
 // by the block that arrives last at the counter cnt[h] (it also resets it): every block has read the old ones by
 // then. Raw outputs o -> out [R][Hv][128] (fp32); gdn_gnorm_x8 applies the gated RMSNorm. grid (Hv, blocks).
-// TREE (gdn_step_verify8s_tree, KFlash tree verifies): the rows are a tree (p.tree; row t's parent tree[t]) and the
-// pending rows a tree cycle's accepted path (p.pidx: tape rows path[0 .. n_pend)). A row whose parent is the row
-// before it continues from that row's state; any other row first rebuilds its parent's state from the base (kept in
-// registers): the folds of its ancestors' tape entries (st = st g + k d, rows in slot order = root to leaf; d: the tape
-// rows this simdgroup wrote).
+// TREE (gdn_step_verify8s_tree, KFlash tree verifies): the rows are a tree (p.tree; row t's parent tree[t]; its live
+// rows alone, the rows in sequence being this step's cost) and the pending rows a tree cycle's accepted path (p.pidx:
+// tape rows path[0 .. n_pend)). A row whose parent is the row before it continues from that row's state; any other
+// row first rebuilds its parent's state from the base (kept in registers): the folds of its ancestors' tape entries
+// (st = st g + k d, rows in slot order = root to leaf; d: the tape rows this simdgroup wrote).
 template <bool TREE>
 NI_INLINE void gdn_step_verify8s_impl(const device float* q, const device float* k, const device float* v,
                                       const device float* g, const device float* beta, device float* state,
@@ -1940,10 +1941,11 @@ NI_INLINE void gdn_step_verify8s_impl(const device float* q, const device float*
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const bool writer = last != 0;  // every block of the head has read the old k / g tape
   const uint rebuild = TREE && p.tree ? uint(tree[kKfJump]) : 0u;  // tree: rows whose parent is not the row before them
+  const uint R = TREE && p.tree ? kf_live(tree, p.R) : p.R;          // a tree: its live rows
   float4 st0[4];  // tree: the base state
   if (TREE)
     for (int r = 0; r < 4; ++r) st0[r] = st[r];
-  for (uint t = 0; t < p.R; ++t) {
+  for (uint t = 0; t < R; ++t) {
     if (TREE && ((rebuild >> t) & 1u)) {
       simdgroup_barrier(mem_flags::mem_device);  // this simdgroup's tape rows of the earlier rows
       for (int r = 0; r < 4; ++r) st[r] = st0[r];

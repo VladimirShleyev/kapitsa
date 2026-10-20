@@ -13,10 +13,11 @@
 //    pass; the rule that also uses the proposal's own confidence (rule 1, not used by the engine at T > 0) must fail in the depth-sensitive
 //    regime (q = p at the first proposal, q = 0.9 / 0.1 vs p = 1/2 at the second: that rule emits 0.55 / 0.45).
 // 3. KFlash tree verifies: the shared builder (kf_build) takes a best-first tree from a synthetic DFlash2 lattice
-//    (random, or aligned with the target's likely path; the identity or a random calibration; 1-8 verify rows), the
-//    target's rows of the tree's
-//    paths are sampled by sample_stage2_rows_tree (top-k, top-p, temperature as the engine's sampler, each row with
-//    the uniform of its token's position), the shared kf_accept walks them; a second cycle runs when one token came out.
+//    (random, or aligned with the target's likely path; the identity or a random calibration; 1-8 live rows of an
+//    8-row verify, one count allowed, or every count 1-8 under the size rule, n per trial: the MoE targets'), the
+//    target's rows of the tree's paths are sampled by sample_stage2_rows_tree (top-k, top-p, temperature as the
+//    engine's sampler, each row with the uniform of its token's position; the live rows alone), the shared kf_accept
+//    walks them; a second cycle runs when one token came out.
 //    The joint law of the first two tokens is tested as in 2, and every trial's two tokens must equal plain decoding's
 //    with the same position-keyed uniforms (the sampler transcribed on the CPU); T = 0: equal to the argmax decoding.
 #include "metal/gpu.h"
@@ -395,12 +396,16 @@ int tree_cases(long trials, uint64_t salt, int only) {
     float temp, top_p;
     int top_k;
     bool cal;  // a random per-depth calibration (alpha, beta) instead of the identity (the law must not depend on it)
-    int R;     // verify rows (the budget allows this count alone)
+    int R;     // live rows (the budget allows this count alone); 0: every count 1 .. 8, the size rule picks n per trial
+    float rate = 0.0f;  // the rule's cases: the recent tokens per ms (E(n) - rate cost[n]; 0: E(n) / cost[n])
   };
   const std::vector<TCase> cases = {{kRandom, 0.6f, 0.95f, 20, false, 8}, {kEqual, 0.6f, 0.95f, 20, true, 8},
                                     {kEqual, 1.0f, 1.0f, 32, true, 5},    {kPoint, 0.6f, 0.95f, 20, true, 3},
                                     {kRandom, 0.0f, 1.0f, 1, false, 8},   {kEqual, 0.0f, 1.0f, 1, true, 6},
-                                    {kEqual, 0.6f, 0.95f, 20, true, 1}};
+                                    {kEqual, 0.6f, 0.95f, 20, true, 1},   {kEqual, 0.6f, 0.95f, 20, true, 0},
+                                    {kRandom, 0.6f, 0.95f, 20, false, 0}, {kEqual, 0.0f, 1.0f, 1, true, 0},
+                                    {kEqual, 0.6f, 0.95f, 20, true, 0, 0.1f},
+                                    {kRandom, 0.0f, 1.0f, 1, false, 0, 0.06f}};
   Pipeline table_p = g.pipeline("dfl_kf_table"), build_p = g.pipeline("kf_build"),
            samp_p = g.pipeline("sample_stage2_rows_tree"), acc_p = g.pipeline("kf_accept");
   const int B = 2048, W = kf::kWords;
@@ -421,7 +426,7 @@ int tree_cases(long trials, uint64_t salt, int only) {
     const int tgt = cs.regime == kPoint ? kPoint : kRandom;
     const int lat = cs.regime == kEqual ? kEqual : kRandom;
     std::map<long, long> obs, obs1;
-    long done = 0, path_bad = 0, compared = 0;
+    long done = 0, path_bad = 0, compared = 0, nhist[9] = {};
     double mean_a = 0;
     std::mt19937_64 hr(4321 + cix * 7 + salt * 1000003);
     KfParams kp{};
@@ -433,9 +438,30 @@ int tree_cases(long trials, uint64_t salt, int only) {
         kp.cost[d] = 1.0f;
       }
       kp.force_n = 0;
-      kp.allowed = 1u << (cs.R - 1);
+      // the size rule's cases: every count, a cycle's cost growing with its rows (a MoE verify's experts)
+      kp.allowed = cs.R ? 1u << (cs.R - 1) : 0xffu;
+      if (!cs.R)
+        for (int nn = 1; nn <= 8; ++nn) kp.cost[nn] = 8.0f + float(nn);
       kp.max_rows = 8;
+      kp.rate = cs.rate;
     }
+    // the rule's choice from the descriptor's E(n) (kf_build's: the first n maximizing E(n) - rate cost[n], rate 0:
+    // E(n) / cost[n], over the allowed counts within the rows built)
+    auto rule_n = [&](const int* tr) {
+      const int m = tr[kf::kNodes];
+      float best = -INFINITY;
+      int n = 0;
+      for (int nn = 1; nn <= m; ++nn) {
+        float E;
+        memcpy(&E, &tr[kf::kE + nn], 4);
+        const float v = kp.rate > 0.0f ? E - kp.rate * kp.cost[nn] : E / kp.cost[nn];
+        if (((kp.allowed >> (nn - 1)) & 1u) && v > best) {
+          best = v;
+          n = nn;
+        }
+      }
+      return n ? n : m;
+    };
     // one cycle for trials [0, n) after prefix pre[i] (the anchor at position P = pre[i].size()); the emitted tokens
     auto cycle = [&](const std::vector<std::vector<int>>& pre, const std::vector<uint32_t>& seed) {
       const int n = int(pre.size());
@@ -502,7 +528,11 @@ int tree_cases(long trials, uint64_t salt, int only) {
         const int* tr = tree.as<int>() + i * W;
         for (int j = 1; j <= a + 1; ++j) out[i].push_back(tok.as<int>()[i * 16 + P + j]);
         if (out[i].back() != res.as<int>()[i * 4 + 1]) ++path_bad;  // the token after the path
-        if (tr[kf::kN] != cs.R || int(live.as<uint32_t>()[i * 4]) != cs.R || tr[kf::kA] != a) ++path_bad;
+        const int nx = cs.R ? cs.R : rule_n(tr);
+        if (tr[kf::kN] != nx || int(live.as<uint32_t>()[i * 4]) != nx || tr[kf::kA] != a || tr[kf::kObs] != nx)
+          ++path_bad;
+        if (a > nx - 1) ++path_bad;
+        if (P == 0) nhist[std::clamp(nx, 0, 8)]++;
         if (int(gst.as<uint32_t>()[i * 16]) != P + a + 1 || int(gst.as<uint32_t>()[i * 16 + 1]) != a + 1) ++path_bad;
         for (int j = 0; j <= a; ++j)  // the path: rows of the accepted branch, the drafter state's and the sequence's
           if (path.as<int>()[i * kf::kPathWords + j] != tr[kf::kPath + j] ||
@@ -567,12 +597,26 @@ int tree_cases(long trials, uint64_t salt, int only) {
     chi2(obs, ex, trials, &st, &dof, &pv, &out);
     chi2(obs1, ex1, trials, &st1, &dof1, &pv1, &out1);
     const bool greedy = cs.temp <= 0;
-    const bool ok = (greedy || (pv > 0.01 && pv1 > 0.01)) && out == 0 && out1 == 0 && path_bad == 0;
-    printf("[S1 tree] lattice %-8s target %-6s T=%.1f top-p %.2f top-k %d %s, %d rows: %ld trials, mean a %.2f; "
+    // the rule's cases must reach several counts (else they test one count again)
+    int counts = 0;
+    for (int nn = 1; nn <= 8; ++nn) counts += nhist[nn] > 0;
+    const bool ok = (greedy || (pv > 0.01 && pv1 > 0.01)) && out == 0 && out1 == 0 && path_bad == 0 &&
+                    (cs.R || counts >= 3);
+    char rows[128];
+    if (cs.R) {
+      snprintf(rows, sizeof rows, "%d rows", cs.R);
+    } else {
+      int o = cs.rate > 0 ? snprintf(rows, sizeof rows, "rate rule (%.2f) over 1-8 rows (trials by n", cs.rate)
+                          : snprintf(rows, sizeof rows, "rule over 1-8 rows (trials by n");
+      for (int nn = 1; nn <= 8 && o < int(sizeof rows) - 12; ++nn)
+        if (nhist[nn]) o += snprintf(rows + o, sizeof rows - o, " %d:%ld", nn, nhist[nn]);
+      snprintf(rows + o, sizeof rows - o, ")");
+    }
+    printf("[S1 tree] lattice %-8s target %-6s T=%.1f top-p %.2f top-k %d %s, %s: %ld trials, mean a %.2f; "
            "joint chi2 %.1f (%d dof) p=%.3f; first token p=%.3f; outside support %ld; plain-decoding mismatches %ld of "
            "%ld: %s\n",
            lat == kEqual ? "aligned" : "random", tgt == kPoint ? "1-2" : "random", cs.temp, cs.top_p, cs.top_k,
-           cs.cal ? "calibrated" : "identity", cs.R, trials, mean_a / trials, st, dof, pv, pv1, out + out1, path_bad,
+           cs.cal ? "calibrated" : "identity", rows, trials, mean_a / trials, st, dof, pv, pv1, out + out1, path_bad,
            compared, ok ? "PASS" : "FAIL");
     if (!ok) ++fails;
   }
@@ -699,6 +743,81 @@ int cache_check() {
           "saves from another thread while cycles are observed: one whole file");
   }
   for (const auto& f : files()) unlink((kdir + "/" + f).c_str());
+  rmdir(kdir.c_str());
+  rmdir(dir.c_str());
+  if (h) setenv("KAPITSA_HOME", old_home.c_str(), 1);
+  else unsetenv("KAPITSA_HOME");
+  return bad ? 1 : 0;
+}
+
+// The shared budget's costs and rate (KfBudget, every count 1 .. 8 allowed, as on MoE targets): the counts explored
+// kExplore times each, then cycles of 8 rows whose cost rises with the context (+7 ms over 400 cycles): every count's
+// cost follows (a common base), not only the count the cycles verify; the rate is the tokens per ms they gave; a
+// process loading the cache verifies a count it holds first and its cost sets the base (+7 ms more here).
+int cost_check() {
+  const char* t = getenv("TMPDIR");
+  std::string dir = std::string(t && *t ? t : "/tmp") + "/kf_cost_XXXXXX";
+  if (!mkdtemp(dir.data())) {
+    printf("[costs] no temporary folder: FAIL\n");
+    return 1;
+  }
+  const char* h = getenv("KAPITSA_HOME");
+  const std::string old_home = h ? h : "";
+  setenv("KAPITSA_HOME", dir.c_str(), 1);
+  int bad = 0;
+  auto check = [&](bool ok, const char* what, double got, double want) {
+    printf("[costs] %s: %.3f (expected %.3f): %s\n", what, got, want, ok ? "PASS" : "FAIL");
+    bad += !ok;
+  };
+  const int lvl = log_level();
+  log_level() = 0;
+  auto cost = [](int n, double base) { return base + 1.1 * (n - 1); };  // a cycle's ms: 1.1 ms per row
+  std::vector<int32_t> tree(kf::kWords, 0);
+  auto cycle = [&](KfBudget& b, int n, double ms, int a) {
+    tree[kf::kObs] = n;
+    const float e = 1.0f + float(n) * 0.4f;
+    memcpy(&tree[kf::kObs + 1], &e, 4);
+    tree[kf::kN] = 8;  // (the next cycle's choice already)
+    tree[kf::kA] = a;
+    b.observe(tree.data(), ms);
+  };
+  {
+    KfBudget b("c");
+    b.set_rows(0xffu, 8);
+    int explored = 0;
+    for (int i = 0; i < 64; ++i) {
+      KfParams p{};
+      b.write(p);
+      if (!p.force_n) break;
+      cycle(b, p.force_n, cost(p.force_n, 14.0), 1);
+      ++explored;
+    }
+    check(explored == 8 * KfBudget::kExplore, "exploration: forced cycles", explored, 8 * KfBudget::kExplore);
+    for (int i = 0; i < 400; ++i) cycle(b, 8, cost(8, 14.0 + 7.0 * (i + 1) / 400.0), 2);
+    KfParams p{};
+    b.write(p);
+    check(std::fabs(p.cost[8] - cost(8, 21.0)) < 0.3, "8 rows (verified) after the drift", p.cost[8], cost(8, 21.0));
+    check(std::fabs(p.cost[1] - cost(1, 21.0)) < 0.6, "1 row (not verified since) after the drift", p.cost[1],
+          cost(1, 21.0));
+    check(std::fabs(p.cost[8] - p.cost[1] - 7.7) < 0.6, "8 rows over 1 row", p.cost[8] - p.cost[1], 7.7);
+    // (the rate's sums decay by 1/64 a cycle: their ms lag the drift by ~63 cycles)
+    const double rate = 3.0 / cost(8, 21.0 - 7.0 * 63.0 / 400.0);
+    check(std::fabs(p.rate - rate) < 0.002, "rate (tokens per ms)", p.rate, rate);
+  }  // saved
+  {
+    KfBudget b("c");
+    b.set_rows(0xffu, 8);
+    KfParams p{};
+    b.write(p);
+    check(p.force_n == 8 && p.rate == 0.0f, "loaded: the first cycle verifies a count the cache holds", p.force_n, 8);
+    cycle(b, 8, cost(8, 28.0), 2);
+    b.write(p);
+    check(p.force_n == 0 && std::fabs(p.cost[1] - cost(1, 28.0)) < 0.6, "loaded, +7 ms: 1 row's cost from the base",
+          p.cost[1], cost(1, 28.0));
+  }
+  log_level() = lvl;
+  const std::string kdir = dir + "/kflash";
+  unlink((kdir + "/c.json").c_str());
   rmdir(kdir.c_str());
   rmdir(dir.c_str());
   if (h) setenv("KAPITSA_HOME", old_home.c_str(), 1);
@@ -914,6 +1033,7 @@ int main(int argc, char** argv) {
     fails += tree_cases(trials, salt, only < 0 ? -1 : only - int(cases.size()));
   if (only < 0) fails += fit_check(salt);
   if (only < 0) fails += cache_check();
+  if (only < 0) fails += cost_check();
   printf(fails ? "FAILED: %d\n" : "ALL PASSED\n", fails);
   return fails ? 1 : 0;
 }

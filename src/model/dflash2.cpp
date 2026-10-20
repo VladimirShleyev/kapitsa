@@ -436,26 +436,29 @@ DFlash2::DFlash2(Qwen35& target, const std::string& dir, int bits) : tg_(target)
   }
   if (const char* v = getenv("NI_DFLASH_DYN_T")) dyn_tau_t_ = tg_.config().moe ? float(atof(v)) : 0.0f;
   if (dyn_tau_ <= 0) dyn_tau_t_ = 0.0f;
-  if (dyn_tau_ > 0) logi("DFlash2: dynamic verify depth, tau %.3f (T = 0) / %.3f (T > 0)", dyn_tau_, dyn_tau_t_);
   if (const char* v = getenv("NI_DFLASH_EXACT_MOE")) exact_moe_ = atoi(v) != 0;
   if (const char* v = getenv("NI_DFLASH_QT")) walk_tf_ = std::max(0.0f, float(atof(v)));
-  // KFlash on dense targets (MoE targets keep the chain: there a row's experts are its cost, and the dynamic depth
-  // spends them; NI_DFLASH_TREE=0/1 overrides). The budget's cache key: this model, drafter and chip.
+  // KFlash on every target. The budget's cache key: this model, drafter and chip.
   {
     std::string key = tg_.model_dir().substr(tg_.model_dir().find_last_of('/') + 1) + "-" +
                       dir.substr(dir.find_last_of('/') + 1) + "-b" + std::to_string(bits_) + "-" + Gpu::get().name();
     for (char& c : key)
       if (!isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '.') c = '_';
     kf_budget_ = std::make_unique<KfBudget>(key);
-    kf_budget_->set_rows(1u << (kB - 1), kB);  // the dense verify: whole 8-row tiles, one today
-    // One rule on every target (here and on Nemotron-H): trees on dense targets, the chain on MoE targets (every
-    // verify row costs experts; trees measured no faster on the Qwen3.6-35B MoE). NI_KFLASH=1 forces trees and
-    // NI_KFLASH=0 chains everywhere; NI_DFLASH_TREE=0/1 overrides it here.
+    // The row counts the verify runs at a cost of their own: on dense targets whole 8-row tiles (one today: every
+    // weight is read once whatever the rows); on MoE targets every count 1 .. 8, a cycle's tree as large as its
+    // expected tokens per ms make it (the verify routes experts, the shared expert and the GDN step over the live rows
+    // alone: the experts of n rows are most of its cost).
+    kf_budget_->set_rows(tg_.config().moe ? (1u << kB) - 1 : 1u << (kB - 1), kB);
+    // One rule on every target (here and on Nemotron-H): trees. NI_KFLASH=0 keeps the chains everywhere;
+    // NI_DFLASH_TREE=0/1 overrides it here.
     const char* kf = getenv("NI_KFLASH");
     const char* v = getenv("NI_DFLASH_TREE");
-    const bool tree = kf && *kf ? atoi(kf) != 0 : !tg_.config().moe;
+    const bool tree = !(kf && *kf) || atoi(kf) != 0;
     set_tree(v && *v ? atoi(v) != 0 : tree);
   }
+  if (dyn_tau_ > 0 && !tree_)
+    logi("DFlash2: dynamic verify depth, tau %.3f (T = 0) / %.3f (T > 0)", dyn_tau_, dyn_tau_t_);
   if (cfg_.v1)
     logi("DFlash drafter (v1) %s: blocks of %d rows (trained %d), context window %d positions (trained %d)",
          dir.c_str(), kB, cfg_.trained_block, kCtxKeep, cfg_.trained_window);
@@ -1579,14 +1582,19 @@ void DFlash2::encode_cycle_verify(Encoder& e, Seq& s, int P, int K, const Sampli
   if (tree_) {
     // the tree's rows (one 8-row tile) with captures; the shared acceptance walks the rows' own tokens (argmax, or the
     // plain sampler's draw keyed by the token's position), writes the path and the budget's records, and leaves the
-    // path for the K/V compaction, the target's next fold (s.pend_tree) and the next ring commit (gst[4 ..])
+    // path for the K/V compaction, the target's next fold (s.pend_tree) and the next ring commit (gst[4 ..]). The
+    // builder's live rows n (kf_live_, read by the GPU) limit the experts' routing on MoE targets as the chain's
+    // dynamic depth does; the tree's own kernels run the live rows alone (tree[kKfN]).
     if (!s.pend_path) s.pend_path = Gpu::get().alloc(size_t(kf::kPathWords) * 4, "pend_path");
     tg_.set_verify_tree(&tree_buf_);
-    tg_.set_verify_moe_exact(exact_moe_ && sp.temperature > 0);  // (a tree forced onto a MoE target)
+    tg_.set_verify_row_limit(&kf_live_);
+    // at T > 0 a row's logits must not depend on how the other rows route (Qwen35::set_verify_moe_exact)
+    tg_.set_verify_moe_exact(exact_moe_ && sp.temperature > 0);
     arm_verify(P);
     tg_.encode_verify(e, s, P, kB, sp, uint32_t(P), /*v8=*/true);
     disarm();
     tg_.set_verify_moe_exact(false);
+    tg_.set_verify_row_limit(nullptr);
     tg_.set_verify_tree(nullptr);
     const kp::KfAccept ap{uint32_t(P), uint32_t(kB), 1u, 0u};
     e.use(dpipe("kf_accept"));

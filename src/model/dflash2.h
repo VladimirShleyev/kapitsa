@@ -180,17 +180,21 @@ class DFlash2 {
   void gpu_state_reset(int P);
   void encode_cycle_draft_gpu(Encoder& e, Seq& s, DFlashSeq& d, int P_max, const SamplingParams& sp);
   int accepted() const { return acc_.as<int>()[0]; }
-  // proposals the last completed cycle verified (K, or the dynamic depth's choice; a tree: its live nodes)
+  // proposals the last completed cycle verified (K, or the dynamic depth's choice; a tree: its live nodes, as its
+  // acceptance recorded them: kN may already be the next cycle's)
   int verified(int K) const {
-    return tree_ ? tree_buf_.as<int>()[kf::kN] - 1 : dyn_tau_ > 0 ? std::min(K, int(kdyn_.as<uint32_t>()[0])) : K;
+    const int* t = tree_buf_.as<int>();
+    return tree_ ? (t[kf::kObs] > 0 ? t[kf::kObs] : t[kf::kN]) - 1
+                 : dyn_tau_ > 0 ? std::min(K, int(kdyn_.as<uint32_t>()[0])) : K;
   }
-  // KFlash on the dense targets (NI_DFLASH_TREE=0/1 overrides): the single-stream cycles (encode_cycle*) verify a
-  // best-first tree over the lattice (the shared builder kf_build on this drafter's children tables, dfl_kf_table)
-  // instead of the walk's chain, under the shared budget (KfBudget: the lattice's probabilities calibrated against
-  // the verify's own acceptances, a cycle's GPU time per row count measured on this Mac), and accept it with the shared
-  // kf_accept: greedy and sampled alike the emitted tokens are plain decoding's (at T > 0 its sampler's draws with
-  // each position's uniform). The verify's rows are whole 8-row tiles (one today). encode_draft (the batched path)
-  // keeps the walk.
+  // KFlash on every target (NI_KFLASH=0 or NI_DFLASH_TREE=0 keeps the chain): the single-stream cycles (encode_cycle*)
+  // verify a best-first tree over the lattice (the shared builder kf_build on this drafter's children tables,
+  // dfl_kf_table) instead of the walk's chain, under the shared budget (KfBudget: the lattice's probabilities
+  // calibrated against the verify's own acceptances, a cycle's GPU time per row count measured on this Mac), and
+  // accept it with the shared kf_accept: greedy and sampled alike the emitted tokens are plain decoding's (at T > 0 its
+  // sampler's draws with each position's uniform). The verify's rows: whole 8-row tiles on dense targets (one today),
+  // 1 .. 8 live rows on MoE targets (the experts route the live rows alone). encode_draft (the batched path) keeps the
+  // walk.
   bool tree() const { return tree_; }
   void set_tree(bool on);
   const int* tree_desc() const { return tree_buf_.as<int>(); }  // the tree descriptor (kflash.h) of the last cycle

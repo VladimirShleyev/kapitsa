@@ -430,6 +430,7 @@ NI_INLINE void gdn_prep_verify_impl(const device float* qkv, const device float*
   const uint C = p.C;
   const uint qk = p.Hk * D;
   const bool is_q = c < qk, is_k = c >= qk && c < 2 * qk;
+  const uint R = TREE && p.tree ? kf_live(tree, p.R) : p.R;  // a tree: its live rows
   // fold pending rows into the committed window
   float w3[3] = {conv_state[0 * C + c], conv_state[1 * C + c], conv_state[2 * C + c]};
   for (uint t = 0; t < p.n_pend; ++t) {
@@ -441,7 +442,7 @@ NI_INLINE void gdn_prep_verify_impl(const device float* qkv, const device float*
   float w0 = conv_w[c * 4 + 0], w1 = conv_w[c * 4 + 1], w2 = conv_w[c * 4 + 2], wq = conv_w[c * 4 + 3];
   float h0 = w3[0], h1 = w3[1], h2 = w3[2];
   float tw1[8], tw2[8], tin[8];  // tree rows: each row's window (its last two entries) and input, by row
-  for (uint t = 0; t < p.R; ++t) {
+  for (uint t = 0; t < R; ++t) {
     float in3 = qkv[t * C + c];
     pend_qkv[t * C + c] = in3;
     if (TREE && p.tree && t > 0) {  // the parent's window shifted by the parent's input
@@ -471,7 +472,7 @@ NI_INLINE void gdn_prep_verify_impl(const device float* qkv, const device float*
   if (tg == 0 && tid < p.Hv) {
     float A = metal::precise::exp(float(A_log[tid]));
     float dtb = float(dt_bias[tid]);
-    for (uint t = 0; t < p.R; ++t) {
+    for (uint t = 0; t < R; ++t) {
       g_out[t * p.Hv + tid] = metal::precise::exp(-A * softplus(a[t * p.Hv + tid] + dtb));
       beta_out[t * p.Hv + tid] = sigmoid(bb[t * p.Hv + tid]);
     }
@@ -489,8 +490,8 @@ NI_INLINE void gdn_prep_verify_impl(const device float* qkv, const device float*
   gdn_prep_verify_impl<false>(qkv, a, bb, conv_state, conv_w, A_log, dt_bias, q_out, k_out, v_out, g_out, beta_out,
                               pend_qkv, p, nullptr, nullptr, tg, tid, scratch);
 }
-// tree rows (p.tree) and / or pending rows on a tree's path (p.pidx): tree = the KFlash tree descriptor, path =
-// kf_accept's (encode_flush folds a tree cycle's accepted rows with it)
+// tree rows (p.tree; the live rows alone) and / or pending rows on a tree's path (p.pidx): tree = the KFlash tree
+// descriptor, path = kf_accept's (encode_flush folds a tree cycle's accepted rows with it)
 [[kernel]] void gdn_prep_verify_tree(const device float* qkv [[buffer(0)]], const device float* a [[buffer(1)]],
                                      const device float* bb [[buffer(2)]], device float* conv_state [[buffer(3)]],
                                      const device bfloat* conv_w [[buffer(4)]],
@@ -599,12 +600,9 @@ NI_GDN_STEP_VERIFY(gdn_step_verify_sg, true)
 
 // ---- per-row sampling ----
 // topk_stage1 with a row dimension: grid (ceil(V/chunk), R).
-[[kernel]] void topk_stage1_rows(const device float* logits [[buffer(0)]], device float* cv [[buffer(1)]],
-                                 device uint* ci [[buffer(2)]], constant TopkStageParams& p [[buffer(3)]],
-                                 uint2 tg [[threadgroup_position_in_grid]], uint2 tid2 [[thread_position_in_threadgroup]],
-                                 uint2 ntg2 [[threads_per_threadgroup]]) {
-  threadgroup float sv[32];
-  threadgroup uint si[32];
+NI_INLINE void topk_stage1_rows_impl(const device float* logits, device float* cv, device uint* ci,
+                                     constant TopkStageParams& p, uint2 tg, uint2 tid2, uint2 ntg2,
+                                     threadgroup float* sv, threadgroup uint* si) {
   const uint tid = tid2.x, ntg = ntg2.x, r = tg.y, ntgs = (p.V + p.chunk - 1) / p.chunk;
   const device float* lg = logits + size_t(r) * p.V;
   float v[8];
@@ -622,6 +620,25 @@ NI_GDN_STEP_VERIFY(gdn_step_verify_sg, true)
       ci[(r * ntgs + tg.x) * p.K + q] = bi;
     }
   }
+}
+[[kernel]] void topk_stage1_rows(const device float* logits [[buffer(0)]], device float* cv [[buffer(1)]],
+                                 device uint* ci [[buffer(2)]], constant TopkStageParams& p [[buffer(3)]],
+                                 uint2 tg [[threadgroup_position_in_grid]], uint2 tid2 [[thread_position_in_threadgroup]],
+                                 uint2 ntg2 [[threads_per_threadgroup]]) {
+  threadgroup float sv[32];
+  threadgroup uint si[32];
+  topk_stage1_rows_impl(logits, cv, ci, p, tg, tid2, ntg2, sv, si);
+}
+// a tree verify's rows (KFlash): its live rows alone (tree = the KFlash tree descriptor)
+[[kernel]] void topk_stage1_rows_tree(const device float* logits [[buffer(0)]], device float* cv [[buffer(1)]],
+                                      device uint* ci [[buffer(2)]], constant TopkStageParams& p [[buffer(3)]],
+                                      const device int* tree [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                                      uint2 tid2 [[thread_position_in_threadgroup]],
+                                      uint2 ntg2 [[threads_per_threadgroup]], uint2 ntgs [[threadgroups_per_grid]]) {
+  threadgroup float sv[32];
+  threadgroup uint si[32];
+  if (tg.y >= kf_live(tree, ntgs.y)) return;
+  topk_stage1_rows_impl(logits, cv, ci, p, tg, tid2, ntg2, sv, si);
 }
 
 // Per-row stage 2: grid R threadgroups x 1024. Row r reads its candidates, samples with RNG step
@@ -715,17 +732,18 @@ NI_INLINE void sample_stage2_rows_impl(const device float* cv, const device uint
 }
 // A tree verify's rows (DFlash2 tree drafting): row r draws with the uniform of the position its token takes, step +
 // depth of node r (tree[kKfDep + r], the KFlash tree descriptor), the same uniform plain decoding's row at that position draws:
-// siblings share it, and only one of them can lie on the accepted path.
+// siblings share it, and only one of them can lie on the accepted path. The live rows alone (no sample past them).
 [[kernel]] void sample_stage2_rows_tree(const device float* cv [[buffer(0)]], const device uint* ci [[buffer(1)]],
                                         device int* tokens [[buffer(2)]], constant SampleRowsParams& p [[buffer(3)]],
                                         const device uint* table [[buffer(4)]], const device int* tree [[buffer(5)]],
                                         uint r [[threadgroup_position_in_grid]],
                                         uint tid [[thread_position_in_threadgroup]],
-                                        uint ntg [[threads_per_threadgroup]]) {
+                                        uint ntg [[threads_per_threadgroup]], uint nr [[threadgroups_per_grid]]) {
   threadgroup float sv[32];
   threadgroup uint si[32];
   threadgroup float topv[64];
   threadgroup uint topi[64];
+  if (r >= kf_live(tree, nr)) return;
   sample_stage2_rows_impl(cv, ci, tokens, p, table, r, uint(tree[kKfDep + r]), tid, ntg, sv, si, topv, topi);
 }
 
