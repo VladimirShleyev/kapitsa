@@ -12,6 +12,7 @@ the drafter's candidates instead of one chain, exactly, sized by a budget that e
 | `kflash` | everything: trees (Qwen + Nemotron), the shared budget, the candidate decoder (trainer, Metal, results), budget persistence, 16/32-row verifies | integration branch, no PRs, tip `43947bf` |
 | `kflash-trees` | the release candidate: trees only, no decoder | this branch; forked from `701d431` |
 | PR #109 (`claude/dflash-3-kapitsa-f294ab`) | the copy lane (prompt lookup inside the DFlash loop) | open; an experiment, not KFlash |
+| `claude/copy-lane-ext` | the copy lane's follow-up work in progress: batched decode, Nemotron, skipping unused drafts | `4c58527`, marked WIP; it builds; `dflash_accept_test` passes on one seed stream but fails one new case on the default stream (unchecked); never run on a model; not KFlash |
 
 ### `kflash-trees` commits (no decoder code; authored by the user)
 
