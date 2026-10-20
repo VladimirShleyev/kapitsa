@@ -448,8 +448,13 @@ DFlash2::DFlash2(Qwen35& target, const std::string& dir, int bits) : tg_(target)
       if (!isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '.') c = '_';
     kf_budget_ = std::make_unique<KfBudget>(key);
     kf_budget_->set_rows(1u << (kB - 1), kB);  // the dense verify: whole 8-row tiles, one today
+    // One rule on every target (here and on Nemotron-H): trees on dense targets, the chain on MoE targets (every
+    // verify row costs experts; trees measured no faster on the Qwen3.6-35B MoE). NI_KFLASH=1 forces trees and
+    // NI_KFLASH=0 chains everywhere; NI_DFLASH_TREE=0/1 overrides it here.
+    const char* kf = getenv("NI_KFLASH");
     const char* v = getenv("NI_DFLASH_TREE");
-    set_tree(v && *v ? atoi(v) != 0 : !tg_.config().moe);
+    const bool tree = kf && *kf ? atoi(kf) != 0 : !tg_.config().moe;
+    set_tree(v && *v ? atoi(v) != 0 : tree);
   }
   if (cfg_.v1)
     logi("DFlash drafter (v1) %s: blocks of %d rows (trained %d), context window %d positions (trained %d)",

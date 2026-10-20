@@ -353,7 +353,10 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
       logi("Nemotron-H: no block drafter found next to %s", opts_.model_dir.c_str());
     } else {
       lili_ = NhDrafter::open(*nh_, lp.dflash);
-      if (const char* v = getenv("NI_KFLASH"); v && atoi(v) != 0) {
+      // KFlash's one rule, as on the Qwen draft models: trees on dense targets, the drafter's chain on MoE targets
+      // (every verify row costs experts); NI_KFLASH=1 forces trees, NI_KFLASH=0 keeps chains
+      const char* kfv = getenv("NI_KFLASH");
+      if (kfv && *kfv ? atoi(kfv) != 0 : nh_->dense()) {
         // the budget's cache: this model, drafter and chip
         std::string key = opts_.model_dir.substr(opts_.model_dir.find_last_of('/') + 1) + "-" + lili_->name() + "-" +
                           Gpu::get().name();

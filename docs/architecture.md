@@ -27,8 +27,8 @@ they decode.
 4. **Draft and verify.** Qwen uses its block drafter when available (DFlash2 on the 35B and 27B, DFlash on the 4B),
    otherwise its MTP head where supported. Nemotron uses a block drafter: LiLiCorr (Bolt, Super-VL) or DSpark
    (Lightning). The target verifies proposed tokens; accepted tokens advance the sequence, and rejected proposals do
-   not become committed recurrent history. KFlash: on the dense Qwen models (27B, 4B), and on the Nemotron drafters
-   with `NI_KFLASH=1`, the drafter's candidates are verified as a best-first tree instead of one chain: each verify row
+   not become committed recurrent history. KFlash: on the dense Qwen models (27B, 4B) by default, and on the MoE targets (the Qwen 35B,
+   the Nemotron drafters) with `NI_KFLASH=1`, the drafter's candidates are verified as a best-first tree instead of one chain: each verify row
    attends to its ancestors only, the recurrent layers run from its own branch's state, and the longest branch that
    agrees with the target is kept, so the reply is plain decoding's. The tree's size follows this Mac's measured cost
    per verify row count and the drafter's probabilities as calibrated against its own acceptances. The 35B-A3B, whose

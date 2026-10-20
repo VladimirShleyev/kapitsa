@@ -1,0 +1,33 @@
+[  5%] Building CXX object CMakeFiles/naceinfer.dir/src/api/anthropic.cpp.o
+[  5%] Building CXX object CMakeFiles/naceinfer.dir/src/api/chat_completions.cpp.o
+[  8%] Building CXX object CMakeFiles/naceinfer.dir/src/api/common.cpp.o
+[  8%] Building CXX object CMakeFiles/naceinfer.dir/src/api/responses.cpp.o
+[ 10%] Building CXX object CMakeFiles/naceinfer.dir/src/engine/doctor.cpp.o
+[ 10%] Building CXX object CMakeFiles/naceinfer.dir/src/engine/engine.cpp.o
+[ 13%] Building CXX object CMakeFiles/naceinfer.dir/src/model/dflash2.cpp.o
+[ 16%] Building CXX object CMakeFiles/naceinfer.dir/src/model/lilicorr.cpp.o
+[ 16%] Building CXX object CMakeFiles/naceinfer.dir/src/model/dory.cpp.o
+[ 18%] Building CXX object CMakeFiles/naceinfer.dir/src/model/dspark.cpp.o
+[ 21%] Building CXX object CMakeFiles/naceinfer.dir/src/model/nemotron_ane.cpp.o
+[ 21%] Building CXX object CMakeFiles/naceinfer.dir/src/model/nemotron_h.cpp.o
+[ 24%] Building CXX object CMakeFiles/naceinfer.dir/src/model/nh_drafter.cpp.o
+[ 24%] Linking CXX static library libnaceinfer.a
+[ 86%] Built target naceinfer
+[ 94%] Building CXX object CMakeFiles/kapitsa.dir/src/server/launch.cpp.o
+[ 94%] Building CXX object CMakeFiles/kapitsa.dir/src/server/bench_cmd.cpp.o
+[ 94%] Building CXX object CMakeFiles/kapitsa.dir/src/server/ui.cpp.o
+[ 94%] Building CXX object CMakeFiles/kapitsa.dir/src/server/picker.cpp.o
+[ 94%] Building CXX object CMakeFiles/kapitsa.dir/src/server/main.cpp.o
+[ 97%] Building CXX object CMakeFiles/kapitsa.dir/src/server/update_cmd.cpp.o
+[100%] Linking CXX executable kapitsa
+[100%] Built target kapitsa
+[ 96%] Built target naceinfer
+[100%] Linking CXX executable ni_run
+[100%] Built target ni_run
+[ 96%] Built target naceinfer
+[100%] Linking CXX executable dflash_accept_test
+[100%] Built target dflash_accept_test
+[ 96%] Built target naceinfer
+[100%] Building CXX object CMakeFiles/nh_tree_check.dir/tools/nh_tree_check.cpp.o
+[100%] Linking CXX executable nh_tree_check
+[100%] Built target nh_tree_check

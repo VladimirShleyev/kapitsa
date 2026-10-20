@@ -103,6 +103,7 @@ class NemotronH : public Model {
   ~NemotronH() override;
   const NhConfig& config() const { return cfg_; }
   const std::string& dir() const { return path_; }
+  bool dense() const { return dense_; }  // no MoE layers (Nano 4B / 9B v2)
   int vocab() const override { return cfg_.vocab; }
   const std::vector<int>& eos_ids() const override { return cfg_.eos; }
 
