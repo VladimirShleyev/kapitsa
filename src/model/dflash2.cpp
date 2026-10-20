@@ -453,7 +453,17 @@ DFlash2::DFlash2(Qwen35& target, const std::string& dir, int bits) : tg_(target)
   {
     std::string key = tg_.model_dir().substr(tg_.model_dir().find_last_of('/') + 1) + "-" +
                       dir.substr(dir.find_last_of('/') + 1) + "-b" + std::to_string(bits_) + "-" + Gpu::get().name();
-    if (kf_) key += "-kflash";  // the candidate decoder's probabilities have a calibration of their own
+    if (kf_) {  // the candidate decoder's probabilities have a calibration of their own, per checkpoint: its folder
+                // and a stamp of its weights file (a re-export starts a new calibration)
+      namespace fs = std::filesystem;
+      const fs::path w = fs::path(kf_->dir()) / "model.safetensors";
+      std::error_code ec;
+      const uint64_t sz = fs::file_size(w, ec);
+      const auto mt = fs::last_write_time(w, ec).time_since_epoch().count();
+      char stamp[24];
+      snprintf(stamp, sizeof stamp, "%08x", uint32_t((sz * 0x9E3779B97F4A7C15ull) ^ uint64_t(mt)));
+      key += "-kflash-" + fs::path(kf_->dir()).filename().string() + "-" + stamp;
+    }
     for (char& c : key)
       if (!isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '.') c = '_';
     kf_budget_ = std::make_unique<KfBudget>(key);
