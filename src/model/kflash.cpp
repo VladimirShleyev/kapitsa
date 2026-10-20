@@ -300,75 +300,11 @@ KFlash::KFlash(Qwen35& target, const std::string& dir) : tg_(target), dir_(dir) 
     memset(b->ptr(), 0, b->size);
     resident_ += b->size;
   }
-  if (const char* v = getenv("NI_KFLASH_SCORE")) fused_score_ = atoi(v) != 0;
-  if (const char* v = getenv("NI_KFLASH_GEMM")) hoisted_gemm_ = atoi(v) != 0;
   g.make_resident(owned_bufs_);
   logi("KFlash decoder %s: %d layers, d %d, %d heads x %d, MLP %d, target hidden %d, %d candidates%s, %.1f MB resident, "
        "loaded in %.0f ms", dir.c_str(), cfg_.NL, cfg_.d, cfg_.nh, cfg_.hd, cfg_.I, cfg_.H, kCand,
        acc_rows_ == 2 ? ", acceptance head (greedy, sampled)" : acc_rows_ ? ", acceptance head" : "", resident_ / 1e6,
        now_ms() - t0);
-}
-
-// One 4-bit projection on kf_qmm8 (dfl_qmm8 with its loads issued up front): K split into ks slices of <= 12 groups
-// (NI_KFLASH_GPS groups per slice, default 8: the smallest power-of-two split with at most that many); returns the
-// threadgroup count of the direct dispatch.
-static uint32_t kf_enc_qmm8(Encoder& e, const QLinear& L, const Buffer& y, uint32_t y_ld, const Buffer& xh,
-                            const Buffer& xs, const Buffer* ind, size_t ind_off) {
-  static const uint32_t gps = std::clamp(getenv("NI_KFLASH_GPS") ? atoi(getenv("NI_KFLASH_GPS")) : 8, 1, 12);
-  const uint32_t gpr = L.K / 64;
-  uint32_t ks = 1;
-  while (ks < 8 && ((gpr + ks - 1) / ks > gps || (gpr + ks - 1) / ks > 12)) ks *= 2;
-  if ((gpr + ks - 1) / ks > 12) fatal("kf_qmm8: K %u too long for 8 slices of 12 groups", L.K);
-  kp::DflQmm8 p{};
-  p.K = L.K;
-  p.nseg = 1;
-  p.ks = ks;
-  p.x_ld = L.K;
-  p.N[0] = L.N;
-  p.bits[0] = 4;
-  p.y_ld[0] = y_ld;
-  p.oscale[0] = 1.0f;
-  const uint32_t rbs = 8 / ks, tg = (L.N / 8 + rbs - 1) / rbs;
-  p.tg_begin[1] = tg;
-  e.use(kfpipe("kf_qmm8"));
-  for (int i = 0; i < 4; ++i) {
-    e.buf(i * 4 + 0, L.w->buf);
-    e.buf(i * 4 + 1, L.s->buf);
-    e.buf(i * 4 + 2, L.b->buf);
-    e.buf(i * 4 + 3, y);
-  }
-  e.buf(16, xh);
-  e.buf(17, xs);
-  e.val(18, p);
-  if (ind) e.dispatch_indirect(*ind, ind_off, 256);
-  else e.dispatch(tg, 1, 1, 256);
-  return tg;
-}
-
-// Gate / up + SwiGLU on kf_qmm8_gu (dfl_qmm8_gu with the loads up front): K slices of <= 8 groups (KS 2 or 4)
-static uint32_t kf_enc_qmm8_gu(Encoder& e, const QLinear& g, const QLinear& u, const Buffer& xh, const Buffer& xs,
-                               const Buffer& hh, const Buffer& hs, const Buffer* ind, size_t ind_off) {
-  if (g.N != u.N || g.K != u.K || !g.q4() || !u.q4() || g.N % 64) fatal("kf_qmm8_gu: shapes");
-  const uint32_t gpr = g.K / 64, ks = (gpr + 1) / 2 <= 8 ? 2u : 4u;
-  if ((gpr + ks - 1) / ks > 8) fatal("kf_qmm8_gu: K %u too long", g.K);
-  kp::DflQmm8 p{};
-  p.K = g.K;
-  p.nseg = 1;
-  p.ks = ks;
-  p.x_ld = g.K;
-  p.N[0] = g.N;
-  p.bits[0] = 4;
-  p.y_ld[0] = g.N;
-  p.oscale[0] = 1.0f;
-  e.use(kfpipe(ks == 2 ? "kf_qmm8_gu_ks2" : "kf_qmm8_gu_ks4"));
-  e.buf(0, g.w->buf); e.buf(1, g.s->buf); e.buf(2, g.b->buf); e.buf(3, hh);
-  e.buf(4, u.w->buf); e.buf(5, u.s->buf); e.buf(6, u.b->buf); e.buf(7, hs);
-  e.buf(16, xh);
-  e.buf(17, xs);
-  e.val(18, p);
-  if (ind) e.dispatch_indirect(*ind, ind_off, 256 * ks);
-  else e.dispatch(g.N / 64, 1, 1, 256 * ks);
-  return g.N / 64;
 }
 
 void KFlash::dbg(Encoder& e, const std::string& name, const Buffer& src, size_t bytes) {
@@ -408,8 +344,7 @@ void KFlash::enc_res_norm(Encoder& e, const Tensor* w, const Buffer* ind) {
 
 void KFlash::encode_prep(Encoder& e, const Buffer& xh, const Buffer& xs) {
   const uint32_t H = uint32_t(cfg_.H);
-  if (hoisted_gemm_) kf_enc_qmm8(e, w_h_, A_, uint32_t(cfg_.d), xh, xs, nullptr, 0);
-  else dfl_enc_qmm8(e, {{&w_h_, A_, uint32_t(cfg_.d), 1.0f}}, xh, xs, H, H);
+  dfl_enc_qmm8(e, {{&w_h_, A_, uint32_t(cfg_.d), 1.0f}}, xh, xs, H, H);
 }
 
 void KFlash::encode_step(Encoder& e, const Buffer& cand_i, const Buffer& cand_col, const Buffer& cand_v, float qtemp,
@@ -430,8 +365,7 @@ void KFlash::encode_step(Encoder& e, const Buffer& cand_i, const Buffer& cand_co
     else e.dispatch(gx, gy, 1, tx);
   };
   auto gemm = [&](int slot, const QLinear& L, const Buffer& y, uint32_t N, const Buffer& xh, const Buffer& xs, uint32_t K) {
-    const uint32_t tg = hoisted_gemm_ ? kf_enc_qmm8(e, L, y, N, xh, xs, ind, size_t(slot) * 12)
-                                      : dfl_enc_qmm8(e, {{&L, y, N, 1.0f}}, xh, xs, K, K, 0, 0, ind, size_t(slot) * 12);
+    const uint32_t tg = dfl_enc_qmm8(e, {{&L, y, N, 1.0f}}, xh, xs, K, K, 0, 0, ind, size_t(slot) * 12);
     full[slot * 3 + 0] = tg;
     full[slot * 3 + 1] = 1;
     full[slot * 3 + 2] = 1;
@@ -461,8 +395,7 @@ void KFlash::encode_step(Encoder& e, const Buffer& cand_i, const Buffer& cand_co
     gemm(5, L.o, u_, d, xh_, xs_, d);
     enc_res_norm(e, L.ln2, ind);
     {
-      const uint32_t tg = hoisted_gemm_ ? kf_enc_qmm8_gu(e, L.gate, L.up, xh_, xs_, hh_, hs_, ind, size_t(6) * 12)
-                                        : dfl_enc_qmm8_gu(e, L.gate, L.up, xh_, xs_, hh_, hs_, 0, ind, size_t(6) * 12);
+      const uint32_t tg = dfl_enc_qmm8_gu(e, L.gate, L.up, xh_, xs_, hh_, hs_, 0, ind, size_t(6) * 12);
       full[18] = tg;
       full[19] = 1;
       full[20] = 1;
@@ -483,17 +416,6 @@ void KFlash::encode_step(Encoder& e, const Buffer& cand_i, const Buffer& cand_co
   const Buffer& w_q = walk ? walk->qprob : tree_;
   const Buffer& w_k = walk ? walk->walk_k : tree_;
   const Buffer& w_s = walk ? walk->walk_s : tree_;
-  if (fused_score_) {  // kf_score: one threadgroup per row gathers the 32 LM-head rows and runs the epilogue
-    e.use(kfpipe("kf_score"));
-    e.buf(0, tree_); e.buf(1, z_); e.buf(2, n_); e.buf(3, cand_i); e.buf(4, cand_v);
-    e.buf(5, O.w->buf); e.buf(6, O.s->buf); e.buf(7, O.b->buf); e.buf(8, acc_we_); e.buf(9, lscale_);
-    e.buf(10, acc_wy_); e.buf(11, w_tok); e.buf(12, w_q); e.buf(13, w_k); e.buf(14, w_s);
-    e.val(15, sp);
-    e.buf(16, cand_col);
-    if (ind) e.dispatch_indirect(*ind, 0, 1024);  // slot 0's 8 rows
-    else e.dispatch(8, 1, 1, 1024);
-    return;
-  }
   {
     kp::KfCand p{H, uint32_t(O.bits)};
     e.use(kfpipe("kf_cand"));

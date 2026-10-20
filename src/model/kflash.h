@@ -110,12 +110,6 @@ class KFlash {
   Buffer tree() const { return tree_; }
   const KFlashTree& tree_host() const { return *tree_.as<KFlashTree>(); }  // after the command buffer completed
 
-  // candidate scores: one threadgroup per row (kf_score) or per row and candidate + an epilogue kernel (kf_cand +
-  // kf_soft); NI_KFLASH_SCORE=0/1
-  void set_fused_score(bool on) { fused_score_ = on; }
-  // projections on kf_qmm8 (loads issued up front) or dfl_qmm8; NI_KFLASH_GEMM=1/0
-  void set_hoisted_gemm(bool on) { hoisted_gemm_ = on; }
-
   // ---- tests ----
   // Per-step copies of the residual stream after the input and after each layer, of y and z, for row 0..7
   // (fp32 [8][d] / [8][H]) into named buffers: x, h<l>, y, z (the last step encoded).
@@ -157,7 +151,7 @@ class KFlash {
   // speculative passes: the full indirect arguments of a step (kSlots x 3 uints, filled at encode time) and one
   // argument block per pass (kf_jac writes the next pass's)
   Buffer full_args_, pass_args_;
-  bool debug_ = false, fused_score_ = true, hoisted_gemm_ = true;
+  bool debug_ = false;
   std::map<std::string, Buffer> dbg_;
 };
 

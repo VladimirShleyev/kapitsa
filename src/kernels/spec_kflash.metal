@@ -247,35 +247,6 @@ struct KfCandParams {
   cd[f * kKfCand + k] = s;
 }
 
-// kf_cand's dot products in one threadgroup per row (kf_score, then kf_soft's epilogue in the same threadgroup):
-// simdgroup k = candidate k, each lane 8 consecutive inputs per 256 (one 32-bit word of 4-bit codes), so a row's 32
-// LM-head rows are gathered with z and w_e read once per threadgroup. -> cd[f][k] as kf_cand.
-NI_INLINE float4 kf_dots8(const device uint32_t* W, const device bfloat* S, const device bfloat* B, uint c, uint H,
-                          uint bits, const device float* zr, const device float* we, uint lane) {
-  float4 acc = float4(0.0f);
-  const uint gpr = H / 64;
-  _Pragma("clang loop unroll_count(4)")
-  for (uint k0 = 8 * lane; k0 < H; k0 += 256) {
-    const float sc = float(S[size_t(c) * gpr + k0 / 64]), bi = float(B[size_t(c) * gpr + k0 / 64]);
-    float e[8];
-    if (bits == 4) {
-      const uint w = W[size_t(c) * (H / 8) + k0 / 8];
-      _Pragma("clang loop unroll(full)")
-      for (int i = 0; i < 8; ++i) e[i] = sc * float((w >> (4 * i)) & 15u) + bi;
-    } else {
-      const uint2 w = *(const device uint2*)(W + size_t(c) * (H / 4) + k0 / 4);
-      _Pragma("clang loop unroll(full)")
-      for (int i = 0; i < 8; ++i) e[i] = sc * float(((i < 4 ? w.x : w.y) >> (8 * (i % 4))) & 255u) + bi;
-    }
-    const float4 e0 = float4(e[0], e[1], e[2], e[3]), e1 = float4(e[4], e[5], e[6], e[7]);
-    const float4 z0 = *(const device float4*)(zr + k0), z1 = *(const device float4*)(zr + k0 + 4);
-    const float4 a0 = *(const device float4*)(we + k0), a1 = *(const device float4*)(we + k0 + 4);
-    const float4 b0 = *(const device float4*)(we + H + k0), b1 = *(const device float4*)(we + H + k0 + 4);
-    acc += float4(dot(z0, e0) + dot(z1, e1), dot(a0, e0) + dot(a1, e1), dot(b0, e0) + dot(b1, e1),
-                  dot(e0, e0) + dot(e1, e1));
-  }
-  return acc;
-}
 // The front rows' children: S = logit_scale[dep] U + <z, E_out[c]>, q = softmax(S / qtemp), the acceptance head's row
 // acc_row -> ch_*, expanded = 1. walk = 1 (the chain builder): row 0's node then takes its child (greedy: first
 // argmax of S; sampled: the first k whose running sum of q exceeds the walk's uniform for position P + 1 + dep, as
@@ -386,35 +357,6 @@ NI_INLINE float kf_wy_dot(const device float* wy, const device float* y, constan
   if (sg != 0) return;
   kf_children(t, f, cd[f * kKfCand + lane], ay[0], cand_i, cand_v, lscale, tokens, qprob, walk_k, walk_s, p, lane);
 }
-// kf_cand + kf_soft in one threadgroup per row: simdgroup k gathers candidate k's LM-head row (kf_dots8), simdgroup 0
-// then runs the epilogue. grid 8 x 1024.
-[[kernel]] void kf_score(device KFlashTree* t [[buffer(0)]], const device float* z [[buffer(1)]],
-                         const device float* y [[buffer(2)]], const device int* cand_i [[buffer(3)]],
-                         const device float* cand_v [[buffer(4)]], const device uint32_t* OW [[buffer(5)]],
-                         const device bfloat* OS [[buffer(6)]], const device bfloat* OB [[buffer(7)]],
-                         const device float* we [[buffer(8)]], const device float* lscale [[buffer(9)]],
-                         const device float* wy [[buffer(10)]], device int* tokens [[buffer(11)]],
-                         device float* qprob [[buffer(12)]], device int* walk_k [[buffer(13)]],
-                         device float* walk_s [[buffer(14)]], constant KfSoftParams& p [[buffer(15)]],
-                         const device int* cand_col [[buffer(16)]],
-                         uint f [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
-                         uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup float4 cdl[kKfCand];
-  threadgroup float ay[1];
-  if (f >= t->n_front) return;
-  const uint node = t->front[f];
-  const uint c = uint(cand_col[uint(t->depth[node]) * kKfCand + sg]);
-  const float4 acc = simd_sum(kf_dots8(OW, OS, OB, c, p.H, p.out_bits, z + size_t(f) * p.H, we, lane));
-  if (lane == 0) cdl[sg] = acc;
-  if (sg == 1) {
-    const float a = kf_wy_dot(wy, y, p, f, lane);
-    if (lane == 0) ay[0] = a;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (sg != 0) return;
-  kf_children(t, f, cdl[lane], ay[0], cand_i, cand_v, lscale, tokens, qprob, walk_k, walk_s, p, lane);
-}
-
 // The speculative chain walk's step after a decoder pass over a speculated chain (the front: one node per depth from
 // walk_at's down to maxdep - 1, each the child of the one above). From walk_at (a node of the real chain, expanded in
 // this pass) it takes children as the sequential walk would (greedy: first argmax of S; sampled: the draw of the
@@ -488,11 +430,23 @@ NI_INLINE uint kf_choose(device const KFlashTree* t, uint src, uint j, uint P, c
         walk_k[j] = int(kb);
         tokens[P + 1 + j] = c;
       }
-      if (j + 1 >= p.maxdep) {
+      int y = at[j + 1];
+      if (j + 1 >= p.maxdep) {  // the chain's last draft: its node (a leaf), as the sequential walk appends it
+        if (lane == 0) {
+          y = int(nodes);
+          t->parent[y] = int(x);
+          t->token[y] = c;
+          t->depth[y] = int(j + 1);
+          t->cand_k[y] = int(kb);
+          t->logp[y] = x_logp + lk;
+          t->acc[y] = ak;
+          t->expanded[y] = 0;
+          t->row[y] = int(j + 1);
+        }
+        ++nodes;
         open = false;
         break;
       }
-      int y = at[j + 1];
       if (y >= 0 && t->parent[y] == int(x) && t->token[y] == c) {  // the real child is this pass's node: exact row
         if (lane == 0) {  // a guessed node now on the chain: its probabilities
           t->cand_k[y] = int(kb);
@@ -624,166 +578,3 @@ NI_INLINE void kf_simd_top32(thread float* v, thread uint* id, uint lane, thread
   oi[o] = bi;
   if (map) tok[o] = map == 1 ? int(head_ids[bi]) : int(bi);
 }
-
-// ---- the decoder's 8-row GEMM: dfl_qmm8's bindings, math and K split, the loads issued up front ----
-// The decoder's projections are small (d 1024: K 1024 / 2816 / H), so dfl_qmm8 runs each simdgroup through a handful
-// of 64-column groups, and on the earlier core (one group per loop step) pays a DRAM round trip per group. Here a
-// simdgroup's K slice (<= 12 groups, a compile-time bound) has all its codes, scales and biases requested before the
-// first MMA. Same lane layout, half-subnormal codes (as dfl_q8_run4: q * 2^-24, scale * 2^24 in the epilogue) and
-// the same per-group epilogue acc += s . C + b . sum(x), groups in order: the sums equal dfl_qmm8's up to fp32
-// contraction. 4-bit only. grid / threads as dfl_qmm8 (8 simdgroups = 8 / ks row blocks x ks K slices).
-constant constexpr uint kKfGMax = 12;
-[[kernel]] void kf_qmm8(const device uint32_t* W0 [[buffer(0)]], const device bfloat* S0 [[buffer(1)]],
-                        const device bfloat* B0 [[buffer(2)]], device float* Y0 [[buffer(3)]],
-                        const device uint32_t* W1 [[buffer(4)]], const device bfloat* S1 [[buffer(5)]],
-                        const device bfloat* B1 [[buffer(6)]], device float* Y1 [[buffer(7)]],
-                        const device uint32_t* W2 [[buffer(8)]], const device bfloat* S2 [[buffer(9)]],
-                        const device bfloat* B2 [[buffer(10)]], device float* Y2 [[buffer(11)]],
-                        const device uint32_t* W3 [[buffer(12)]], const device bfloat* S3 [[buffer(13)]],
-                        const device bfloat* B3 [[buffer(14)]], device float* Y3 [[buffer(15)]],
-                        const device half* X [[buffer(16)]], const device float* XS [[buffer(17)]],
-                        constant DflQmm8Params& p [[buffer(18)]], uint tg [[threadgroup_position_in_grid]],
-                        uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup float2 red[8 * 32];
-  uint si = 0;
-  while (si + 1 < p.nseg && tg >= p.tg_begin[si + 1]) ++si;
-  const device uint32_t* W = si == 0 ? W0 : si == 1 ? W1 : si == 2 ? W2 : W3;
-  const device bfloat* S = si == 0 ? S0 : si == 1 ? S1 : si == 2 ? S2 : S3;
-  const device bfloat* B = si == 0 ? B0 : si == 1 ? B1 : si == 2 ? B2 : B3;
-  device float* Y = si == 0 ? Y0 : si == 1 ? Y1 : si == 2 ? Y2 : Y3;
-  const uint ks = p.ks, rbs = 8 / ks;
-  const uint rb = (tg - p.tg_begin[si]) * rbs + sg / ks, kslice = sg % ks;
-  const uint N = p.N[si], gpr = p.K / 64, wpr = p.K / 8;
-  const uint2 rc = dfl_lane_rc(lane);
-  const uint fm = rc.x, fn = rc.y, q = fn / 2;
-  const uint n = rb * 8 + fm, row = min(n, N - 1);
-  const uint gper = (gpr + ks - 1) / ks, g0 = min(kslice * gper, gpr), gn = min(g0 + gper, gpr) - g0;
-  uint2 wv[kKfGMax];
-  float sv[kKfGMax], bv[kKfGMax];
-  _Pragma("clang loop unroll(full)")
-  for (uint i = 0; i < kKfGMax; ++i)
-    if (i < gn) {
-      wv[i] = *(const device uint2*)(W + size_t(row) * wpr + (g0 + i) * 8 + 2 * q);
-      sv[i] = float(S[size_t(row) * gpr + g0 + i]) * 16777216.0f;
-      bv[i] = float(B[size_t(row) * gpr + g0 + i]);
-    }
-  const device half* x0 = X + fn * p.x_ld + 16 * (fm / 2) + 4 * (fm % 2);
-  const device half* x1 = x0 + p.x_ld;
-  float2 acc = float2(0.0f);
-  _Pragma("clang loop unroll(full)")
-  for (uint i = 0; i < kKfGMax; ++i)
-    if (i < gn) {
-      half2 b[8], a[8];
-      dfl_xg(x0, x1, g0 + i, b);
-      dfl_codes_sn(wv[i], a);
-      const float2 c = dfl_mma8(a, b);
-      acc += sv[i] * c + bv[i] * *(const device float2*)(XS + (g0 + i) * 8 + fn);
-    }
-  if (ks > 1) {
-    if (kslice) red[sg * 32 + lane] = acc;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (kslice) return;
-    for (uint j = 1; j < ks; ++j) acc += red[(sg + j) * 32 + lane];
-  }
-  if (n >= N) return;
-  const uint ld = p.y_ld[si];
-  Y[fn * ld + n] = p.oscale[si] * acc.x;
-  Y[(fn + 1) * ld + n] = p.oscale[si] * acc.y;
-}
-
-// dfl_qmm8_gu (gate / up + SwiGLU into the down projection's X8 table and its group sums) with kf_qmm8's up-front
-// loads: a threadgroup owns 64 output columns, 8 row blocks x KS K slices of <= 8 groups each. 4-bit only.
-// grid: N / 64 threadgroups x 256 KS.
-constant constexpr uint kKfGuMax = 8;
-template <int KS>
-NI_INLINE void kf_qmm8_gu_impl(const device uint32_t* Wg, const device bfloat* Sg, const device bfloat* Bg,
-                               device half* Hh, const device uint32_t* Wu, const device bfloat* Su,
-                               const device bfloat* Bu, device float* HS, const device half* X,
-                               const device float* XS, constant DflQmm8Params& p, threadgroup float2* red,
-                               threadgroup float* hred, uint tg, uint sg, uint lane) {
-  const uint N = p.N[0], gpr = p.K / 64, wpr = p.K / 8;
-  const uint2 rc = dfl_lane_rc(lane);
-  const uint fm = rc.x, fn = rc.y, q = fn / 2;
-  const uint rbl = sg / KS, kslice = sg % KS;
-  const uint n = (tg * 8 + rbl) * 8 + fm, row = min(n, N - 1);
-  const uint gper = (gpr + KS - 1) / KS, g0 = min(kslice * gper, gpr), gn = min(g0 + gper, gpr) - g0;
-  uint2 wg[kKfGuMax], wu[kKfGuMax];
-  float sg2[kKfGuMax], bg[kKfGuMax], su[kKfGuMax], bu[kKfGuMax];
-  _Pragma("clang loop unroll(full)")
-  for (uint i = 0; i < kKfGuMax; ++i)
-    if (i < gn) {
-      const size_t wo = size_t(row) * wpr + (g0 + i) * 8 + 2 * q, so = size_t(row) * gpr + g0 + i;
-      wg[i] = *(const device uint2*)(Wg + wo);
-      wu[i] = *(const device uint2*)(Wu + wo);
-      sg2[i] = float(Sg[so]) * 16777216.0f;
-      bg[i] = float(Bg[so]);
-      su[i] = float(Su[so]) * 16777216.0f;
-      bu[i] = float(Bu[so]);
-    }
-  const device half* x0 = X + fn * p.x_ld + 16 * (fm / 2) + 4 * (fm % 2);
-  const device half* x1 = x0 + p.x_ld;
-  float2 ag = float2(0.0f), au = float2(0.0f);
-  _Pragma("clang loop unroll(full)")
-  for (uint i = 0; i < kKfGuMax; ++i)
-    if (i < gn) {
-      half2 b[8], a[8];
-      dfl_xg(x0, x1, g0 + i, b);
-      const float2 sx = *(const device float2*)(XS + (g0 + i) * 8 + fn);
-      dfl_codes_sn(wg[i], a);
-      ag += sg2[i] * dfl_mma8(a, b) + bg[i] * sx;
-      dfl_codes_sn(wu[i], a);
-      au += su[i] * dfl_mma8(a, b) + bu[i] * sx;
-    }
-  if (KS > 1) {
-    if (kslice) {
-      red[(sg * 2 + 0) * 32 + lane] = ag;
-      red[(sg * 2 + 1) * 32 + lane] = au;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (kslice == 0)
-      for (uint j = 1; j < KS; ++j) {
-        ag += red[((sg + j) * 2 + 0) * 32 + lane];
-        au += red[((sg + j) * 2 + 1) * 32 + lane];
-      }
-  }
-  if (kslice == 0) {  // dfl_qmm8_gu_impl's epilogue
-    const half h0 = half(silu(ag.x) * au.x), h1 = half(silu(ag.y) * au.y);
-    const uint ld = p.y_ld[0];
-    float2 t = float2(0.0f);
-    if (n < N) {
-      Hh[fn * ld + n] = h0;
-      Hh[(fn + 1) * ld + n] = h1;
-      const uint tn = (n & ~63u) + dfl_tslot(n & 63u);
-      Hh[(8 + fn) * ld + tn] = h0;
-      Hh[(9 + fn) * ld + tn] = h1;
-      t = float2(float(h0), float(h1));
-    }
-    t += simd_shuffle_xor(t, 2);
-    t += simd_shuffle_xor(t, 4);
-    t += simd_shuffle_xor(t, 16);
-    if ((lane & 22u) == 0) {
-      hred[rbl * 8 + fn] = t.x;
-      hred[rbl * 8 + fn + 1] = t.y;
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (sg == 0 && lane < 8) {
-    float s = 0.0f;
-    for (uint j = 0; j < 8; ++j) s += hred[j * 8 + lane];
-    HS[tg * 8 + lane] = s;
-  }
-}
-#define D3_QMM8_GU(NAME, KS)                                                                                 \
-  [[kernel]] void NAME(const device uint32_t* Wg [[buffer(0)]], const device bfloat* Sg [[buffer(1)]],         \
-                       const device bfloat* Bg [[buffer(2)]], device half* Hh [[buffer(3)]],                  \
-                       const device uint32_t* Wu [[buffer(4)]], const device bfloat* Su [[buffer(5)]],         \
-                       const device bfloat* Bu [[buffer(6)]], device float* HS [[buffer(7)]],                 \
-                       const device half* X [[buffer(16)]], const device float* XS [[buffer(17)]],             \
-                       constant DflQmm8Params& p [[buffer(18)]], uint tg [[threadgroup_position_in_grid]],     \
-                       uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
-    threadgroup float2 red[KS > 1 ? 8 * KS * 2 * 32 : 1];                                                    \
-    threadgroup float hred[8 * 8];                                                                           \
-    kf_qmm8_gu_impl<KS>(Wg, Sg, Bg, Hh, Wu, Su, Bu, HS, X, XS, p, red, hred, tg, sg, lane);                 \
-  }
-D3_QMM8_GU(kf_qmm8_gu_ks2, 2)
-D3_QMM8_GU(kf_qmm8_gu_ks4, 4)

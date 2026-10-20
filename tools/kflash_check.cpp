@@ -668,24 +668,6 @@ int main(int argc, char** argv) {
         printf("  %d row%s %.3f (in a 5-step buffer %.3f each)", F, F > 1 ? "s" : "", median(t1), median(t5) / 5);
       }
       printf("\n");
-      // interleaved A/B in this process: the projections on kf_qmm8 vs dfl_qmm8, scoring fused vs two kernels (1 row)
-      T.n_front = 1;
-      T.front[0] = 1;
-      std::vector<double> tv[4];
-      for (int i = 0; i <= time_n; ++i)
-        for (int v = 0; v < 4; ++v) {
-          kf->set_hoisted_gemm(v & 1);
-          kf->set_fused_score(v & 2);
-          auto e2 = g.begin();
-          for (int r = 0; r < 5; ++r) kf->encode_step(*e2, dr.cand32_ids_buf(), dr.cand32_cols_buf(), dr.cand32_vals_buf(), 1.0f, 0);
-          e2->commit_and_wait();
-          if (i) tv[v].push_back(e2->gpu_ms() / 5);
-        }
-      printf("[time] one step, interleaved A/B (median of %d, 5-step buffers): dfl_qmm8 + 2-kernel scores %.3f | "
-             "kf_qmm8 + 2-kernel %.3f | dfl_qmm8 + fused scores %.3f | kf_qmm8 + fused %.3f\n", time_n, median(tv[0]),
-             median(tv[1]), median(tv[2]), median(tv[3]));
-      kf->set_hoisted_gemm(true);
-      kf->set_fused_score(true);
     }
   }
   printf(fails ? "FAILED: %d\n" : "ALL PASSED\n", fails);
