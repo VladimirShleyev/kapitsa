@@ -103,11 +103,25 @@ Trees of 7 nodes vs `main`, interleaved, M4 Pro 48 GB:
      - `nh_tree_check`: all pass;
      - 4B and 27B greedy: identical to plain decoding;
      - cost: about +1% GPU time per cycle (4B 16.85 -> 17.03 ms, 35B 21.0 -> 21.3 ms), within noise in tok/s.
-   - **Residual gap:** `tools/kflash_invariance.py` on the 35B (192 tokens) matches with the tree forced to 1 and
-     3 rows, but sizes 5, 8 and cycling all differ from size 1 at generated token 177 (5460 vs 1851). So something
-     still depends on how many live rows there are past a threshold between 3 and 5. A likely place is the expert
-     passes, if their path switches with how many rows share an expert. Next: `--sizes 1,2,3,4,5,6,7,8` to find the
-     threshold, then compare one row's logits layer by layer.
+   - **Residual gap: it's the cycle boundary, not the tree size.**
+     - Sweep of forced sizes 1-8 on the 35B (`kflash_invariance.py --sizes 1,...,8`, 192 tokens): sizes 4, 5, 7 match
+       size 1 and sizes 2, 3, 6, 8 differ at generated token 177. A previous run gave a different split, so it
+       doesn't follow the size.
+     - `--ref` at that token: plain decoding has 5460 ahead of 1851 by 0.23, a one-pass prefill of the prefix by
+       0.12, and the force-8 run's verify row (row 2 of the cycle anchored at P = 259) has 1851 ahead by 0.08. That
+       is a router flip (different experts), not a last-bit tie.
+     - Cause: a position is verified inside cycles anchored at different P in different runs, because acceptance
+       lengths follow the tree and the budget's learned state. The verify splits attention into history keys (< P,
+       MMA tiles) and the tree block's keys (`attn8_tree_block`). Where that split falls changes the reduction order,
+       hence the last bits, and the 35B's router flips its top-8 on them. The GDN state at P (committed fold) against
+       an in-block step is the other place to check. Chains don't show it, because their cycle boundaries don't
+       depend on learned state.
+     - Fix: make the verify invariant to the boundary. Reduce attention keys in chunks aligned to absolute positions
+       (history and block alike), combined in a fixed order, and make the committed GDN fold give the same bits as
+       an in-block step. A test: decode one prompt with different forced anchors and compare the rows at the same
+       absolute position.
+     - Until then the server suite passes (the fixes above shrank the effect), but a rare greedy flip on the 35B
+       between identical requests remains possible.
    - Fallback if it can't be closed: default MoE targets to the chain (`NI_KFLASH=1` keeps the dynamic trees).
 3. Nemotron speed: tree vs chain on Lightning. This needs the 23 GB model; the user said not to download it for now.
 4. 16/32-row verifies: the interleaved A/B is deferred; decide whether they join `kflash-trees`.
