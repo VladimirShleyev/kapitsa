@@ -353,13 +353,25 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
       logi("Nemotron-H: no block drafter found next to %s", opts_.model_dir.c_str());
     } else {
       lili_ = NhDrafter::open(*nh_, lp.dflash);
+      if (const char* v = getenv("NI_KFLASH"); v && atoi(v) != 0) {
+        // the budget's cache: this model, drafter and chip
+        std::string key = opts_.model_dir.substr(opts_.model_dir.find_last_of('/') + 1) + "-" + lili_->name() + "-" +
+                          Gpu::get().name();
+        for (char& c : key)
+          if (!isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '.') c = '_';
+        kf_budget_ = std::make_unique<KfBudget>(key);
+        kf_params_ = Gpu::get().alloc(sizeof(KfParams), "kf_params");
+        logi("KFlash: tree drafting on %s (budget cache %s)", lili_->name(), key.c_str());
+      }
     }
   }
   // A dense Nemotron-H model (Nemotron Nano) has no block drafter: prompt lookup drafts up to K tokens per cycle
   // (--spec K, else NI_NH_NGRAM=K), verified in one pass; the reply is the one plain decoding writes. By default 4
-  // where the MLP layers are BF16 (the Nano 4B: a verify pass's 2-8 rows read each weight once, as one row does;
-  // decoding 4-8% faster on an M1 Pro) and off for NVFP4 (the Nano 9B v2: within 2% either way there, the M1's
-  // NVFP4 products of several rows being bound by their arithmetic, not by the weights' bytes).
+  // where the MLP layers are BF16 or FP8 (the Nano 4B: a verify pass's 2-8 rows read each weight once, as one row
+  // does; on an M1 Pro decoding 4-8% faster in BF16; in FP8 with its 8-bit head 1% on the benchmark's code (4% with
+  // the BF16 head), 1.4-2.3x on replies that repeat their prompt, 4-5% slower on free prose that drafts rarely match)
+  // and off for NVFP4 (the Nano 9B v2: within 2% either way there, the M1's NVFP4 products of several rows being
+  // bound by their arithmetic, not by the weights' bytes).
   if (nh_ && !lili_ && spec_asked != 0) {
     const auto& kind = nh_->config().kind;
     if (std::find(kind.begin(), kind.end(), 'E') == kind.end()) {
@@ -2001,11 +2013,19 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
     constexpr int B = NhDrafter::kB;
     int P = n, m_prev = 0;
     req_cycles = 0;
+    // KFlash: the drafting pass builds a tree under the budget, the verify checks it as a tree and the acceptance keeps
+    // the longest root path agreeing with the rows' own samples; the kept rows are that path's (Seq::pend_path)
+    const bool kft = kf_budget_ != nullptr;
+    auto commit_kept = [&](Encoder& e) {
+      if (m_prev <= 0) return;
+      if (kft) lili_->encode_commit_path(e, d, m_prev, s.pend_path);
+      else lili_->encode_commit(e, d, m_prev);
+    };
     // parked: the rows the last cycle kept go into the ring now (the verify's captured features are shared)
     auto park = [&] {
       if (m_prev > 0) {
         auto ep = g.begin();
-        lili_->encode_commit(*ep, d, m_prev);
+        commit_kept(*ep);
         ep->commit_and_wait();
         m_prev = 0;
       }
@@ -2021,18 +2041,28 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
         break;
       }
       // two command buffers: the drafting half starts on the GPU while the host encodes the verify half
+      const double t_cycle = Encoder::host_ms();
       auto e1 = g.begin();
-      if (m_prev > 0) lili_->encode_commit(*e1, d, m_prev);
-      lili_->encode_draft(*e1, s, d, P);
+      commit_kept(*e1);
+      if (kft) {
+        kf_budget_->write(*kf_params_.as<KfParams>());  // (the GPU is done with it: the last cycle completed)
+        lili_->encode_draft_tree(*e1, s, d, P, kf_params_);
+      } else {
+        lili_->encode_draft(*e1, s, d, P);
+      }
       e1->commit();
       auto e2 = nh_->grouped_passes() ? g.begin_grouped() : g.begin();
       lili_->arm_verify(P);
       nh_->set_dynamic_rows(true);  // the drafter's pass chose how many of the block's rows to verify
+      nh_->set_tree(kft);
       nh_->encode_verify(*e2, s, P, B);
       lili_->disarm();
-      nh_->encode_accept(*e2, s, P, B, B - 1, sp);
+      if (kft) nh_->encode_accept_tree(*e2, s, P, sp);
+      else nh_->encode_accept(*e2, s, P, B, B - 1, sp);
+      nh_->set_tree(false);
       nh_->set_dynamic_rows(false);
       e2->commit_and_wait();
+      if (kft) kf_budget_->observe(nh_->tree_buf().as<int32_t>(), Encoder::host_ms() - t_cycle);
       const int a = nh_->accepted();
       const int* tk = s.tokens();
       int m = 0;
@@ -2047,8 +2077,18 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
       ++req_cycles;
       spec_accepted_ += m;
       cycle_done(m);
-      if (trace_path) trace_fn(nh_->logits(), m, tk + P + 1);
-      nh_->commit_rows(s, m);  // rows P .. P+m-1 are fed; tk[P+m] is the new anchor
+      if (trace_path && kft) {  // (a tree's rows: the accepted path's, in order)
+        const int V = nh_->vocab();
+        const int32_t* t = nh_->tree_buf().as<int32_t>();
+        std::vector<float> rows(size_t(m) * size_t(V));
+        for (int j = 0; j < m; ++j)
+          memcpy(rows.data() + size_t(j) * V, nh_->logits() + size_t(t[kf::kPath + j]) * V, size_t(V) * 4);
+        trace_fn(rows.data(), m, tk + P + 1);
+      } else if (trace_path) {
+        trace_fn(nh_->logits(), m, tk + P + 1);
+      }
+      if (kft) nh_->commit_rows_tree(s, m);  // the accepted path's first m rows are fed
+      else nh_->commit_rows(s, m);  // rows P .. P+m-1 are fed; tk[P+m] is the new anchor
       m_prev = m;
       P += m;
       const bool join = go && batch_wanted();
@@ -2059,10 +2099,11 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
       }
     }
     auto e3 = g.begin();
-    if (m_prev > 0) lili_->encode_commit(*e3, d, m_prev);
+    commit_kept(*e3);
     nh_->encode_flush(*e3, s);
     e3->commit_and_wait();
     fed_until = P;
+    if (kft && req_cycles > 0) logi("%s", kf_budget_->summary().c_str());
   } else if (dfl_) {
     // DFlash2, double-buffered: each cycle's verify (8-row target forward with captures + on-GPU
     // acceptance) is committed, then right behind it the NEXT cycle's drafting half (ring commit of the

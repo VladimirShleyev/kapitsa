@@ -4,9 +4,9 @@
   <img alt="Kapitsa: a blazing fast Apple Silicon optimized inference engine built for Qwen and Nemotron. Writing speed of Qwen3.6 35B-A3B on a MacBook Pro (2024), M4 Pro, 48 GB, in tokens per second, at 4-bit: Kapitsa 154, oMLX with DFlash2 127, Ollama 89, LM Studio 86, MTPLX 80, llama.cpp with MTP 69." src="docs/assets/header-light.svg">
 </picture>
 
-[Install](#install) · [Benchmarks](#benchmarks) · [Models](#models) · [Docs](docs/usage.md)
+[Quickstart](#quickstart) · [CLI](#cli) · [Benchmarks](#benchmarks) · [Models](#models) · [Docs](docs/usage.md)
 
-## Install
+## Quickstart
 
 **Requirements:** a Mac with Apple silicon (M1 or newer) and macOS 14 Sonoma or later.
 
@@ -19,8 +19,24 @@ brew install nace-ai/tap/kapitsa
 kapitsa opencode --model 35b    # also: kapitsa claude, kapitsa codex, kapitsa pi
 ```
 
-<sub>On a 16-24 GB Mac use `--model 9b`, or `4b` for the quickest replies. `kapitsa serve` starts the chat page and the
-OpenAI and Anthropic APIs at http://127.0.0.1:8000. Kapitsa updates itself. [Usage guide](docs/usage.md)</sub>
+<sub>On a 16-24 GB Mac use `--model 9b`, or `4b` for the quickest replies.</sub>
+
+## CLI
+
+```bash
+kapitsa serve                   # chat + OpenAI/Anthropic APIs at http://127.0.0.1:8000
+kapitsa claude                  # Claude Code on Kapitsa (also: codex, opencode, pi)
+kapitsa doctor                  # this Mac's GPU and memory, and which models fit it
+kapitsa bench                   # benchmark this Mac, share it with the community
+kapitsa pull 27b                # download a model without starting it
+kapitsa list                    # downloaded models and their size
+kapitsa rm 27b                  # delete a downloaded model
+kapitsa import model.gguf       # use a Qwen GGUF from LM Studio, Ollama or llama.cpp
+kapitsa update                  # update now (it also updates itself)
+```
+
+<sub>`--model` picks the model and its precision (`35b:6bit`). `kapitsa <command> --help` has the options.
+[Usage guide](docs/usage.md)</sub>
 
 ## Benchmarks
 
@@ -114,6 +130,8 @@ OpenAI and Anthropic APIs at http://127.0.0.1:8000. Kapitsa updates itself. [Usa
 | **Qwen3.6-35B-A3B** · `35b`<br><sub>MoE, 3B active</sub> | **4-bit · 22.1 GB**<br><sub>also 5-bit 26.4 · 6-bit 30.7 · 8-bit 39.4 · bf16 71.9 GB</sub> | DFlash2 / MTP |
 | **Qwen3.8-Flash-Next 180B-A7B** · `flash-next`<br><sub>MoE, 7B active; 128 GB Macs</sub> | **4-bit · 105.9 GB**<br><sub>4/6/8-bit MLX; its 32 GB n-gram table stays on the SSD</sub> | MTP |
 | **Nemotron Dory1.0 4B** · `dory`<br><sub>looped dense, 1-4 loops per token; text only</sub> | **NVIDIA NVFP4 · 3.2 GB**<br><sub>also bf16 8.0 GB</sub> | — |
+| **Nemotron 3 Nano 4B** · `nano-4b`<br><sub>hybrid Mamba-2, dense; text only</sub> | **NVIDIA FP8 · 5.3 GB**<br><sub>also bf16 8.0 GB</sub> | prompt lookup |
+| **Nemotron Nano 9B v2** · `nano-9b`<br><sub>hybrid Mamba-2, dense; text only</sub> | **NVIDIA NVFP4 · 7.9 GB** | prompt lookup |
 | **Nemotron 3.5 Lightning 30B-A3B** · `lightning`<br><sub>hybrid Mamba-2 MoE, 3B active; text only</sub> | **NVIDIA NVFP4 · 22.9 GB**<br><sub>4-bit NVFP4 experts, FP8, BF16</sub> | DSpark |
 | **Nemotron 3.5 Bolt 74B-A9B** · `bolt`<br><sub>hybrid Mamba-2 MoE, 9B active</sub> | **NVIDIA 24 GB · 25.1 GB**<br><sub>2-bit experts, NVFP4, 8-bit</sub> | LiLiCorr |
 | **Nemotron 3.5 Super-VL 120B-A12B** · `super`<br><sub>hybrid Mamba-2 MoE, 12B active; 96 GB+ Macs</sub> | **NVIDIA NVFP4 · 76.4 GB**<br><sub>4-bit NVFP4 experts, FP8, BF16</sub> | LiLiCorr |
