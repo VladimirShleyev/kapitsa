@@ -152,6 +152,11 @@ offline replay says why. Over the 48 unseen agent turns, the decoder chain's gai
 | 150-300 tokens | 7 | 3.022 | 3.402 (+12.6%) |
 | over 300 tokens | 8 | 4.079 | 4.210 (+3.2%) |
 
+Over all 48 unseen agent turns (M3's run on origin/kflash, trees ranked by q at its default pass cap of 3; A = the
+lattice's best-first tree, arm order rotated per turn, budget caches warming across turns, every arm identical to plain
+decoding), decode tok/s, B vs A: answers under 150 tokens +16.8%, 150-300 +3.8%, over 300 +0.9%; all 48 turns +8.7%;
+weighted like the opencode session (10 of 15 turns under 150 tokens) +8.4%. Tokens per cycle 3.045 -> 3.444 (+13.1%).
+
 So what the decoder learned is the harness's tool-call syntax (tags, parameter names, paths and values copied from the
 context), which DFlash v1 drafts badly; prose and code inside long turns gain about what new code does, nothing. A
 previous A/B on agent requests 12 and 18 compared trees, not chains, on requests that share the training conversation;
@@ -159,10 +164,11 @@ it is withdrawn.
 
 ## Next
 
-- The decision: on coding-agent turns the decoder clears the bar (+21-24% accepted tokens per cycle over calibrated v1
-  trees on unseen turns), but the gain is the tool-call syntax, worth +44% on tool-call turns and +3% on long ones; on
-  everything else it adds nothing, and over the mixed held-out set it stays under the bar (+3-7%). As trained here it is
-  a tool-call specialist, not a better drafter.
+- The decision: on coding-agent turns the decoder clears the bar offline (+21-24% accepted tokens per cycle over
+  calibrated v1 trees on unseen turns) and gives +8.4% decode speed for a session's mix of turns in the engine, but the
+  gain is the tool-call syntax (+17% speed on tool-call turns, +1-4% on long ones); on everything else it adds nothing
+  (code -2 to -4% speed for its 0.8 ms of drafting per cycle), and over the mixed held-out set it stays under the bar
+  (+3-7%). As trained here it is a tool-call specialist, not a better drafter.
 - Data, not passes: the training loss on seen sequences fell to a third of the held-out loss. More distinct code, chat
   and reasoning answers (their text can come from any server; the target's distributions and the drafter's features
   along them are computed here), agent weight 1 instead of 2, and a larger greedy term for greedy decoding.
