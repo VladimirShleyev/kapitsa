@@ -649,7 +649,7 @@ int main(int argc, char** argv) {
         ++expanded;
         for (int c = 0; c < K; ++c) {
           const int o = int(i) * K + c;
-          const float src = sp.temperature > 0 ? T.ch_q[o] : T.ch_a[o];
+          const float src = T.ch_q[o];  // trees rank by q (KFlash::encode_tree)
           int nx = -1;
           for (uint32_t j = 1; j < T.n_nodes && nx < 0; ++j)
             if (T.parent[j] == int(i) && T.token[j] == T.ch_tok[o] && T.expanded[j]) nx = int(j);

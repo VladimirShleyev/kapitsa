@@ -168,8 +168,8 @@ class KFlash {
   // into desc (and its tokens): the top-32 and W_h h as encode_draft, then passes that each map the tree's rows onto
   // decoder nodes, expand the ones not expanded yet (up to 8, ancestors first) in one decoder step, and have the
   // builder take the tree again from the decoder's children tables: rows = decoder nodes, children = the 32
-  // candidates of the next block row with the log of the greedy acceptance head (T = 0) or of q = softmax(S / T)
-  // (T > 0), a child expandable once the decoder expanded it. NI_KFLASH_PASSES passes at most (default 7); passes
+  // candidates of the next block row with the log of q = softmax(S / T) (T = 0: softmax(S)), calibrated per depth by
+  // the budget, a child expandable once the decoder expanded it. NI_KFLASH_PASSES passes at most (default 7); passes
   // after every node of the tree is expanded are skipped (indirect dispatches of zero threadgroups): the tree is then
   // the builder's best-first tree over the decoder's own probabilities. kp: the budget's parameters (calibration,
   // costs, row counts) as for the lattice; Pk = 0xffffffff: the anchor from the drafter state (kf_build_gpu).

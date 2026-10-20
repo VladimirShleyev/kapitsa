@@ -548,9 +548,10 @@ void KFlash::encode_tree(Encoder& e, const Buffer& logits, const Buffer& xh, con
 void KFlash::encode_tree_passes(Encoder& e, const Buffer& tokens, uint32_t Pk, const Buffer& gst,
                                 const SamplingParams& sp, const Buffer& desc, const Buffer& live, const KfParams& kp) {
   const bool sampled = sp.temperature > 0.0f;
-  // the children's probability: at T = 0 the acceptance head's greedy row (P(the child is the target's argmax)), at
-  // T > 0 q = softmax(S / T) (the decoder's estimate of the target's sampler)
-  const bool use_acc = !sampled && acc_rows_ > 0;
+  // the children's probability: the decoder's q = softmax(S / T) (T = 0: softmax(S)), which the budget calibrates per
+  // depth. Not the acceptance head: on M2's held-out replay (4B) it ranks trees worse than q (8 rows: 4.25 vs 4.43
+  // tokens per cycle) and is under-confident (0.75 predicted vs 0.87 accepted at the chain's pick).
+  const bool use_acc = false;
   const float tq = sampled ? sp.temperature : 1.0f;
   const int passes = std::clamp(passes_ > 0 ? passes_ : 7, 1, 16);
   const bool gpu = Pk == 0xffffffffu;  // kDflGpu
