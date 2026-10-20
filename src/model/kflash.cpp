@@ -342,6 +342,85 @@ void KFlash::enc_res_norm(Encoder& e, const Tensor* w, const Buffer* ind) {
   else e.dispatch(8, 1, 1, 256);
 }
 
+void KFlash::bind_drafter(const QLinear* head, const Buffer* head_ids, uint32_t vd) {
+  out_head_ = head;
+  head_ids_ = head_ids;
+  vd_ = vd;
+  Gpu& g = Gpu::get();
+  const size_t ntg = (size_t(vd) + 2047) / 2048, ntg2 = (ntg * 32 + 2047) / 2048;
+  c_i_ = g.alloc(7 * kCand * 4, "kf_cand_i");
+  c_col_ = g.alloc(7 * kCand * 4, "kf_cand_col");
+  c_v_ = g.alloc(7 * kCand * 4, "kf_cand_v");
+  w_q_ = g.alloc(7 * kCand * 4, "kf_walk_q");
+  w_s_ = g.alloc(7 * kCand * 4, "kf_walk_s");
+  t_v_[0] = g.alloc(7 * ntg * kCand * 4, "kf_top_v");
+  t_i_[0] = g.alloc(7 * ntg * kCand * 4, "kf_top_i");
+  t_v_[1] = g.alloc(7 * ntg2 * kCand * 4, "kf_top_v");
+  t_i_[1] = g.alloc(7 * ntg2 * kCand * 4, "kf_top_i");
+  for (Buffer* b : {&c_i_, &c_col_, &c_v_, &w_q_, &w_s_, &t_v_[0], &t_i_[0], &t_v_[1], &t_i_[1]}) {
+    memset(b->ptr(), 0, b->size);
+    resident_ += b->size;
+  }
+  // NI_KFLASH_PASSES: speculative passes of the chain walk (default 7 = the sequential walk's result, passes after the
+  // chain is complete skipped); 0 = one single-row decoder step per position
+  if (const char* v = getenv("NI_KFLASH_PASSES")) passes_ = std::max(0, atoi(v));
+}
+
+// Top-32 of the draft logit rows 1..7, ordered (value desc, id asc) like dfl_top16: kf_top32 over chunks of 2048, then
+// over the chunks' top-32s until one chunk remains -> c_v_ (draft logits), c_col_ (draft-head columns, the E_out rows)
+// and c_i_ (token ids) [7][32].
+void KFlash::enc_top32(Encoder& e, const Buffer& logits) {
+  Buffer src = logits, sid = t_i_[0];
+  uint32_t n = vd_, has = 0;
+  int to = 0;
+  for (;;) {
+    const uint32_t chunks = (n + 2047) / 2048;
+    const Buffer& ov = chunks == 1 ? c_v_ : t_v_[to];
+    const Buffer& oi = chunks == 1 ? c_col_ : t_i_[to];
+    const uint32_t map = chunks == 1 ? (head_ids_ ? 1u : 2u) : 0u;
+    kp::DflTop p{n, n, chunks};
+    e.use(kfpipe("kf_top32"));
+    e.buf(0, src); e.buf(1, sid); e.buf(2, ov); e.buf(3, oi);
+    e.val(4, p);
+    e.val(5, has);
+    e.buf(6, head_ids_ ? *head_ids_ : c_i_); e.buf(7, c_i_);
+    e.val(8, map);
+    e.dispatch(chunks, 7, 1, 256);
+    if (chunks == 1) break;
+    src = ov;
+    sid = oi;
+    has = 1;
+    n = chunks * kCand;
+    to ^= 1;
+  }
+}
+
+void KFlash::encode_draft(Encoder& e, const Buffer& logits, const Buffer& xh, const Buffer& xs, const Buffer& tokens,
+                          uint32_t Pk, const Buffer& gst, const Buffer& walk_k, const SamplingParams& sp, float walk_tf,
+                          bool chain) {
+  if (!vd_) fatal("KFlash::encode_draft: no drafter bound (bind_drafter)");
+  enc_top32(e, logits);
+  encode_prep(e, xh, xs);
+  if (!chain) return;
+  const bool sampled = sp.temperature > 0.0f;
+  const float tq = sampled && walk_tf > 0.0f ? sp.temperature * walk_tf : 1.0f;
+  KFlashWalk w;
+  w.tokens = tokens;
+  w.qprob = w_q_;
+  w.walk_k = walk_k;
+  w.walk_s = w_s_;
+  w.temp = sampled ? sp.temperature : 0.0f;
+  w.seed = sp.seed;
+  w.qt = walk_tf > 0.0f;
+  w.maxdep = 7;
+  if (passes_ > 0) {
+    encode_chain(e, tokens, Pk, gst, c_i_, c_col_, c_v_, tq, sampled ? 1 : 0, w, passes_);
+  } else {
+    encode_root(e, tokens, Pk, gst);
+    for (int j = 0; j < w.maxdep; ++j) encode_step(e, c_i_, c_col_, c_v_, tq, sampled ? 1 : 0, &w);
+  }
+}
+
 void KFlash::encode_prep(Encoder& e, const Buffer& xh, const Buffer& xs) {
   const uint32_t H = uint32_t(cfg_.H);
   dfl_enc_qmm8(e, {{&w_h_, A_, uint32_t(cfg_.d), 1.0f}}, xh, xs, H, H);

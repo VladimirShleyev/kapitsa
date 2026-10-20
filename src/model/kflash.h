@@ -15,6 +15,38 @@
 
 namespace ni {
 
+namespace kp {  // the decoder kernels' parameters (src/kernels/spec_kflash.metal; the other kernels' are in kparams.h)
+struct KfRoot {
+  uint32_t P, spec;
+};
+
+struct KfJac {
+  float temp;
+  uint32_t seed, qt, maxdep, last, nslot;
+};
+
+struct KfIn {
+  uint32_t H, d, emb_bits, emb_gs;
+  float eps;
+};
+
+struct KfAttn {
+  uint32_t d, layer, nl;
+  float scale;
+};
+
+struct KfCand {
+  uint32_t H, out_bits;
+};
+
+struct KfSoft {
+  uint32_t H, d, acc_row, has_acc;
+  float qtemp, wq, wb, temp;
+  uint32_t seed, qt, maxdep, walk;
+  uint32_t out_bits;
+};
+}  // namespace kp
+
 // The drafting tree on the GPU, shared by the decoder step and the tree builder (a chain walk or the budgeted tree).
 // Node 0 = the anchor (depth 0); a node at depth j is a draft at block row j, position P + j. Expanding a node at depth j
 // runs the decoder's path row j over its branch and writes its children: the backbone's 32 candidates of block row
@@ -77,6 +109,24 @@ class KFlash {
   // front = {0}. spec > 0: nodes 1 .. spec below it, each its row's top-1 candidate (cand_i), all in the front.
   void encode_root(Encoder& e, const Buffer& tokens, uint32_t Pk, const Buffer& gst, const Buffer* cand_i = nullptr,
                    int spec = 0);
+  // ---- with a DFlash2 drafter (DFlash2 does this when NI_KFLASH finds a decoder) ----
+  // The drafter's draft head (the candidates' E_out rows, by column; 4 / 8-bit for every target format), its column ->
+  // token id map (null: the full vocabulary) and its row count vd; allocates the candidate and walk buffers.
+  void bind_drafter(const QLinear* head, const Buffer* head_ids, uint32_t vd);
+  // The end of a drafting pass: the top-32 of the draft logit rows 1..7 (logits fp32 [7][vd]) -> cand_ids / cand_cols /
+  // cand_vals, W_h h from the pass's X8 table (xh / xs), and with chain the chain walk (NI_KFLASH_PASSES speculative
+  // passes, default 7 = the sequential walk's result; 0: single-row steps): tokens[P + 1 ..], walk_q / walk_scores and
+  // walk_k for dfl_accept32 / dfl_depth32. The walk's q at T > 0 is softmax(S / (walk_tf T)) (walk_tf 0: the argmax
+  // with a one-hot q), at T = 0 the children's q is softmax(S); the acceptance head's row by T.
+  void encode_draft(Encoder& e, const Buffer& logits, const Buffer& xh, const Buffer& xs, const Buffer& tokens,
+                    uint32_t Pk, const Buffer& gst, const Buffer& walk_k, const SamplingParams& sp, float walk_tf,
+                    bool chain);
+  Buffer cand_ids() const { return c_i_; }      // [7][32] token ids of block rows 1..7
+  Buffer cand_cols() const { return c_col_; }   // their draft-head columns
+  Buffer cand_vals() const { return c_v_; }     // their draft logits
+  Buffer walk_q() const { return w_q_; }        // [7][32] the chain walk's q
+  Buffer walk_scores() const { return w_s_; }   // [7][32] its scores S
+
   // Once per drafting pass, before the steps: W_h h of the backbone's 8 block rows from its X8 table (xh / xs: the
   // half rows of its final normed hidden and their group sums, as its LM head read them).
   void encode_prep(Encoder& e, const Buffer& xh, const Buffer& xs);
@@ -151,6 +201,12 @@ class KFlash {
   // speculative passes: the full indirect arguments of a step (kSlots x 3 uints, filled at encode time) and one
   // argument block per pass (kf_jac writes the next pass's)
   Buffer full_args_, pass_args_;
+  // bind_drafter: the top-32 (ids, draft-head columns, logits), its staging, the chain walk's q and scores
+  const Buffer* head_ids_ = nullptr;
+  uint32_t vd_ = 0;
+  int passes_ = 7;
+  Buffer c_i_, c_col_, c_v_, w_q_, w_s_, t_v_[2], t_i_[2];
+  void enc_top32(Encoder& e, const Buffer& logits);
   bool debug_ = false;
   std::map<std::string, Buffer> dbg_;
 };

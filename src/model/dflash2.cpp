@@ -419,23 +419,8 @@ DFlash2::DFlash2(Qwen35& target, const std::string& dir, int bits) : tg_(target)
   // KFlash candidate decoder (opt-in NI_KFLASH): replaces the selector walk of the single-stream cycles
   if (const std::string kfdir = KFlash::find(tg_.model_dir(), dir, tg_.config()); !kfdir.empty()) {
     kf_ = std::make_unique<KFlash>(tg_, kfdir);
-    Gpu& g = Gpu::get();
-    const size_t ntg = (size_t(draft_vocab()) + 2047) / 2048, ntg2 = (ntg * 32 + 2047) / 2048;
-    c32_i_ = g.alloc(7 * 32 * 4, "kf_cand_i");
-    c32_col_ = g.alloc(7 * 32 * 4, "kf_cand_col");
-    c32_v_ = g.alloc(7 * 32 * 4, "kf_cand_v");
-    q32_ = g.alloc(7 * 32 * 4, "kf_qprob");
-    ws32_ = g.alloc(7 * 32 * 4, "kf_walk_s");
-    t32a_v_ = g.alloc(7 * ntg * 32 * 4, "kf_top_v");
-    t32a_i_ = g.alloc(7 * ntg * 32 * 4, "kf_top_i");
-    t32b_v_ = g.alloc(7 * ntg2 * 32 * 4, "kf_top_v");
-    t32b_i_ = g.alloc(7 * ntg2 * 32 * 4, "kf_top_i");
-    for (Buffer* b : {&c32_i_, &c32_col_, &c32_v_, &q32_, &ws32_, &t32a_v_, &t32a_i_, &t32b_v_, &t32b_i_}) {
-      memset(b->ptr(), 0, b->size);
-      resident_ += b->size;
-    }
+    kf_->bind_drafter(&draft_head(), head_n_ ? &head_ids_ : nullptr, draft_vocab());
     resident_ += kf_->resident_bytes();
-    kf_->set_out_head(&draft_head());  // the candidates' E_out rows: the draft head by column (4 / 8-bit always)
   } else if (const char* v = getenv("NI_KFLASH"); v && *v && strcmp(v, "0")) {
     logi("KFlash: NI_KFLASH=%s but no decoder (kflash/ in %s or beside %s); drafting with DFlash2's walk", v,
          tg_.model_dir().c_str(), dir.c_str());
@@ -1266,35 +1251,6 @@ void DFlash2::encode_draft_sel(Encoder& e, Seq& s, DFlashSeq& d, int P, const Sa
   encode_draft_impl(e, s, d, P, sp, false, sel);
 }
 
-// Top-32 of the draft logit rows 1..7, ordered (value desc, id asc) like dfl_top16: kf_top32 over chunks of 2048,
-// then over the chunks' top-32s until one chunk remains -> c32_v_ (draft logits), c32_col_ (draft-head columns, the
-// decoder's E_out rows) and c32_i_ (token ids) [7][32].
-void DFlash2::enc_top32(Encoder& e, uint32_t Vd) {
-  Buffer src = logits_.view(size_t(Vd) * 4, size_t(7) * Vd * 4), sid = t32a_i_;
-  uint32_t n = Vd, has = 0;
-  bool to_a = true;
-  for (;;) {
-    const uint32_t chunks = (n + 2047) / 2048;
-    const Buffer& ov = chunks == 1 ? c32_v_ : to_a ? t32a_v_ : t32b_v_;
-    const Buffer& oi = chunks == 1 ? c32_col_ : to_a ? t32a_i_ : t32b_i_;
-    const uint32_t map = chunks == 1 ? (head_n_ ? 1u : 2u) : 0u;
-    kp::DflTop p{n, n, chunks};
-    e.use(dpipe("kf_top32"));
-    e.buf(0, src); e.buf(1, sid); e.buf(2, ov); e.buf(3, oi);
-    e.val(4, p);
-    e.val(5, has);
-    e.buf(6, head_n_ ? head_ids_ : c32_i_); e.buf(7, c32_i_);
-    e.val(8, map);
-    e.dispatch(chunks, 7, 1, 256);
-    if (chunks == 1) break;
-    src = ov;
-    sid = oi;
-    has = 1;
-    n = chunks * 32;
-    to_a = !to_a;
-  }
-}
-
 void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const SamplingParams& sp, bool gpu, int sel) {
   // gpu: the anchor position comes from the drafter state (gst_); P is only its upper bound here
   if (!gpu && P != d.ctx) fatal("DFlash2 draft: anchor position %d but the ring holds %d positions", P, d.ctx);
@@ -1492,33 +1448,10 @@ void DFlash2::encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const S
   } else {
     enc_qmm8(e, {{&head, logits_, Vd, 1.0f}, {&sel_w_, sel_, uint32_t(kRank), 1.0f}}, xh_, xs_, H, H);
   }
-  if (sel != 0) {  // KFlash: the top-32 of each block row, then the decoder's chain walk (sel 2: the caller's steps)
-    if (!(skip & 4096)) enc_top32(e, Vd);
-    kf_->encode_prep(e, xh_, xs_);  // W_h h of the block rows from the LM head's input table
-    if (sel == 1) {
-      // the walk's q at T > 0 is softmax(S / (walk_tf_ T)) (walk_tf_ 0: the argmax chain with a one-hot q); at T = 0
-      // the children's q is softmax(S) (path probabilities); the acceptance head's greedy / sampled row by T
-      const bool sampled = sp.temperature > 0.0f;
-      const float tq = sampled && walk_tf_ > 0.0f ? sp.temperature * walk_tf_ : 1.0f;
-      KFlashWalk w;
-      w.tokens = s.tok;
-      w.qprob = q32_;
-      w.walk_k = walk_k_;
-      w.walk_s = ws32_;
-      w.temp = sampled ? sp.temperature : 0.0f;
-      w.seed = sp.seed;
-      w.qt = walk_tf_ > 0.0f;
-      w.maxdep = kB - 1;
-      // NI_KFLASH_PASSES: speculative passes of the chain walk (KFlash::encode_chain; default 7 = the sequential
-      // walk's result, passes after the chain is complete skipped); 0 = one single-row decoder step per position
-      static const int passes = getenv("NI_KFLASH_PASSES") ? atoi(getenv("NI_KFLASH_PASSES")) : kB - 1;
-      if (passes > 0) {
-        kf_->encode_chain(e, s.tok, Pk, gst_, c32_i_, c32_col_, c32_v_, tq, sampled ? 1 : 0, w, passes);
-      } else {
-        kf_->encode_root(e, s.tok, Pk, gst_);
-        for (int j = 0; j < kB - 1; ++j) kf_->encode_step(e, c32_i_, c32_col_, c32_v_, tq, sampled ? 1 : 0, &w);
-      }
-    }
+  if (sel != 0) {  // KFlash: top-32, W_h h, and (sel 1) its chain walk instead of the selector's
+    if (!(skip & 4096))
+      kf_->encode_draft(e, logits_.view(size_t(Vd) * 4, size_t(7) * Vd * 4), xh_, xs_, s.tok, Pk, gst_, walk_k_, sp,
+                        walk_tf_, sel == 1);
     return;
   }
   const uint32_t ntg = (Vd + 2047) / 2048;
@@ -1594,8 +1527,8 @@ void DFlash2::encode_accept(Encoder& e, Seq& s, int P, int K, const SamplingPara
   kp::DflAccept ap{uint32_t(P), uint32_t(K), sampled ? sp.temperature : 0.0f, sp.seed, dyn_tau_ > 0 ? 1u : 0u};
   // the single-stream cycles draft with the KFlash decoder when it is loaded: its walk has 32 candidates
   e.use(dpipe(kf_ ? "dfl_accept32" : "dfl_accept"));
-  e.buf(0, s.tok); e.buf(1, tg_.verify_samples()); e.buf(2, dist_id_); e.buf(3, dist_p_); e.buf(4, kf_ ? c32_i_ : cand_i_);
-  e.buf(5, kf_ ? q32_ : qprob_); e.buf(6, walk_k_); e.buf(7, acc_);
+  e.buf(0, s.tok); e.buf(1, tg_.verify_samples()); e.buf(2, dist_id_); e.buf(3, dist_p_);
+  e.buf(4, kf_ ? kf_->cand_ids() : cand_i_); e.buf(5, kf_ ? kf_->walk_q() : qprob_); e.buf(6, walk_k_); e.buf(7, acc_);
   e.val(8, ap);
   e.buf(9, kdyn_);
   e.buf(10, gst_);
@@ -1613,7 +1546,8 @@ void DFlash2::encode_cycle_verify(Encoder& e, Seq& s, int P, int K, const Sampli
     kp::DflDepth dp{uint32_t(K), sp.temperature > 0 ? dyn_tau_t_ : dyn_tau_, sp.temperature > 0 ? sp.temperature : 0.0f,
                     dyn_rule_};
     e.use(dpipe(kf_ ? "dfl_depth32" : "dfl_depth"));
-    e.buf(0, kf_ ? ws32_ : walk_s_); e.buf(1, walk_k_); e.buf(2, kf_ ? q32_ : qprob_); e.buf(3, kdyn_);
+    e.buf(0, kf_ ? kf_->walk_scores() : walk_s_); e.buf(1, walk_k_); e.buf(2, kf_ ? kf_->walk_q() : qprob_);
+    e.buf(3, kdyn_);
     e.val(4, dp);
     e.dispatch(1, 1, 1, 32);
     tg_.set_verify_row_limit(&rows);

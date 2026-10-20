@@ -279,10 +279,10 @@ int main(int argc, char** argv) {
     const std::string cd = out + "/" + name;
     mkdir(cd.c_str(), 0755);
     save_npy(cd + "/h.npy", "<f4", {8, H}, dr.final_hidden_buf().ptr(), size_t(8) * H * 4);
-    save_npy(cd + "/cand_i.npy", "<i4", {7, 32}, dr.cand32_ids_buf().ptr(), 7 * 32 * 4);
-    save_npy(cd + "/cand_v.npy", "<f4", {7, 32}, dr.cand32_vals_buf().ptr(), 7 * 32 * 4);
+    save_npy(cd + "/cand_i.npy", "<i4", {7, 32}, kf->cand_ids().ptr(), 7 * 32 * 4);
+    save_npy(cd + "/cand_v.npy", "<f4", {7, 32}, kf->cand_vals().ptr(), 7 * 32 * 4);
     std::set<int> toks;
-    for (int i = 0; i < 7 * 32; ++i) toks.insert(dr.cand32_ids_buf().as<int>()[i]);
+    for (int i = 0; i < 7 * 32; ++i) toks.insert(kf->cand_ids().as<int>()[i]);
     for (uint32_t i = 0; i < T.n_nodes; ++i) toks.insert(T.token[i]);
     std::vector<int> rid(toks.begin(), toks.end());
     std::vector<float> er(rid.size() * size_t(H)), orow(rid.size() * size_t(H));
@@ -324,9 +324,9 @@ int main(int argc, char** argv) {
         return a.first > b.first || (a.first == b.first && a.second < b.second);
       });
       for (int k = 0; k < 32; ++k) {
-        const int col = dr.cand32_cols_buf().as<int>()[(r - 1) * 32 + k];
-        if (dr.cand32_ids_buf().as<int>()[(r - 1) * 32 + k] != int(v[k].second) ||
-            dr.cand32_vals_buf().as<float>()[(r - 1) * 32 + k] != v[k].first || col < 0 || uint32_t(col) >= Vd ||
+        const int col = kf->cand_cols().as<int>()[(r - 1) * 32 + k];
+        if (kf->cand_ids().as<int>()[(r - 1) * 32 + k] != int(v[k].second) ||
+            kf->cand_vals().as<float>()[(r - 1) * 32 + k] != v[k].first || col < 0 || uint32_t(col) >= Vd ||
             (hid ? hid[col] : uint32_t(col)) != v[k].second)
           ++bad;
       }
@@ -360,7 +360,7 @@ int main(int argc, char** argv) {
       const int x = ch[j], c = ch[j + 1];
       // the row's scores come from the chain node itself when it was expanded (always, with 7 passes)
       if (!T.expanded[x] || T.depth[c] != j + 1 || T.cand_k[c] != dr.walk_k()[j] || T.ch_tok[x * 32 + T.cand_k[c]] != T.token[c] ||
-          dr.cand32_ids_buf().as<int>()[j * 32 + T.cand_k[c]] != T.token[c])
+          kf->cand_ids().as<int>()[j * 32 + T.cand_k[c]] != T.token[c])
         ++bad;
       for (int k = 0; k < 32; ++k) {
         if (dr.walk_scores()[j * 32 + k] != T.ch_s[x * 32 + k]) ++bad;
@@ -397,9 +397,9 @@ int main(int argc, char** argv) {
       w.maxdep = 7;
       if (mode == 0) {
         kf->encode_root(*e, s.tok, uint32_t(P), kf->tree());
-        for (int j = 0; j < 7; ++j) kf->encode_step(*e, dr.cand32_ids_buf(), dr.cand32_cols_buf(), dr.cand32_vals_buf(), tq, sp.temperature > 0, &w);
+        for (int j = 0; j < 7; ++j) kf->encode_step(*e, kf->cand_ids(), kf->cand_cols(), kf->cand_vals(), tq, sp.temperature > 0, &w);
       } else {
-        kf->encode_chain(*e, s.tok, uint32_t(P), kf->tree(), dr.cand32_ids_buf(), dr.cand32_cols_buf(), dr.cand32_vals_buf(), tq,
+        kf->encode_chain(*e, s.tok, uint32_t(P), kf->tree(), kf->cand_ids(), kf->cand_cols(), kf->cand_vals(), tq,
                          sp.temperature > 0, w, 7);
       }
       e->commit_and_wait();
@@ -430,7 +430,7 @@ int main(int argc, char** argv) {
     dr.encode_draft_sel(*e, s, ds, P, greedy, 2);
     kf->encode_root(*e, s.tok, uint32_t(P), kf->tree());  // explicit P: the drafter-state buffer is not read
     kf->set_debug(true);
-    kf->encode_step(*e, dr.cand32_ids_buf(), dr.cand32_cols_buf(), dr.cand32_vals_buf(), 1.0f, 0);
+    kf->encode_step(*e, kf->cand_ids(), kf->cand_cols(), kf->cand_vals(), 1.0f, 0);
     e->commit_and_wait();
     kf->set_debug(false);
     KFlashTree& T = *kf->tree().as<KFlashTree>();
@@ -464,7 +464,7 @@ int main(int argc, char** argv) {
       T.n_front = uint32_t(front.size());
       for (size_t i = 0; i < front.size(); ++i) T.front[i] = uint32_t(front[i]);
       auto e2 = g.begin();
-      kf->encode_step(*e2, dr.cand32_ids_buf(), dr.cand32_cols_buf(), dr.cand32_vals_buf(), 1.0f, 0);
+      kf->encode_step(*e2, kf->cand_ids(), kf->cand_cols(), kf->cand_vals(), 1.0f, 0);
       e2->commit_and_wait();
       ++steps;
       rows += int(front.size());
@@ -489,7 +489,7 @@ int main(int argc, char** argv) {
         const int id = int(T.n_nodes++);
         T.parent[id] = parent;
         T.depth[id] = T.depth[parent] + 1;
-        T.token[id] = dr.cand32_ids_buf().as<int>()[(T.depth[id] - 1) * 32 + k];
+        T.token[id] = kf->cand_ids().as<int>()[(T.depth[id] - 1) * 32 + k];
         T.cand_k[id] = k;
         T.logp[id] = 0.0f;
         T.acc[id] = 0.0f;
@@ -504,7 +504,7 @@ int main(int argc, char** argv) {
       T.front[2] = uint32_t(b2);
       T.front[3] = uint32_t(b);
       auto e2 = g.begin();
-      kf->encode_step(*e2, dr.cand32_ids_buf(), dr.cand32_cols_buf(), dr.cand32_vals_buf(), 1.0f, 0);
+      kf->encode_step(*e2, kf->cand_ids(), kf->cand_cols(), kf->cand_vals(), 1.0f, 0);
       e2->commit_and_wait();
       ++steps;
       rows += 4;
@@ -531,7 +531,7 @@ int main(int argc, char** argv) {
     for (int j = 1; j < 7; ++j) {
       T.parent[j] = j - 1;
       T.depth[j] = j;
-      T.token[j] = dr.cand32_ids_buf().as<int>()[(j - 1) * 32];
+      T.token[j] = kf->cand_ids().as<int>()[(j - 1) * 32];
       T.cand_k[j] = 0;
       T.expanded[j] = 0;
     }
@@ -539,7 +539,7 @@ int main(int argc, char** argv) {
     T.n_front = 7;
     for (int j = 0; j < 7; ++j) T.front[j] = uint32_t(6 - j);  // reversed: order must not matter
     auto e2 = g.begin();
-    kf->encode_step(*e2, dr.cand32_ids_buf(), dr.cand32_cols_buf(), dr.cand32_vals_buf(), 1.0f, 0);
+    kf->encode_step(*e2, kf->cand_ids(), kf->cand_cols(), kf->cand_vals(), 1.0f, 0);
     e2->commit_and_wait();
     int n_exp = 0;
     for (int j = 0; j < 7; ++j) n_exp += T.expanded[j];
@@ -586,7 +586,7 @@ int main(int argc, char** argv) {
     w.walk_s = tws;
     auto chain = [&](Encoder& e) {
       kf->encode_root(e, s.tok, uint32_t(P), kf->tree());
-      for (int j = 0; j < 7; ++j) kf->encode_step(e, dr.cand32_ids_buf(), dr.cand32_cols_buf(), dr.cand32_vals_buf(), 1.0f, 0, &w);
+      for (int j = 0; j < 7; ++j) kf->encode_step(e, kf->cand_ids(), kf->cand_cols(), kf->cand_vals(), 1.0f, 0, &w);
     };
     for (int i = 0; i <= time_n; ++i) {
       auto e = g.begin();
@@ -604,7 +604,7 @@ int main(int argc, char** argv) {
         uint32_t used = 0;
         for (int i = 0; i <= time_n; ++i) {
           auto e = g.begin();
-          kf->encode_chain(*e, s.tok, uint32_t(P), kf->tree(), dr.cand32_ids_buf(), dr.cand32_cols_buf(), dr.cand32_vals_buf(), 1.0f, 0, w, cap);
+          kf->encode_chain(*e, s.tok, uint32_t(P), kf->tree(), kf->cand_ids(), kf->cand_cols(), kf->cand_vals(), 1.0f, 0, w, cap);
           e->commit_and_wait();
           if (i) t.push_back(e->gpu_ms());
           used = kf->tree_host().walk_passes;
@@ -629,7 +629,7 @@ int main(int argc, char** argv) {
     {
       auto e = g.begin();
       kf->encode_root(*e, s.tok, uint32_t(P), kf->tree());
-      kf->encode_step(*e, dr.cand32_ids_buf(), dr.cand32_cols_buf(), dr.cand32_vals_buf(), 1.0f, 0);
+      kf->encode_step(*e, kf->cand_ids(), kf->cand_cols(), kf->cand_vals(), 1.0f, 0);
       e->commit_and_wait();
       KFlashTree& T = *kf->tree().as<KFlashTree>();
       for (int i = 1; i <= 8; ++i) {
@@ -646,7 +646,7 @@ int main(int argc, char** argv) {
         T.front[0] = 1;
         for (int i = 0; i < 10; ++i) {
           auto e2 = g.begin();
-          kf->encode_step(*e2, dr.cand32_ids_buf(), dr.cand32_cols_buf(), dr.cand32_vals_buf(), 1.0f, 0);
+          kf->encode_step(*e2, kf->cand_ids(), kf->cand_cols(), kf->cand_vals(), 1.0f, 0);
           e2->commit_and_wait();
         }
         Encoder::profile_report(10);
@@ -661,7 +661,7 @@ int main(int argc, char** argv) {
           for (int reps : {1, 5}) {
             auto e2 = g.begin();
             for (int r = 0; r < reps; ++r)
-              kf->encode_step(*e2, dr.cand32_ids_buf(), dr.cand32_cols_buf(), dr.cand32_vals_buf(), 1.0f, 0);
+              kf->encode_step(*e2, kf->cand_ids(), kf->cand_cols(), kf->cand_vals(), 1.0f, 0);
             e2->commit_and_wait();
             if (i) (reps == 1 ? t1 : t5).push_back(e2->gpu_ms());
           }

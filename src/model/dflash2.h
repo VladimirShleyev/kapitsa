@@ -198,21 +198,18 @@ class DFlash2 {
   // dfl_depth32). The batched path (encode_draft, encode_save_walk, encode_accept_rows) keeps DFlash2's walk.
   KFlash* kflash() const { return kf_.get(); }
   // A drafting pass with an explicit selection: 0 = DFlash2's walk, 1 = the KFlash decoder's chain walk, 2 = the
-  // backbone and its top-32 only (decoder steps / tree builders follow; tests)
+  // backbone, its top-32 and W_h h only (decoder steps / tree builders follow: KFlash::cand_ids() ...; tests)
   void encode_draft_sel(Encoder& e, Seq& s, DFlashSeq& d, int P, const SamplingParams& sp, int sel);
-  Buffer final_hidden_buf() const { return n_; }  // fp32 [8][H]: the decoder's h rows
-  Buffer cand32_ids_buf() const { return c32_i_; }
-  Buffer cand32_cols_buf() const { return c32_col_; }  // their columns in the draft head (KFlash::set_out_head)
-  Buffer cand32_vals_buf() const { return c32_v_; }
+  Buffer final_hidden_buf() const { return n_; }  // fp32 [8][H]: the backbone's final normed hidden rows
 
   // results of the last pass (host-visible after the command buffer completed); walk_cands() candidates per
   // position: 16 (DFlash2's walk), 32 with the KFlash decoder (its top-32, walk scores and q)
   int walk_cands() const { return kf_ ? 32 : 16; }
-  const int* cand_ids() const { return (kf_ ? c32_i_ : cand_i_).as<int>(); }       // [7][walk_cands()]
-  const float* cand_vals() const { return (kf_ ? c32_v_ : cand_v_).as<float>(); }  // [7][walk_cands()]
-  const float* qprob() const { return (kf_ ? q32_ : qprob_).as<float>(); }         // [7][walk_cands()] (sampled walk)
+  const int* cand_ids() const { return (kf_ ? kf_->cand_ids() : cand_i_).as<int>(); }       // [7][walk_cands()]
+  const float* cand_vals() const { return (kf_ ? kf_->cand_vals() : cand_v_).as<float>(); }  // [7][walk_cands()]
+  const float* qprob() const { return (kf_ ? kf_->walk_q() : qprob_).as<float>(); }  // [7][walk_cands()] (sampled walk)
   const int* walk_k() const { return walk_k_.as<int>(); }                          // [7]
-  const float* walk_scores() const { return (kf_ ? ws32_ : walk_s_).as<float>(); } // [7][walk_cands()]
+  const float* walk_scores() const { return (kf_ ? kf_->walk_scores() : walk_s_).as<float>(); }  // [7][walk_cands()]
   const float* edges() const { return edges_.as<float>(); }       // [7][16][16]
   const float* logits() const { return logits_.as<float>(); }     // [8][Vd] (row 0 unused; Vd = head_rows())
   uint32_t head_rows() const { return draft_vocab(); }             // draft logit columns (vocab or the reduced head)
@@ -263,7 +260,6 @@ class DFlash2 {
   // encode_commit's projections of m rows of `src` (bf16 [8][n_slots * H]; the verify captures capt_ by default)
   void enc_commit_from(Encoder& e, DFlashSeq& d, int m, const Buffer& src);
   void encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const SamplingParams& sp, bool gpu, int sel = 0);
-  void enc_top32(Encoder& e, uint32_t Vd);  // top-32 of draft logit rows 1..7 -> c32_i_ / c32_v_
   void dbg(Encoder& e, const std::string& name, const Buffer& src, size_t bytes);
 
   Qwen35& tg_;
@@ -319,9 +315,7 @@ class DFlash2 {
   bool h0_set_ = false, debug_ = false;
   int attn_variant_ = 0, pf8_ = -1;
   std::map<std::string, Buffer> dbg_;
-  // KFlash decoder (NI_KFLASH): top-32 per block row (ids / draft logits), its staging, the walk's q and scores
-  std::unique_ptr<KFlash> kf_;
-  Buffer c32_i_, c32_col_, c32_v_, q32_, ws32_, t32a_v_, t32a_i_, t32b_v_, t32b_i_;
+  std::unique_ptr<KFlash> kf_;  // the KFlash decoder (NI_KFLASH)
 };
 
 } // namespace ni
