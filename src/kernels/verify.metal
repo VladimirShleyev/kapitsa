@@ -402,6 +402,9 @@ NI_INLINE void topk256_row(const device float* logits, const device float* share
 // recorded (k, g, delta) per row, a rank-1 update each) and stores the new base, then evaluates
 // the R new rows without writing the state, recording their tape. Accepted rows are folded in by
 // the next call, rejected ones are simply never applied. R = 0 just flushes the pending rows.
+// KFlash tree verifies (Qwen35::set_verify_tree): the R rows are a tree, row t's parent row tree[kKfPar + t] (the KFlash
+// tree descriptor, kflash.h; row 0, the anchor, has none): a row's conv window and recurrent state are its ancestors' fold. Its
+// accepted path's rows are folded by the next pass in path order: tape rows path[0 .. n_pend) (pidx; kf_accept).
 struct GdnVerifyParams {
   uint R;
   uint n_pend;
@@ -409,36 +412,52 @@ struct GdnVerifyParams {
   uint Hv;
   uint C;
   float eps;
+  uint tree;  // the rows form a tree (the *_tree kernels)
+  uint pidx;  // the pending rows are tape rows path[0 .. n_pend), not 0 .. n_pend
+  uint pin;   // gdn_step_verify8s_tree: the recurrence's update in one explicit form (gdn_update), in the step, the fold and
+              // the replay of a jumping row alike
 };
 
 // grid: C/128 threadgroups x 128 threads (as gdn_prep).
-[[kernel]] void gdn_prep_verify(const device float* qkv [[buffer(0)]], const device float* a [[buffer(1)]],
-                                const device float* bb [[buffer(2)]], device float* conv_state [[buffer(3)]],
-                                const device bfloat* conv_w [[buffer(4)]], const device bfloat* A_log [[buffer(5)]],
-                                const device bfloat* dt_bias [[buffer(6)]], device float* q_out [[buffer(7)]],
-                                device float* k_out [[buffer(8)]], device float* v_out [[buffer(9)]],
-                                device float* g_out [[buffer(10)]], device float* beta_out [[buffer(11)]],
-                                device float* pend_qkv [[buffer(12)]], constant GdnVerifyParams& p [[buffer(13)]],
-                                uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
-  threadgroup float scratch[32];
+template <bool TREE>
+NI_INLINE void gdn_prep_verify_impl(const device float* qkv, const device float* a, const device float* bb,
+                                    device float* conv_state, const device bfloat* conv_w,
+                                    const device bfloat* A_log, const device bfloat* dt_bias, device float* q_out,
+                                    device float* k_out, device float* v_out, device float* g_out,
+                                    device float* beta_out, device float* pend_qkv, constant GdnVerifyParams& p,
+                                    const device int* tree, const device int* path, uint tg, uint tid,
+                                    threadgroup float* scratch) {
   constexpr uint D = 128;
   const uint c = tg * D + tid;
   const uint C = p.C;
   const uint qk = p.Hk * D;
   const bool is_q = c < qk, is_k = c >= qk && c < 2 * qk;
+  const uint R = TREE && p.tree ? kf_live(tree, p.R) : p.R;  // a tree: its live rows
   // fold pending rows into the committed window
   float w3[3] = {conv_state[0 * C + c], conv_state[1 * C + c], conv_state[2 * C + c]};
   for (uint t = 0; t < p.n_pend; ++t) {
     w3[0] = w3[1];
     w3[1] = w3[2];
-    w3[2] = pend_qkv[t * C + c];
+    w3[2] = pend_qkv[(TREE && p.pidx ? uint(path[t]) : t) * C + c];
   }
   for (uint r = 0; r < 3; ++r) conv_state[r * C + c] = w3[r];
   float w0 = conv_w[c * 4 + 0], w1 = conv_w[c * 4 + 1], w2 = conv_w[c * 4 + 2], wq = conv_w[c * 4 + 3];
   float h0 = w3[0], h1 = w3[1], h2 = w3[2];
-  for (uint t = 0; t < p.R; ++t) {
+  float tw1[8], tw2[8], tin[8];  // tree rows: each row's window (its last two entries) and input, by row
+  for (uint t = 0; t < R; ++t) {
     float in3 = qkv[t * C + c];
     pend_qkv[t * C + c] = in3;
+    if (TREE && p.tree && t > 0) {  // the parent's window shifted by the parent's input
+      const uint pr = uint(tree[kKfPar + t]);
+      h0 = tw1[pr];
+      h1 = tw2[pr];
+      h2 = tin[pr];
+    }
+    if (TREE) {
+      tw1[t] = h1;
+      tw2[t] = h2;
+      tin[t] = in3;
+    }
     float o = silu(w0 * h0 + w1 * h1 + w2 * h2 + wq * in3);
     h0 = h1;
     h1 = h2;
@@ -455,29 +474,60 @@ struct GdnVerifyParams {
   if (tg == 0 && tid < p.Hv) {
     float A = metal::precise::exp(float(A_log[tid]));
     float dtb = float(dt_bias[tid]);
-    for (uint t = 0; t < p.R; ++t) {
+    for (uint t = 0; t < R; ++t) {
       g_out[t * p.Hv + tid] = metal::precise::exp(-A * softplus(a[t * p.Hv + tid] + dtb));
       beta_out[t * p.Hv + tid] = sigmoid(bb[t * p.Hv + tid]);
     }
   }
 }
+[[kernel]] void gdn_prep_verify(const device float* qkv [[buffer(0)]], const device float* a [[buffer(1)]],
+                                const device float* bb [[buffer(2)]], device float* conv_state [[buffer(3)]],
+                                const device bfloat* conv_w [[buffer(4)]], const device bfloat* A_log [[buffer(5)]],
+                                const device bfloat* dt_bias [[buffer(6)]], device float* q_out [[buffer(7)]],
+                                device float* k_out [[buffer(8)]], device float* v_out [[buffer(9)]],
+                                device float* g_out [[buffer(10)]], device float* beta_out [[buffer(11)]],
+                                device float* pend_qkv [[buffer(12)]], constant GdnVerifyParams& p [[buffer(13)]],
+                                uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+  threadgroup float scratch[32];
+  gdn_prep_verify_impl<false>(qkv, a, bb, conv_state, conv_w, A_log, dt_bias, q_out, k_out, v_out, g_out, beta_out,
+                              pend_qkv, p, nullptr, nullptr, tg, tid, scratch);
+}
+// tree rows (p.tree; the live rows alone) and / or pending rows on a tree's path (p.pidx): tree = the KFlash tree
+// descriptor, path = kf_accept's (encode_flush folds a tree cycle's accepted rows with it)
+[[kernel]] void gdn_prep_verify_tree(const device float* qkv [[buffer(0)]], const device float* a [[buffer(1)]],
+                                     const device float* bb [[buffer(2)]], device float* conv_state [[buffer(3)]],
+                                     const device bfloat* conv_w [[buffer(4)]],
+                                     const device bfloat* A_log [[buffer(5)]],
+                                     const device bfloat* dt_bias [[buffer(6)]], device float* q_out [[buffer(7)]],
+                                     device float* k_out [[buffer(8)]], device float* v_out [[buffer(9)]],
+                                     device float* g_out [[buffer(10)]], device float* beta_out [[buffer(11)]],
+                                     device float* pend_qkv [[buffer(12)]], constant GdnVerifyParams& p [[buffer(13)]],
+                                     const device int* tree [[buffer(14)]], const device int* path [[buffer(15)]],
+                                     uint tg [[threadgroup_position_in_grid]],
+                                     uint tid [[thread_position_in_threadgroup]]) {
+  threadgroup float scratch[32];
+  gdn_prep_verify_impl<true>(qkv, a, bb, conv_state, conv_w, A_log, dt_bias, q_out, k_out, v_out, g_out, beta_out,
+                             pend_qkv, p, tree, path, tg, tid, scratch);
+}
 
 // grid: Hv threadgroups x 1024 threads (as gdn_step).
 // pend_k: [Rmax, Hv, 128], pend_g: [Rmax, Hv], pend_d: [Rmax, Hv, 128]
-template <bool SIG>
+// PIDX: the pending rows are tape rows path[0 .. n_pend) when p.pidx (a tree cycle's accepted path; rows are a chain)
+template <bool SIG, bool PIDX = false>
 NI_INLINE void gdn_step_verify_impl(const device float* q, const device float* k, const device float* v,
                                     const device float* g, const device float* beta, device float* state,
                                     const device float* z, const device bfloat* norm_w, device float* out,
                                     device float* pend_k, device float* pend_g, device float* pend_d,
                                     constant GdnVerifyParams& p, uint h, uint sg, uint lane,
-                                    threadgroup float* scratch) {
+                                    threadgroup float* scratch, const device int* path = nullptr) {
   constexpr uint D = 128;
   const uint hk = h / (p.Hv / p.Hk);
   device float* S = state + h * D * D;
   float4 st[4];
   for (int r = 0; r < 4; ++r) st[r] = *(device float4*)(S + (sg * 4 + r) * D + lane * 4);
   // fold pending (accepted) rows from the tape
-  for (uint t = 0; t < p.n_pend; ++t) {
+  for (uint t0 = 0; t0 < p.n_pend; ++t0) {
+    const uint t = PIDX && p.pidx ? uint(path[t0]) : t0;
     float4 kk = *(const device float4*)(pend_k + (t * p.Hv + h) * D + lane * 4);
     float gg = pend_g[t * p.Hv + h];
     for (int r = 0; r < 4; ++r) st[r] = st[r] * gg + kk * pend_d[(t * p.Hv + h) * D + sg * 4 + r];
@@ -534,15 +584,27 @@ NI_INLINE void gdn_step_verify_impl(const device float* q, const device float* k
   }
 NI_GDN_STEP_VERIFY(gdn_step_verify, false)
 NI_GDN_STEP_VERIFY(gdn_step_verify_sg, true)
+// pending rows on a tree cycle's path (encode_flush after a KFlash tree cycle): path = kf_accept's
+[[kernel]] void gdn_step_verify_pidx(const device float* q [[buffer(0)]], const device float* k [[buffer(1)]],
+                                     const device float* v [[buffer(2)]], const device float* g [[buffer(3)]],
+                                     const device float* beta [[buffer(4)]], device float* state [[buffer(5)]],
+                                     const device float* z [[buffer(6)]], const device bfloat* norm_w [[buffer(7)]],
+                                     device float* out [[buffer(8)]], device float* pend_k [[buffer(9)]],
+                                     device float* pend_g [[buffer(10)]], device float* pend_d [[buffer(11)]],
+                                     constant GdnVerifyParams& p [[buffer(12)]], const device int* path [[buffer(13)]],
+                                     uint h [[threadgroup_position_in_grid]],
+                                     uint sg [[simdgroup_index_in_threadgroup]],
+                                     uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float scratch[32];
+  gdn_step_verify_impl<false, true>(q, k, v, g, beta, state, z, norm_w, out, pend_k, pend_g, pend_d, p, h, sg, lane,
+                                    scratch, path);
+}
 
 // ---- per-row sampling ----
 // topk_stage1 with a row dimension: grid (ceil(V/chunk), R).
-[[kernel]] void topk_stage1_rows(const device float* logits [[buffer(0)]], device float* cv [[buffer(1)]],
-                                 device uint* ci [[buffer(2)]], constant TopkStageParams& p [[buffer(3)]],
-                                 uint2 tg [[threadgroup_position_in_grid]], uint2 tid2 [[thread_position_in_threadgroup]],
-                                 uint2 ntg2 [[threads_per_threadgroup]]) {
-  threadgroup float sv[32];
-  threadgroup uint si[32];
+NI_INLINE void topk_stage1_rows_impl(const device float* logits, device float* cv, device uint* ci,
+                                     constant TopkStageParams& p, uint2 tg, uint2 tid2, uint2 ntg2,
+                                     threadgroup float* sv, threadgroup uint* si) {
   const uint tid = tid2.x, ntg = ntg2.x, r = tg.y, ntgs = (p.V + p.chunk - 1) / p.chunk;
   const device float* lg = logits + size_t(r) * p.V;
   float v[8];
@@ -561,6 +623,25 @@ NI_GDN_STEP_VERIFY(gdn_step_verify_sg, true)
     }
   }
 }
+[[kernel]] void topk_stage1_rows(const device float* logits [[buffer(0)]], device float* cv [[buffer(1)]],
+                                 device uint* ci [[buffer(2)]], constant TopkStageParams& p [[buffer(3)]],
+                                 uint2 tg [[threadgroup_position_in_grid]], uint2 tid2 [[thread_position_in_threadgroup]],
+                                 uint2 ntg2 [[threads_per_threadgroup]]) {
+  threadgroup float sv[32];
+  threadgroup uint si[32];
+  topk_stage1_rows_impl(logits, cv, ci, p, tg, tid2, ntg2, sv, si);
+}
+// a tree verify's rows (KFlash): its live rows alone (tree = the KFlash tree descriptor)
+[[kernel]] void topk_stage1_rows_tree(const device float* logits [[buffer(0)]], device float* cv [[buffer(1)]],
+                                      device uint* ci [[buffer(2)]], constant TopkStageParams& p [[buffer(3)]],
+                                      const device int* tree [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                                      uint2 tid2 [[thread_position_in_threadgroup]],
+                                      uint2 ntg2 [[threads_per_threadgroup]], uint2 ntgs [[threadgroups_per_grid]]) {
+  threadgroup float sv[32];
+  threadgroup uint si[32];
+  if (tg.y >= kf_live(tree, ntgs.y)) return;
+  topk_stage1_rows_impl(logits, cv, ci, p, tg, tid2, ntg2, sv, si);
+}
 
 // Per-row stage 2: grid R threadgroups x 1024. Row r reads its candidates, samples with RNG step
 // (step + r) and writes tokens[out_index + r]. Indices >= remap_from map to remap_base + (i - remap_from)
@@ -577,15 +658,50 @@ struct SampleRowsParams {
   uint remap_base;
   uint table_from;  // 0 = none; indices >= table_from are table[i - table_from] (a draft head's gathered rows)
 };
-[[kernel]] void sample_stage2_rows(const device float* cv [[buffer(0)]], const device uint* ci [[buffer(1)]],
-                                   device int* tokens [[buffer(2)]], constant SampleRowsParams& p [[buffer(3)]],
-                                   const device uint* table [[buffer(4)]],
-                                   uint r [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
-                                   uint ntg [[threads_per_threadgroup]]) {
-  threadgroup float sv[32];
-  threadgroup uint si[32];
-  threadgroup float topv[64];
-  threadgroup uint topi[64];
+// A row's sample from its K best candidates (topv / topi, value desc, id asc): top-p on the untempered distribution,
+// then temperature, with RNG step (p.step + rkey; the row r, or a tree verify row's node depth); writes tokens[p.out_index + r]. (One thread.)
+NI_INLINE void sample_rows_pick(threadgroup const float* topv, threadgroup const uint* topi, uint K,
+                                constant SampleRowsParams& p, uint r, uint rkey, const device uint* table,
+                                device int* tokens) {
+  uint chosen = topi[0];
+  if (p.temp > 0.0f && K > 1) {
+    // top-p is taken on the untempered distribution (llama.cpp's and mlx-lm's order: top-k,
+    // top-p, then temperature), then the kept candidates are sampled at temperature p.temp.
+    float probs[64];
+    float tot = 0.0f;
+    for (uint q = 0; q < K; ++q) {
+      probs[q] = metal::precise::exp(topv[q] - topv[0]);
+      tot += probs[q];
+    }
+    uint keep = K;
+    float cum = 0.0f;
+    for (uint q = 0; q < K; ++q) {
+      cum += probs[q] / tot;
+      if (cum >= p.top_p) { keep = q + 1; break; }
+    }
+    float kt = 0.0f;
+    for (uint q = 0; q < keep; ++q) {
+      probs[q] = metal::precise::exp((topv[q] - topv[0]) / p.temp);
+      kt += probs[q];
+    }
+    float u = float(pcg_hash(p.seed ^ pcg_hash(p.step + rkey)) & 0xffffff) / 16777216.0f * kt;
+    chosen = topi[keep - 1];
+    float acc = 0.0f;
+    for (uint q = 0; q < keep; ++q) {
+      acc += probs[q];
+      if (u < acc) { chosen = topi[q]; break; }
+    }
+  }
+  if (p.table_from && chosen >= p.table_from) chosen = table[chosen - p.table_from];
+  else if (p.remap_from && chosen >= p.remap_from) chosen = p.remap_base + (chosen - p.remap_from);
+  tokens[p.out_index + r] = int(chosen);
+}
+
+// rkey: the row's RNG step offset (r; a tree verify's row: its node's depth)
+NI_INLINE void sample_stage2_rows_impl(const device float* cv, const device uint* ci, device int* tokens,
+                                       constant SampleRowsParams& p, const device uint* table, uint r, uint rkey,
+                                       uint tid, uint ntg, threadgroup float* sv, threadgroup uint* si,
+                                       threadgroup float* topv, threadgroup uint* topi) {
   constexpr int PER = 4;
   float v[PER];
   uint id[PER];
@@ -609,40 +725,132 @@ struct SampleRowsParams {
     if (tid == 0) { topv[q] = wv; topi[q] = wi; }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (tid == 0) {
-    uint chosen = topi[0];
-    if (p.temp > 0.0f && K > 1) {
-      // top-p is taken on the untempered distribution (llama.cpp's and mlx-lm's order: top-k,
-      // top-p, then temperature), then the kept candidates are sampled at temperature p.temp.
-      float probs[64];
-      float tot = 0.0f;
-      for (uint q = 0; q < K; ++q) {
-        probs[q] = metal::precise::exp(topv[q] - topv[0]);
-        tot += probs[q];
-      }
-      uint keep = K;
-      float cum = 0.0f;
-      for (uint q = 0; q < K; ++q) {
-        cum += probs[q] / tot;
-        if (cum >= p.top_p) { keep = q + 1; break; }
-      }
-      float kt = 0.0f;
-      for (uint q = 0; q < keep; ++q) {
-        probs[q] = metal::precise::exp((topv[q] - topv[0]) / p.temp);
-        kt += probs[q];
-      }
-      float u = float(pcg_hash(p.seed ^ pcg_hash(p.step + r)) & 0xffffff) / 16777216.0f * kt;
-      chosen = topi[keep - 1];
-      float acc = 0.0f;
-      for (uint q = 0; q < keep; ++q) {
-        acc += probs[q];
-        if (u < acc) { chosen = topi[q]; break; }
-      }
-    }
-    if (p.table_from && chosen >= p.table_from) chosen = table[chosen - p.table_from];
-    else if (p.remap_from && chosen >= p.remap_from) chosen = p.remap_base + (chosen - p.remap_from);
-    tokens[p.out_index + r] = int(chosen);
+  if (tid == 0) sample_rows_pick(topv, topi, K, p, r, rkey, table, tokens);
+}
+[[kernel]] void sample_stage2_rows(const device float* cv [[buffer(0)]], const device uint* ci [[buffer(1)]],
+                                   device int* tokens [[buffer(2)]], constant SampleRowsParams& p [[buffer(3)]],
+                                   const device uint* table [[buffer(4)]],
+                                   uint r [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
+                                   uint ntg [[threads_per_threadgroup]]) {
+  threadgroup float sv[32];
+  threadgroup uint si[32];
+  threadgroup float topv[64];
+  threadgroup uint topi[64];
+  sample_stage2_rows_impl(cv, ci, tokens, p, table, r, r, tid, ntg, sv, si, topv, topi);
+}
+// A tree verify's rows (DFlash2 tree drafting): row r draws with the uniform of the position its token takes, step +
+// depth of node r (tree[kKfDep + r], the KFlash tree descriptor), the same uniform plain decoding's row at that position draws:
+// siblings share it, and only one of them can lie on the accepted path. The live rows alone (no sample past them).
+[[kernel]] void sample_stage2_rows_tree(const device float* cv [[buffer(0)]], const device uint* ci [[buffer(1)]],
+                                        device int* tokens [[buffer(2)]], constant SampleRowsParams& p [[buffer(3)]],
+                                        const device uint* table [[buffer(4)]], const device int* tree [[buffer(5)]],
+                                        uint r [[threadgroup_position_in_grid]],
+                                        uint tid [[thread_position_in_threadgroup]],
+                                        uint ntg [[threads_per_threadgroup]], uint nr [[threadgroups_per_grid]]) {
+  threadgroup float sv[32];
+  threadgroup uint si[32];
+  threadgroup float topv[64];
+  threadgroup uint topi[64];
+  if (r >= kf_live(tree, nr)) return;
+  sample_stage2_rows_impl(cv, ci, tokens, p, table, r, uint(tree[kKfDep + r]), tid, ntg, sv, si, topv, topi);
+}
+
+// The same two passes on simdgroup reductions (no threadgroup barrier per candidate): the same candidates in the same
+// order, so the same tokens. topk_stage1_rows_sg: each simdgroup's 256 logits give their K best (K rounds of a
+// simdgroup argmax, value desc, id asc), simdgroup 0 merges the 8 sorted lists. sample_stage2_rows_sg: one simdgroup
+// merges the ntgs <= 64 sorted lists of stage 1 (K <= 32 each; lane l: lists l and l + 32) into the row's K best, then
+// samples as sample_stage2_rows (the candidates loaded by all its threads first). grids as theirs.
+NI_INLINE void sg_argmax(thread float& v, thread uint& i) {
+  for (uint off = 16; off > 0; off >>= 1) {
+    const float ov = simd_shuffle_xor(v, off);
+    const uint oi = simd_shuffle_xor(i, off);
+    if (ov > v || (ov == v && oi < i)) { v = ov; i = oi; }
   }
+}
+[[kernel]] void topk_stage1_rows_sg(const device float* logits [[buffer(0)]], device float* cv [[buffer(1)]],
+                                    device uint* ci [[buffer(2)]], constant TopkStageParams& p [[buffer(3)]],
+                                    uint2 tg [[threadgroup_position_in_grid]], uint2 tid2 [[thread_position_in_threadgroup]],
+                                    uint2 ntg2 [[threads_per_threadgroup]]) {
+  threadgroup float lv[8][64];
+  threadgroup uint li[8][64];
+  const uint tid = tid2.x, sg = tid / 32, lane = tid % 32, nsg = ntg2.x / 32, r = tg.y;
+  const uint ntgs = (p.V + p.chunk - 1) / p.chunk, K = min(p.K, 64u);
+  const device float* lg = logits + size_t(r) * p.V;
+  float v[8];
+  const uint base = tg.x * p.chunk + tid * 8;
+  for (int j = 0; j < 8; ++j) v[j] = base + j < p.V ? lg[base + j] : -INFINITY;
+  float bv = -INFINITY;
+  uint bi = 0xffffffff;
+  for (int j = 0; j < 8; ++j)
+    if (v[j] > bv) { bv = v[j]; bi = base + j; }
+  for (uint q = 0; q < K; ++q) {
+    float wv = bv;
+    uint wi = bi;
+    sg_argmax(wv, wi);
+    if (lane == 0) { lv[sg][q] = wv; li[sg][q] = wi; }
+    if (bi == wi && wi >= base && wi < base + 8) {  // the winner's lane: the next of its 8
+      v[wi - base] = -INFINITY;
+      bv = -INFINITY;
+      bi = 0xffffffff;
+      for (int j = 0; j < 8; ++j)
+        if (v[j] > bv) { bv = v[j]; bi = base + j; }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg) return;
+  uint pos = 0;
+  for (uint q = 0; q < K; ++q) {
+    float hv = lane < nsg && pos < K ? lv[lane][pos] : -INFINITY;
+    uint hi = lane < nsg && pos < K ? li[lane][pos] : 0xffffffff;
+    const float mv = hv;
+    const uint mi = hi;
+    sg_argmax(hv, hi);
+    if (lane == 0) {
+      cv[(r * ntgs + tg.x) * p.K + q] = hv;
+      ci[(r * ntgs + tg.x) * p.K + q] = hi;
+    }
+    if (lane < nsg && mi == hi && mv == hv) ++pos;
+  }
+}
+[[kernel]] void sample_stage2_rows_sg(const device float* cv [[buffer(0)]], const device uint* ci [[buffer(1)]],
+                                      device int* tokens [[buffer(2)]], constant SampleRowsParams& p [[buffer(3)]],
+                                      const device uint* table [[buffer(4)]],
+                                      uint r [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
+                                      uint ntg [[threads_per_threadgroup]]) {
+  threadgroup float topv[64];
+  threadgroup uint topi[64];
+  threadgroup float lv[64 * 32];  // the row's candidates (p.n = lists x p.K <= 64 x 32)
+  threadgroup uint li[64 * 32];
+  uint K = max(1u, min(p.K, 64u));
+  if (p.temp <= 0.0f) K = 1;
+  const uint L = p.n / p.K;  // stage 1's lists, p.K candidates each, sorted
+  for (uint k = tid; k < p.n; k += ntg) {
+    lv[k] = cv[size_t(r) * p.n + k];
+    li[k] = ci[size_t(r) * p.n + k];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid >= 32) return;
+  const uint lane = tid;
+  uint pa = 0, pb = 0;  // positions in lists lane, lane + 32
+  const uint la = lane, lb = lane + 32;
+  for (uint q = 0; q < K; ++q) {
+    const bool ha = la < L && pa < p.K, hb = lb < L && pb < p.K;
+    const float va = ha ? lv[la * p.K + pa] : -INFINITY, vb = hb ? lv[lb * p.K + pb] : -INFINITY;
+    const uint ia = ha ? li[la * p.K + pa] : 0xffffffff, ib = hb ? li[lb * p.K + pb] : 0xffffffff;
+    const bool a = va > vb || (va == vb && ia < ib);
+    float wv = a ? va : vb;
+    uint wi = a ? ia : ib;
+    const float mv = wv;
+    const uint mi = wi;
+    sg_argmax(wv, wi);
+    if (lane == 0) { topv[q] = wv; topi[q] = wi; }
+    if (mi == wi && mv == wv && (a ? ha : hb)) {
+      if (a) ++pa;
+      else ++pb;
+    }
+  }
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  if (lane == 0) sample_rows_pick(topv, topi, K, p, r, r, table, tokens);
 }
 
 // ---- qmvr v2: x rows staged in threadgroup memory (half), 4 weight rows per simdgroup ----

@@ -721,13 +721,21 @@ void Qwen35::enc_attn_rows(Encoder& e, const Seq& s, const Layer& L, const Buffe
 void Qwen35::enc_moe_rows(Encoder& e, const Layer& L, int R, const Buffer& x, bool mtp_layer, const Buffer* in) {
   const int D = cfg_.hidden, k = cfg_.top_k;
   if (in && in->mtl != xrn_.mtl) fatal("enc_moe_rows: the input rows must be xrn_");
-  enc_qmvr_multi(e, {{&L.router, rlog_}, {&L.shared_gate, slog_}}, in ? *in : x, in ? nullptr : L.post_norm, R, &xrn_);
+  // IQ experts (GGUF imports) at one row: their bf16 router and shared gate on the decode matvec with the norm folded
+  // (qmvg_multi_f16, 14 us per layer on the M1 Pro) instead of a row norm and two X8 tables and 8-row GEMMs (54 us)
+  if (L.eg.iq && R == 1 && !in) enc_qmv_multi(e, {{&L.router, rlog_}, {&L.shared_gate, slog_}}, x, L.post_norm, &xrn_);
+  else
+    enc_qmvr_multi(e, {{&L.router, rlog_}, {&L.shared_gate, slog_}}, in ? *in : x, in ? nullptr : L.post_norm, R, &xrn_);
   kp::Topk tp{uint32_t(cfg_.experts), uint32_t(k), cfg_.norm_topk ? 1u : 0u};
   // E = 256, k <= 8 (Qwen3.5/3.6): the unrolled form; any other E <= 512, k <= 16: one simdgroup per row
   e.use(pipe2(cfg_.experts == 256 && k <= 8 ? "moe_topk256_rows" : "moe_topk_rows"));
   e.buf(0, rlog_); e.buf(1, slog_); e.buf(2, ridx_); e.buf(3, rwts_);
   e.val(4, tp);
   e.dispatch(R, 1, 1, 32);
+  if (L.eg.iq) {  // llama.cpp's IQ blocks (qwen35_iq.cpp)
+    enc_moe_iq_rows(e, L, R, x);
+    return;
+  }
   kp::Moe mp{uint32_t(D), uint32_t(cfg_.moe_I), uint32_t(cfg_.shared_I), uint32_t(k), cfg_.eps};
   // opt-in: measured slower than per-row expert reads on M4 Pro
   static const bool no_dedupe = !env_on("NI_DEDUPE");
@@ -948,6 +956,8 @@ void Qwen35::encode_verify(Encoder& e, Seq& s, int pos, int R, const SamplingPar
     return;
   }
   if (pos + R + 1 >= s.cap) fatal("context full (%d)", s.cap);
+  if (v8_tree_) fatal("encode_verify: a verify tree needs the 8-row path");
+  if (s.pend_tree) encode_flush(e, s);  // a tree cycle's accepted rows (DFlash2 tree drafting) fold on their own
   const int D = cfg_.hidden;
   const uint32_t C = 2 * cfg_.lin_hk * cfg_.lin_dk + cfg_.lin_hv * cfg_.lin_dv;
   const int VD = cfg_.lin_hv * cfg_.lin_dv;
@@ -999,27 +1009,38 @@ void Qwen35::encode_verify(Encoder& e, Seq& s, int pos, int R, const SamplingPar
 }
 
 void Qwen35::encode_flush(Encoder& e, Seq& s) {
-  if (s.n_pend == 0) return;
+  if (s.n_pend == 0) {
+    s.pend_tree = false;
+    return;
+  }
+  // a tree cycle's accepted rows (DFlash2 tree drafting): tape rows pend_path[0 .. n_pend)
+  const bool pt = s.pend_tree;
   const uint32_t C = 2 * cfg_.lin_hk * cfg_.lin_dk + cfg_.lin_hv * cfg_.lin_dv;
-  kp::GdnVerify gv{0, uint32_t(s.n_pend), uint32_t(cfg_.lin_hk), uint32_t(cfg_.lin_hv), C, cfg_.eps};
+  kp::GdnVerify gv{0, uint32_t(s.n_pend), uint32_t(cfg_.lin_hk), uint32_t(cfg_.lin_hv), C, cfg_.eps, 0u, pt ? 1u : 0u};
   for (int i = 0; i < cfg_.layers; ++i) {
     if (!cfg_.is_linear[i]) continue;
     const Layer& L = layers_[i];
-    e.use(pipe2("gdn_prep_verify"));
+    e.use(pipe2(pt ? "gdn_prep_verify_tree" : "gdn_prep_verify"));
     e.buf(0, qkv_); e.buf(1, ab_); e.buf(2, bb_); e.buf(3, s.conv[i]);
     e.buf(4, L.conv_w->buf); e.buf(5, L.A_log->buf); e.buf(6, L.dt_bias->buf);
     e.buf(7, gq_); e.buf(8, gk_); e.buf(9, gv_); e.buf(10, gg_); e.buf(11, gbeta_);
     e.buf(12, s.pend_qkv[i]);
     e.val(13, gv);
+    if (pt) {
+      e.buf(14, s.pend_path);
+      e.buf(15, s.pend_path);
+    }
     e.dispatch(C / 128, 1, 1, 128);
-    e.use(pipe2("gdn_step_verify"));
+    e.use(pipe2(pt ? "gdn_step_verify_pidx" : "gdn_step_verify"));
     e.buf(0, gq_); e.buf(1, gk_); e.buf(2, gv_); e.buf(3, gg_); e.buf(4, gbeta_);
     e.buf(5, s.rec[i]); e.buf(6, zb_); e.buf(7, L.gnorm->buf); e.buf(8, gout_);
     e.buf(9, s.pend_k[i]); e.buf(10, s.pend_g[i]); e.buf(11, s.pend_d[i]);
     e.val(12, gv);
+    if (pt) e.buf(13, s.pend_path);
     e.dispatch(cfg_.lin_hv, 1, 1, 1024);
   }
   s.n_pend = 0;
+  s.pend_tree = false;
 }
 
 } // namespace ni

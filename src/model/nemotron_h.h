@@ -103,6 +103,7 @@ class NemotronH : public Model {
   ~NemotronH() override;
   const NhConfig& config() const { return cfg_; }
   const std::string& dir() const { return path_; }
+  bool dense() const { return dense_; }  // no MoE layers (Nano 4B / 9B v2)
   int vocab() const override { return cfg_.vocab; }
   const std::vector<int>& eos_ids() const override { return cfg_.eos; }
 
@@ -110,6 +111,10 @@ class NemotronH : public Model {
   // checkpoint's llm_config)
   static bool is_model(const std::string& dir);
   static MemPlan plan(const std::string& path, int prefill_chunk = 2048);
+  // the prefill chunk the engine tries before 2048 rows when it fits (0: none): 4096 for the MoE models on the M5
+  // without the Neural Engine split (Lightning), whose prefill runs on the matrix units (NI_NH_TG) and streams every
+  // routed expert once per chunk and layer
+  static int wide_chunk(const std::string& path);
   static size_t ane_plan_bytes(const NhConfig& c, size_t state);
 
   // ---- Model ----
@@ -163,6 +168,19 @@ class NemotronH : public Model {
   };
   void encode_verify_multi(Encoder& e, const std::vector<VerifyGroup>& groups);
   void commit_rows(Seq& s, int n) { s.n_pend = n; }
+  // KFlash tree verify (src/model/kflash_budget.h): while on, the verify block's rows form a tree (tree_buf(), written
+  // on the GPU by the drafter's tree builder: rows, parents, depths, ancestor masks; the nodes' tokens in tokens[pos +
+  // r]): row r attends to the history and its ancestors, and its Mamba-2 state is its root path's. encode_accept_tree
+  // then samples row r at position pos + depth(r), accepts the longest root path whose tokens are the rows' own samples
+  // (accepted() = a; tokens[pos + 1 ..] = the path's tokens and the last row's sample; the path's K/V moved into place)
+  // and commit_rows_tree(s, n) makes the path's first n rows pending.
+  void set_tree(bool on) { tree_on_ = on; }
+  Buffer tree_buf() const { return tree_; }
+  void encode_accept_tree(Encoder& e, Seq& s, int pos, const SamplingParams& sp);
+  void commit_rows_tree(Seq& s, int n) {
+    s.n_pend = n;
+    s.pend_tree = n > 0;
+  }
   void encode_flush(Encoder& e, Seq& s);
   // Logits of rows [0, T) of the last pass (fp32 [T][vocab], T <= kMaxRows) / of the last prefill chunk.
   float* logits() { return logits_.as<float>(); }
@@ -180,6 +198,7 @@ class NemotronH : public Model {
   Buffer live_rows() const { return live_; }
   const int* samples() const { return samp_.as<int>(); }
   int accepted() const { return acc_.as<int>()[0]; }
+  const Buffer& accepted_buf() const { return acc_; }  // (accepted() on the GPU: int [0])
 
   // ---- for the drafter ----
   void set_capture(const NhCapture* c) { cap_ = c; }
@@ -195,7 +214,14 @@ class NemotronH : public Model {
   void enc_gemm(Encoder& e, const NhMat& W, const Buffer& xh, const Buffer& y, int M, int epi, uint32_t y_ld = 0,
                 uint32_t x_ld = 0);
   void enc_rows_half(Encoder& e, const Buffer& x, const Buffer& y, int R, int D);
-  void enc_embed(Encoder& e, const Buffer& tokens, int tok_off, int R, const Buffer& out);
+  // RMSNorm of fp32 rows straight into half rows (nh_rows_half's norm), and into both (nh_rmsnorm_h): one pass where
+  // enc_norm + enc_rows_half took two, with the same values
+  void enc_norm_half(Encoder& e, const Buffer& x, const Buffer& w, const Buffer& yh, int R, int D);
+  void enc_norm2(Encoder& e, const Buffer& x, const Buffer& w, const Buffer& y, const Buffer& yh, int R, int D);
+  bool enc_qkv(Encoder& e, const NhLayer& L, int R);
+  // (params: the kernel's {D, tok_off} read from that buffer instead, e.g. written on the GPU by a chained drafting half)
+  void enc_embed(Encoder& e, const Buffer& tokens, int tok_off, int R, const Buffer& out, const Buffer* params = nullptr,
+                 size_t params_off = 0);
   static Pipeline pipeline(const std::string& name);
 
  private:
@@ -205,8 +231,9 @@ class NemotronH : public Model {
   // commit: the Mamba state and conv ring advance (prefill, decode); else the rows become pending (verify).
   void enc_rows(Encoder& e, Seq& s, int pos0, int R, bool commit);
   void enc_head(Encoder& e, int R, const Buffer& out, size_t out_row_stride);
+  // the draw's RNG step: step, plus (*dstep)[out_index] (int32 at byte offset dstep_off) when dstep is given
   void enc_sample(Encoder& e, const Buffer& logits_row, const Buffer& tokens, int out_index, const SamplingParams& sp,
-                  uint32_t step);
+                  uint32_t step, const Buffer* dstep = nullptr, size_t dstep_off = 0);
   void enc_capture(Encoder& e, int layer, const Buffer& x, int pos0, int R);
   // np pending rows zp (a verify block's accepted rows, at pos0 - np) are committed first when given
   // parts: 1 the scan, 2 the conv ring updates after it (a batched pass runs every sequence's scans, then their rings)
@@ -225,6 +252,15 @@ class NemotronH : public Model {
   bool ane_chunk_ = false;  // the chunk being encoded runs the split
   AneStats ane_stats_;
   bool group_ = false;  // NI_NH_GROUP
+  bool v8_n1_ = false;   // NI_NH_V8_N1
+  bool rsu_ = false;     // NI_NH_RSU
+  bool sample_sg_ = false;  // NI_NH_SAMPLE_SG
+  // a dynamic verify's routed-expert grids (nh_moe_pair_args into moe_args_; NI_NH_PAIR_IND): set by enc_rows for
+  // its pass, the shapes they were made for
+  Buffer moe_args_;
+  bool pair_ind_ = false, pair_args_ = false, moe_lightning_ = false;
+  uint32_t moe_I_ = 0, moe_k_ = 0, pair_thr_ = 0, pair_rows_ = 0, pair_k_ = 0, pair_gx_up_ = 0, pair_gx_dn_ = 0;
+  Buffer sdv_;           // the shared expert's down product of a verify's rows (rsu_)
   void init_ane();
   void ane_build();
   void prewarm_pipelines();
@@ -247,6 +283,8 @@ class NemotronH : public Model {
   // activations (kMaxRows rows)
   Buffer x_, xn_, zx_, y_, yn_, q_, k_, v_, ao_, part_o_, part_ml_, rl_, eid_, ew_, lat_, h_, lo_, sh_;
   Buffer logits_, cand_v_, cand_i_, sprob_, samp_, acc_;
+  Buffer tree_;            // KFlash: the verify block's tree and its acceptance (layout kKf*, nh_common.h)
+  bool tree_on_ = false;
   Buffer xnh_, aoh_, loh_, shh_;  // half inputs of the multi-row GEMMs (passes of 2+ rows)
   Buffer part_;                   // routed experts' weighted partial outputs [rows * k][latent]
   Buffer iq2tab_;                 // IQ2_XXS lookup tables (constant address space in the kernels)
@@ -257,21 +295,34 @@ class NemotronH : public Model {
   bool v8_ = true;                // NI_NH_V8: GEMMs of <= 8 rows on the 8-row MMA kernels (nh_v8.metal)
   bool x4_ = true;  // NVFP4 x4 kernels (one row, 8-row verify, 9-32-row split-K); NI_NH_X4=0: the older ones
   bool x8_ = true;  // FP8 x8 kernels (one row, 8-row verify, 9-32-row split-K); NI_NH_X8=0: the generic ones
+  // The M5's matrix units (Metal 4 tensor_ops, src/kernels/tensor/nh_v8t.metal) for the NVFP4 GEMMs of <= 8 rows:
+  // Apple10 on macOS 26; NI_NH_V8T=0 keeps them on nh_x4_v8
+  bool v8t_ = false;
+  // M5 (Apple10, macOS 26): the prefill's tile GEMMs (> 32 rows) on the GPU's matrix units (nh_gemm_t_*, Metal 4
+  // tensor_ops); NI_NH_TG=0: the simdgroup-MMA ones (nh_gemm_*)
+  bool tg_ = false;
+  Buffer pcv_;  // nh_ssm_conv's conv'd rows and dt of a prefill chunk (M5; pout_ when it is large enough)
+  Buffer psb_;  // nh_ssd's per-chunk M and decays (M5; the rest of pout_ when it is large enough)
   Buffer x4part_, x4cnt_;  // split-K partials / arrival counters of the 9-32-row x4 / x8 kernels (serial calls share them)
   // A dense model (no MoE layers: Nemotron Nano 4B / 9B v2). Its products of K % 128 != 0 (hidden 3136, the 9B's MLP
-  // width 15680) run on the tail variants of the 2-32-row kernels (nh_xb_v8_t, nh_x4_*_t), which the MoE models' paths
-  // do not take.
+  // width 15680) run on the tail variants of the 2-32-row kernels (nh_xb_v8_t, nh_x4_*_t, nh_x8_*_t), which the MoE
+  // models' paths do not take.
   bool dense_ = false;
   // NVFP4 codes in layout L2 (nh_x_fp4.metal): the dense models on the M1's GPU family, as Dory (NI_NH_FP4=l0 / l2
   // overrides); every NVFP4 product then runs on the x4 kernels or nh_gemm_fp4l2_*
   bool fp4_l2_ = false;
+  bool experts_l2_ = false;  // NVFP4 routed experts in layout L2 (NI_NH_FP4_EXPERTS); see NemotronH::load
   bool x2_ = true;  // IQ2_XXS x2 kernels (subnormal-half weights); NI_NH_X2=0: the older ones (fused decode excepted)
   Buffer x2sorted_, x2tiles_, x2args_, x2rank_;  // verify routed experts grouped by expert (nh_x2_bucket)
   bool merge_flush_ = true;       // NI_NH_MERGE_FLUSH: a verify's scans commit the previous block's accepted rows
   bool fuse_dec_ = true;          // NI_NH_FUSE: a token's MoE layer in 4 dispatches (nh_zdec.metal)
+  bool route_bucket_ = true;      // NI_NH_ROUTE_BUCKET: an M5 verify's IQ2 routing and bucketing in one dispatch
+  uint32_t x2_sgd_ = 1;           // NI_NH_X2_SGD: simdgroups per threadgroup of a verify's IQ2 experts' down projection
+  uint32_t moe_thr_ = 256;        // NI_NH_MOE_THR: threads per threadgroup of a verify's NVFP4 routed experts
   Buffer route_ctr_, sd_;         // fused MoE: the router threadgroups' arrival counter, the shared expert's output
   Buffer moecnt_;                 // NVFP4 experts: arrival counters per (row, 32-row block) of nh_x4_moe_dn_sum
   int attn_max_chunks_ = 64;
+  uint32_t attn_chunk_ = 256;  // keys per attention chunk (NI_NH_ATTN_CHUNK; M5: 64)
   const NhCapture* cap_ = nullptr;
   // prefill activations (tmax_ rows; allocated on first use)
   int pf_rows_ = 0;

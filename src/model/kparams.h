@@ -131,6 +131,8 @@ struct MoeRowsDown {
 struct GdnVerify {
   uint32_t R, n_pend, Hk, Hv, C;
   float eps;
+  uint32_t tree = 0, pidx = 0;  // the *_tree kernels: rows form a tree / pending rows are a tree cycle's path
+  uint32_t pin = 0;             // gdn_step_verify8s_tree: the recurrence's update in one explicit form (gdn_update)
 };
 
 struct SampleRows {
@@ -198,6 +200,12 @@ struct DflAttn {
   float scale;
 };
 
+struct DflAttnQk {
+  uint32_t P, lo, chunk, nsplit;
+  float scale, eps;
+  uint32_t q_ld, kv_ld;
+};
+
 struct DflAttnRed {
   uint32_t nsplit;
   uint32_t P, lo, chunk;
@@ -211,6 +219,7 @@ struct DflCommit {
 struct DflX8 {
   uint32_t K, m, src_ld;
   float scale;
+  uint32_t gather = 0;  // 1: row r from source row gst[4 + r] (a tree cycle's accepted path)
 };
 
 struct DflRows {
@@ -225,6 +234,7 @@ struct DflQmm8 {
   uint32_t bits[4];
   uint32_t y_ld[4];
   float oscale[4];
+  uint32_t old4;  // 1: 4-bit GEMMs on dfl_q8_run, the core before dfl_q8_run4 (dflash2.cpp dfl_old4)
 };
 
 struct DflMerge {
@@ -252,6 +262,19 @@ struct DflAccept {
   float temp;
   uint32_t seed;
   uint32_t dyn;  // 1: K = min(K, kdyn[0]) (dynamic verify depth)
+};
+
+// the shared KFlash tree kernels (src/kernels/kflash.h): kf_build / kf_build_gpu and kf_accept
+struct KfBuild {
+  uint32_t K, P, root, pad;
+};
+
+struct KfAccept {
+  uint32_t P, R, gst, pad;
+};
+
+struct KvTree {
+  uint32_t pos, Hkv, D, max_seq;
 };
 
 struct DflDepth {
@@ -292,7 +315,7 @@ struct Qmm8Gu {
 };
 
 struct SwigluX8 {
-  uint32_t K, R;
+  uint32_t K, R, write_t;
 };
 
 struct Moe8Plan {
@@ -319,6 +342,26 @@ struct Moe8CombineX8 {
   uint32_t N, k, R;
   float eps;
   uint32_t unroll, write_t;
+};
+
+// wfmt_iq.metal: routed experts in llama.cpp's IQ blocks
+struct IqSec {
+  uint32_t x1, x2, x3, d;
+};
+
+struct MoeIq {
+  uint32_t D, I, SI, k;
+  IqSec gu, dn;
+};
+
+struct Moe8Iq {
+  uint32_t K, N, h_stride, hs_stride, k;
+  IqSec sec;
+};
+
+struct QrmIq {
+  uint32_t N, K, x_ld, y_ld;
+  IqSec sec;
 };
 
 } // namespace ni::kp

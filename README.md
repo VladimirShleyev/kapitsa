@@ -4,9 +4,9 @@
   <img alt="Kapitsa: a blazing fast Apple Silicon optimized inference engine built for Qwen and Nemotron. Writing speed of Qwen3.6 35B-A3B on a MacBook Pro (2024), M4 Pro, 48 GB, in tokens per second, at 4-bit: Kapitsa 154, oMLX with DFlash2 127, Ollama 89, LM Studio 86, MTPLX 80, llama.cpp with MTP 69." src="docs/assets/header-light.svg">
 </picture>
 
-[Install](#install) · [Benchmarks](#benchmarks) · [Models](#models) · [Docs](docs/usage.md)
+[Quickstart](#quickstart) · [CLI](#cli) · [Benchmarks](#benchmarks) · [Models](#models) · [Docs](docs/usage.md)
 
-## Install
+## Quickstart
 
 **Requirements:** a Mac with Apple silicon (M1 or newer) and macOS 14 Sonoma or later.
 
@@ -19,8 +19,24 @@ brew install nace-ai/tap/kapitsa
 kapitsa opencode --model 35b    # also: kapitsa claude, kapitsa codex, kapitsa pi
 ```
 
-<sub>On a 16-24 GB Mac use `--model 9b`, or `4b` for the quickest replies. `kapitsa serve` starts the chat page and the
-OpenAI and Anthropic APIs at http://127.0.0.1:8000. Kapitsa updates itself. [Usage guide](docs/usage.md)</sub>
+<sub>On a 16-24 GB Mac use `--model 9b`, or `4b` for the quickest replies.</sub>
+
+## CLI
+
+```bash
+kapitsa serve                   # chat + OpenAI/Anthropic APIs at http://127.0.0.1:8000
+kapitsa claude                  # Claude Code on Kapitsa (also: codex, opencode, pi)
+kapitsa doctor                  # this Mac's GPU and memory, and which models fit it
+kapitsa bench                   # benchmark this Mac, share it with the community
+kapitsa pull 27b                # download a model without starting it
+kapitsa list                    # downloaded models and their size
+kapitsa rm 27b                  # delete a downloaded model
+kapitsa import model.gguf       # use a Qwen GGUF from LM Studio, Ollama or llama.cpp
+kapitsa update                  # update now (it also updates itself)
+```
+
+<sub>`--model` picks the model and its precision (`35b:6bit`). `kapitsa <command> --help` has the options.
+[Usage guide](docs/usage.md)</sub>
 
 ## Benchmarks
 
@@ -77,12 +93,16 @@ OpenAI and Anthropic APIs at http://127.0.0.1:8000. Kapitsa updates itself. [Usa
 | Model | <mark>**Kapitsa**</mark> | <sub>oMLX</sub> | <sub>mlx‑serve</sub> | <sub>Ollama</sub> | <sub>MTPLX</sub> | <sub>LM&nbsp;Studio</sub> | <sub>llama.cpp</sub> | <sub>MLX</sub> | <sub>Rapid‑MLX</sub> |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Qwen3.5<br>4B<br><sub>4-bit</sub> | 🟩&nbsp;<mark>**85&nbsp;tok/s**</mark> | 55 | 62 | 55 | 42 | 47 | 38 | 46 | 52 |
+| Qwen3.5<br>9B<br><sub>4-bit</sub> | 🟩&nbsp;<mark>**51&nbsp;tok/s**</mark> | —<br><sub>not run</sub> | 37 | —<br><sub>not run</sub> | —<br><sub>not run</sub> | —<br><sub>not run</sub> | —<br><sub>not run</sub> | 30 | —<br><sub>not run</sub> |
+| Qwen3.6<br>35B‑A3B<br><sub>2-bit experts (GGUF UD‑IQ2_XXS)</sub> | 🟩&nbsp;<mark>**53&nbsp;tok/s**</mark> | —<br><sub>no GGUF</sub> | —<br><sub>no GGUF</sub> | —<br><sub>not run</sub> | —<br><sub>no GGUF</sub> | —<br><sub>not run</sub> | 38 | —<br><sub>no GGUF</sub> | —<br><sub>no GGUF</sub> |
 
 #### Nemotron
 
 | Model | <mark>**Kapitsa**</mark> | <sub>oMLX</sub> | <sub>llama.cpp</sub> | <sub>MLX</sub> |
 | --- | ---: | ---: | ---: | ---: |
 | Nemotron Dory1.0 4B<br><sub>NVFP4</sub> | 🟩&nbsp;<mark>**40&nbsp;tok/s**</mark> | —<br><sub>no support</sub> | 4 | 30 |
+| Nemotron 3 Nano 4B<br><sub>FP8</sub> | 🟩&nbsp;<mark>**37&nbsp;tok/s**</mark> | —<br><sub>not run</sub> | 28<br><sub>Q4_K_M</sub> | 21<br><sub>BF16</sub> |
+| Nemotron Nano 9B v2<br><sub>NVFP4</sub> | 🟩&nbsp;<mark>**25&nbsp;tok/s**</mark> | —<br><sub>not run</sub> | 14<br><sub>Q4_K_M</sub> | 18 |
 
 ### MacBook Pro (16-inch, 2026) · M5 Pro · 48 GB
 
@@ -111,15 +131,17 @@ OpenAI and Anthropic APIs at http://127.0.0.1:8000. Kapitsa updates itself. [Usa
 | **Qwen3.5-4B** · `4b`<br><sub>dense</sub> | **4-bit · 4.6 GB**<br><sub>also 6-bit 5.6 · 8-bit 6.7 · bf16 10.6 GB</sub> | DFlash / MTP |
 | **Qwen3.5-9B** · `9b`<br><sub>dense</sub> | **4-bit · 9.0 GB** | DFlash / MTP |
 | **Qwen3.8-27B** · `27b`<br><sub>dense</sub> | **4-bit · 20.2 GB**<br><sub>also 5-bit 23.5 · 6-bit 26.9 · 8-bit 33.6 · bf16 58.8 GB</sub> | DFlash2 / MTP |
-| **Qwen3.6-35B-A3B** · `35b`<br><sub>MoE, 3B active</sub> | **4-bit · 22.1 GB**<br><sub>also 5-bit 26.4 · 6-bit 30.7 · 8-bit 39.4 · bf16 71.9 GB</sub> | DFlash2 / MTP |
+| **Qwen3.6-35B-A3B** · `35b`<br><sub>MoE, 3B active</sub> | **4-bit · 22.1 GB**<br><sub>also 5-bit 26.4 · 6-bit 30.7 · 8-bit 39.4 · bf16 71.9 GB; 16-24 GB Macs: `16gb`, 2-bit experts (unsloth's GGUF) 10.8 GB</sub> | DFlash2 / MTP<br><sub>`16gb`: none</sub> |
 | **Qwen3.8-Flash-Next 180B-A7B** · `flash-next`<br><sub>MoE, 7B active; 128 GB Macs</sub> | **4-bit · 105.9 GB**<br><sub>4/6/8-bit MLX; its 32 GB n-gram table stays on the SSD</sub> | MTP |
 | **Nemotron Dory1.0 4B** · `dory`<br><sub>looped dense, 1-4 loops per token; text only</sub> | **NVIDIA NVFP4 · 3.2 GB**<br><sub>also bf16 8.0 GB</sub> | — |
+| **Nemotron 3 Nano 4B** · `nano-4b`<br><sub>hybrid Mamba-2, dense; text only</sub> | **NVIDIA FP8 · 5.3 GB**<br><sub>also bf16 8.0 GB</sub> | prompt lookup |
+| **Nemotron Nano 9B v2** · `nano-9b`<br><sub>hybrid Mamba-2, dense; text only</sub> | **NVIDIA NVFP4 · 7.9 GB** | prompt lookup |
 | **Nemotron 3.5 Lightning 30B-A3B** · `lightning`<br><sub>hybrid Mamba-2 MoE, 3B active; text only</sub> | **NVIDIA NVFP4 · 22.9 GB**<br><sub>4-bit NVFP4 experts, FP8, BF16</sub> | DSpark |
 | **Nemotron 3.5 Bolt 74B-A9B** · `bolt`<br><sub>hybrid Mamba-2 MoE, 9B active</sub> | **NVIDIA 24 GB · 25.1 GB**<br><sub>2-bit experts, NVFP4, 8-bit</sub> | LiLiCorr |
 | **Nemotron 3.5 Super-VL 120B-A12B** · `super`<br><sub>hybrid Mamba-2 MoE, 12B active; 96 GB+ Macs</sub> | **NVIDIA NVFP4 · 76.4 GB**<br><sub>4-bit NVFP4 experts, FP8, BF16</sub> | LiLiCorr |
 
-<sub>Other precisions: `--model 35b:6bit` is five times closer to bf16 than the 4-bit default ([KL](docs/benchmarks.md#quality-qwen36-35b-a3b-against-bf16-2026-10-19)). All but Lightning and Dory read images. Memory: 16 GB for the 4B models, 32 GB
-for the 27B, 35B, Lightning and Bolt, 96 GB for Super-VL, 128 GB for Flash-Next. [Details](docs/usage.md#models-and-downloads)</sub>
+<sub>Other precisions: `--model 35b:6bit` is five times closer to bf16 than the 4-bit default ([KL](docs/benchmarks.md#quality-qwen36-35b-a3b-against-bf16-2026-10-19)). All but Lightning, Dory, the two Nemotron Nanos and the 35B's `16gb` read images. Memory: 16 GB for the 4B and 9B models, 32 GB
+for the 27B, 35B, Lightning and Bolt, 96 GB for Super-VL, 128 GB for Flash-Next. On a 16 or 24 GB Mac, `35b` takes its `16gb` variant: unsloth's 2-bit GGUF, downloaded and imported in one step ([how](docs/usage.md#gguf-files)). [Details](docs/usage.md#models-and-downloads)</sub>
 
 ## How it works
 

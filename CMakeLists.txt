@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.24)
 set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "")
 project(nace_infer LANGUAGES C CXX OBJCXX)
 
-set(KAPITSA_VERSION "0.1.38")
+set(KAPITSA_VERSION "0.1.39")
 if(NOT DEFINED KAPITSA_GIT)  # packaging/release/build.sh passes the commit it exported
   execute_process(COMMAND git -C ${CMAKE_SOURCE_DIR} rev-parse --short HEAD OUTPUT_VARIABLE KAPITSA_GIT
                   OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
@@ -23,6 +23,7 @@ set(CMAKE_OBJCXX_FLAGS "${CMAKE_OBJCXX_FLAGS} -fobjc-arc")
 # Metal kernel sources are embedded as strings and compiled at runtime (no offline
 # `metal` compiler needed; works with Command Line Tools only).
 file(GLOB NI_KERNELS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/kernels/*.metal ${CMAKE_SOURCE_DIR}/src/kernels/*.h)
+# (src/kernels/kflash.h is in NI_KERNELS: both embedded libraries read it)
 set(NI_EMBED ${CMAKE_BINARY_DIR}/generated/kernels_embed.cpp)
 add_custom_command(
   OUTPUT ${NI_EMBED}
@@ -38,7 +39,8 @@ add_custom_command(
   OUTPUT ${NI_NH_EMBED}
   COMMAND ${CMAKE_COMMAND} -DOUT=${NI_NH_EMBED} -DSRC_DIR=${CMAKE_SOURCE_DIR}/src/kernels
           -P ${CMAKE_SOURCE_DIR}/cmake/embed_kernels_nh.cmake
-  DEPENDS ${NI_NH_KERNELS} ${CMAKE_SOURCE_DIR}/src/kernels/common.h ${CMAKE_SOURCE_DIR}/cmake/embed_kernels_nh.cmake
+  DEPENDS ${NI_NH_KERNELS} ${CMAKE_SOURCE_DIR}/src/kernels/common.h ${CMAKE_SOURCE_DIR}/src/kernels/iq.h ${CMAKE_SOURCE_DIR}/src/kernels/kflash.h
+          ${CMAKE_SOURCE_DIR}/cmake/embed_kernels_nh.cmake
   COMMENT "Embedding the Nemotron-H Metal kernels")
 
 # Dory kernels: a third embedded source, compiled only when a Dory model loads.
@@ -58,7 +60,9 @@ add_custom_command(
   OUTPUT ${NI_TENSOR_EMBED}
   COMMAND ${CMAKE_COMMAND} -DOUT=${NI_TENSOR_EMBED} -DSRC_DIR=${CMAKE_SOURCE_DIR}/src/kernels
           -P ${CMAKE_SOURCE_DIR}/cmake/embed_kernels_tensor.cmake
-  DEPENDS ${NI_TENSOR_KERNELS} ${CMAKE_SOURCE_DIR}/src/kernels/common.h ${CMAKE_SOURCE_DIR}/cmake/embed_kernels_tensor.cmake
+  DEPENDS ${NI_TENSOR_KERNELS} ${CMAKE_SOURCE_DIR}/src/kernels/common.h ${CMAKE_SOURCE_DIR}/src/kernels/nemotron/nh_route.h
+          ${CMAKE_SOURCE_DIR}/src/kernels/iq.h
+          ${CMAKE_SOURCE_DIR}/cmake/embed_kernels_tensor.cmake
   COMMENT "Embedding the Metal 4 tensor kernels")
 
 # kapitsa bench (src/bench/): the harness's frozen prompt corpus and Apple's names for the Mac models, embedded

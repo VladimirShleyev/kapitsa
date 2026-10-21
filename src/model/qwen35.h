@@ -11,6 +11,7 @@
 #include <deque>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace ni {
@@ -33,15 +34,21 @@ struct QLinear {
   int bits = 4, gs = 64;
   bool mtp = false;   // part of the MTP head (8-bit prefill GEMM on qmr8 since it was introduced)
   bool gate = false;  // the trunk's MoE router / shared-expert gate: their 8-bit prefill GEMMs keep the old kernels
+  // Routed experts of a GGUF import kept in llama.cpp's blocks (src/kernels/wfmt_iq.metal): their GGUF type
+  // (gguf::kIQ2_XXS, kIQ2_S or kIQ3_S; bits 2 / 3, gs 256, s and b point at w), 0 otherwise. w is the stacked
+  // [E, N, K] matrix in the kernels' layout, its sections at these byte offsets (Q at 0).
+  uint32_t iq = 0;
+  uint32_t iq_x1 = 0, iq_x2 = 0, iq_x3 = 0, iq_d = 0;
   explicit operator bool() const { return w != nullptr; }
-  bool dense() const { return bits == 16; }
-  bool q4() const { return bits == 4 && gs == 64; }  // the specialized 4-bit kernels
-  bool q8() const { return bits == 8 && gs == 64; }  // the specialized 8-bit kernels
-  // kernel-name suffix of the format: "f16" (bf16) or "f<bits>g<gs>"
-  std::string fmt() const { return bits == 16 ? std::string("f16") : "f" + std::to_string(bits) + "g" + std::to_string(gs); }
-  bool same_format(const QLinear& o) const { return bits == o.bits && (bits == 16 || gs == o.gs); }
-  size_t row_bytes() const { return size_t(K) * size_t(bits) / 8; }
-  size_t group_row_bytes() const { return bits == 16 ? 0 : size_t(K / gs) * 2; }  // scales (or biases) per row
+  bool dense() const { return bits == 16 && !iq; }
+  bool q4() const { return bits == 4 && gs == 64 && !iq; }  // the specialized 4-bit kernels
+  bool q8() const { return bits == 8 && gs == 64 && !iq; }  // the specialized 8-bit kernels
+  // kernel-name suffix of the format: "f16" (bf16), "f<bits>g<gs>", or iq2xxs / iq2s / iq3s
+  std::string fmt() const;
+  std::string name() const;  // "4-bit group 64", "bf16", "IQ2_XXS", ...
+  bool same_format(const QLinear& o) const { return iq == o.iq && bits == o.bits && (bits == 16 || gs == o.gs); }
+  size_t row_bytes() const;  // weight bytes per row (IQ: the blocks', d included)
+  size_t group_row_bytes() const { return bits == 16 || iq ? 0 : size_t(K / gs) * 2; }  // scales (or biases) per row
 };
 
 // Formats with a full set of kernels: 4-bit and 8-bit group 64 (specialized), and the generic ones of wfmt.metal.
@@ -64,6 +71,7 @@ struct Qwen35Config {
   bool moe = false;
   int experts = 0, top_k = 0, moe_I = 0, shared_I = 0, dense_I = 0;
   bool norm_topk = true;
+  bool iq = false;  // routed experts in llama.cpp's IQ blocks (GGUF imports): their own MoE kernels (qwen35_iq.cpp)
   std::vector<int> eos;
   int group_size = 64;
 };
@@ -123,10 +131,12 @@ struct V8Knobs {
   // timing only (wrong outputs): skip kernel groups of a dense verify / drafting pass. Verify: 1 GDN step, 2 attention
   // core, 4 GDN prep, 8 MLP down, 16 MLP gate/up, 32 GDN in_proj, 64 GDN out / attention o, 128 LM head + sampling,
   // 256 normed X8 preps, 512 attention q|k|v; drafter: 1024 MLP gate/up, 2048 MLP down, 4096 LM head,
-  // 8192 conv / attention projections, 16384 ring commit. With NI_AB: the in-pipeline cost of those kernels.
+  // 8192 conv / attention projections, 16384 ring commit, 32768 attention, 262144 attention reduce. With NI_AB: the
+  // in-pipeline cost of those kernels.
   int skip = 0;
   int pad = 0;  // timing only: this many empty dispatches after every verify GEMM (the per-dispatch cost, with NI_AB)
   int tw = 1;   // the dense 4-bit verify GEMMs on the GPU's matrix units (qmm8t; Apple10 = M5 and macOS 26, else off)
+  int twm = 1;  // with tw: the dense MLP's gate|up and down GEMMs on qmm8t as well (NI_V8_TWM; 0 = the MMA kernels)
   // fused verify passes (verify8_fuse.metal, bitwise the passes they replace): 1 = MoE combine + the next norm's X8
   // table (and qmm8t's T table with tw), 4 = GDN prep with the rows' norms reduced together (the MoE top-k + plan
   // fusion is moe8_plan's own: tkp)
@@ -135,10 +145,11 @@ struct V8Knobs {
   int tkp = -1;  // NI_V8_MOE_TOPKPLAN: the router top-k inside moe8_plan (-1 = the environment's)
   int shs = -1;  // NI_V8_MOE_SHS: the shared expert as small tiles (with split 8; -1 = the environment's)
   int split = -1;  // NI_V8_MOE_SPLIT: experts with 3..split rows as 2-row small tiles (-1 = the environment's)
+  int dfl = 0;  // drafter experiments (DFlash2::encode_draft_impl): variant bits, A/B'd per cycle with NI_AB
 };
 V8Knobs& v8_knobs();
-// "key=value,..." over a copy of `base` (keys: cm, pair, kplan, gusplit, gdnsplit, prepu, skip, pad, tw, fuse, emu, shs,
-// split, tkp); unknown keys are fatal
+// "key=value,..." over a copy of `base` (keys: cm, pair, kplan, gusplit, gdnsplit, prepu, skip, pad, tw, twm, fuse, emu, shs,
+// split, tkp, dfl); unknown keys are fatal
 V8Knobs v8_knobs_parse(const char* spec, V8Knobs base);
 
 class Qwen35 : public Model {
@@ -310,6 +321,7 @@ class Qwen35 : public Model {
   // its rows again, so the hook must stay armed until the chunk has completed or been rerun.
   void set_capture(const CaptureHook* h) { cap_ = h; }
   const QLinear& embed_table() const { return embed_; }
+  const std::string& model_dir() const { return dir_; }
   const QLinear& lm_head() const { return lm_head_; }
   // Drafter's dynamic verify depth (DFlash2, MoE only): while set, the 8-row verify routes experts only
   // for rows < min(R, rows[0]) (uint read by the GPU); later rows' outputs are garbage and must not be used.
@@ -318,6 +330,18 @@ class Qwen35 : public Model {
   // passes for 1-2-row experts): a row's logits then depend only on the rows before it, not on how the
   // other rows route. A speculative sampler that needs p(. | prefix) exactly sets it (~3% slower verify).
   void set_verify_moe_exact(bool on) { v8_moe_exact_ = on; }
+  // KFlash tree verifies: while set, the 8-row verify's rows are a tree (tree = the KFlash tree descriptor,
+  // src/kernels/kflash.h: parents, depths, ancestor-or-self masks): row t's token takes position pos + depth(t) (RoPE,
+  // its sample's uniform), its attention sees the history and its ancestors' rows, its GDN conv window and recurrent
+  // state are its ancestors' fold. The rows' K/V stay in cache rows pos + t and their tape in rows t until the
+  // acceptance (kf_accept) writes the accepted path to s.pend_path, moves its K/V (encode_kv_tree_compact) and sets
+  // s.pend_tree: the next pass (or encode_flush) folds tape rows pend_path[0 .. n_pend).
+  void set_verify_tree(const Buffer* tree) { v8_tree_ = tree; }
+  // the 8-row verify can run a tree (its attention on attn8m, the split GDN step)
+  bool verify_tree_ok() const;
+  // After a tree verify at pos: the K/V rows of the accepted path (the descriptor's, kf_accept) move to positions
+  // pos + i (every attention layer)
+  void encode_kv_tree_compact(Encoder& e, Seq& s, int pos, const Buffer& tree);
   // dev (tools/bench_verify8): the last verify's MoE expert passes again with layer li's weights (timing only)
   void moe8_replay(Encoder& e, int li, int mask);
   // The 8-row verify GEMMs, for other 8-row passes (the DFlash2 drafter). Inputs are X8 tables
@@ -333,8 +357,10 @@ class Qwen35 : public Model {
   void enc_qmm8(Encoder& e, const std::vector<Seg8>& segs, int R, const Buffer& table, const Buffer& sums,
                 bool x2 = false, const Buffer* tt = nullptr);
   // h = half(silu(X Wg^T) * (X Wu^T)) written as the down projection's X8 table h + sums hs (4-bit, N % 64 == 0)
-  void enc_gu8(Encoder& e, const QLinear& gate, const QLinear& up, const Buffer& table, const Buffer& sums,
-               const Buffer& h, const Buffer& hs);
+  // tt: the inputs' T table (qmm8t for gate|up); ht: also write h as a T table there (split path only). Returns
+  // whether ht was written.
+  bool enc_gu8(Encoder& e, const QLinear& gate, const QLinear& up, const Buffer& table, const Buffer& sums,
+               const Buffer& h, const Buffer& hs, const Buffer* tt = nullptr, const Buffer* ht = nullptr);
   // The last verify's sampler inputs and outputs, as GPU buffers (for an on-GPU acceptance step):
   // stage-1 top-k candidates per row (values / ids, verify_candidates() per row) and the sampled ids.
   Buffer verify_cand_vals() const { return cand_v_; }
@@ -388,10 +414,11 @@ class Qwen35 : public Model {
   // NI_QMVF (default on): R <= 2 token rows of up to 4 matrices sharing x (4- or 8-bit group 64, one width) in one
   // qmvf.metal dispatch, an RMSNorm of x folded in (xn_out: also the normalized rows, [R, K]), add[i]: y += ...;
   // gu: segments 0 / 1 are gate / up and segs[0].y gets silu(gate) * up. x_ld / y_ld: 0 = K / each matrix's N.
+  // b6: one-row decode matvecs, which may also take 6-bit group 64 (IQ models on the M1; enc_qmv_multi).
   // False (nothing encoded) when off or not applicable.
   bool enc_qmvf(Encoder& e, const std::vector<Seg>& segs, const Buffer& x, int R, const Tensor* norm,
                 const Buffer* xn_out = nullptr, const std::vector<bool>& add = {}, uint32_t x_ld = 0,
-                uint32_t y_ld = 0, bool gu = false);
+                uint32_t y_ld = 0, bool gu = false, bool b6 = false);
   void enc_gdn(Encoder& e, Seq& s, int li, const Layer& L);
   void enc_attn(Encoder& e, Seq& s, int li, const Layer& L, int pos);
   void enc_moe(Encoder& e, const Layer& L);
@@ -500,6 +527,13 @@ class Qwen35 : public Model {
   // next_norm: the norm of what follows (the next layer's input norm, or the final norm); when given, the combine may
   // also write that norm's X8 table (V8Knobs::fuse & 1; with v8_tw() also the T table). Returns whether it did.
   bool enc_moe8(Encoder& e, const Layer& L, int R, int li, const Tensor* next_norm = nullptr);
+  // ---- routed experts in llama.cpp's IQ blocks (GGUF imports; qwen35_iq.cpp) ----
+  void load_iq_experts();
+  std::string iq_layer_check(const Layer& L) const;  // "" when the IQ MoE kernels take the layer
+  void enc_moe_iq_rows(Encoder& e, const Layer& L, int R, const Buffer& x);
+  void enc_moe8_iq(Encoder& e, const Layer& L, int R, int li);
+  void enc_moe_prefill_iq(Encoder& e, const Layer& L, int T, const Buffer& x, bool xh_ready);
+  std::unordered_map<const Tensor*, std::string> iq_src_;  // IQ experts' deferred tensors until load_iq_experts
 
   std::string dir_;
   std::string prefix_;
@@ -531,6 +565,7 @@ class Qwen35 : public Model {
   const CaptureHook* cap_ = nullptr;
   const Buffer* v8_rlim_ = nullptr;
   bool v8_moe_exact_ = false;
+  const Buffer* v8_tree_ = nullptr;
   std::deque<Tensor> owned_;
   std::vector<Buffer> owned_bufs_;
 

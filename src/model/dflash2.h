@@ -5,6 +5,7 @@
 // Opt-in: nothing here is constructed unless a drafter directory is given.
 #pragma once
 #include "model/copy_lane.h"
+#include "model/kflash_budget.h"
 #include "model/qwen35.h"
 
 #include <algorithm>
@@ -180,8 +181,28 @@ class DFlash2 {
   void gpu_state_reset(int P);
   void encode_cycle_draft_gpu(Encoder& e, Seq& s, DFlashSeq& d, int P_max, const SamplingParams& sp);
   int accepted() const { return acc_.as<int>()[0]; }
-  // proposals the last completed cycle verified (K, or the dynamic depth's choice)
-  int verified(int K) const { return dyn_tau_ > 0 ? std::min(K, int(kdyn_.as<uint32_t>()[0])) : K; }
+  // proposals the last completed cycle verified (K, or the dynamic depth's choice; a tree: its live nodes, as its
+  // acceptance recorded them: kN may already be the next cycle's)
+  int verified(int K) const {
+    const int* t = tree_buf_.as<int>();
+    return tree_ ? (t[kf::kObs] > 0 ? t[kf::kObs] : t[kf::kN]) - 1
+                 : dyn_tau_ > 0 ? std::min(K, int(kdyn_.as<uint32_t>()[0])) : K;
+  }
+  // KFlash on every target (NI_KFLASH=0 or NI_DFLASH_TREE=0 keeps the chain): the single-stream cycles (encode_cycle*)
+  // verify a best-first tree over the lattice (the shared builder kf_build on this drafter's children tables,
+  // dfl_kf_table) instead of the walk's chain, under the shared budget (KfBudget: the lattice's probabilities
+  // calibrated against the verify's own acceptances, a cycle's GPU time per row count measured on this Mac), and
+  // accept it with the shared kf_accept: greedy and sampled alike the emitted tokens are plain decoding's (at T > 0 its
+  // sampler's draws with each position's uniform). The verify's rows: whole 8-row tiles on dense targets (one today),
+  // 1 .. 8 live rows on MoE targets (the experts route the live rows alone). encode_draft (the batched path) keeps the
+  // walk.
+  bool tree() const { return tree_; }
+  void set_tree(bool on);
+  const int* tree_desc() const { return tree_buf_.as<int>(); }  // the tree descriptor (kflash.h) of the last cycle
+  KfBudget* budget() const { return kf_budget_.get(); }
+  // after each tree cycle completed: the cycle's GPU ms for the budget, its drafting half's command buffer and its
+  // verify's (the loop calls it after its wait)
+  void observe(double ms);
   // proposals verified per cycle: NI_DFLASH_VERIFY (1..7), default 7
   static int verify_depth();
   // dynamic verify depth threshold (dfl_depth; MoE targets only): 0.5 by default, NI_DFLASH_DYN=tau, 0 = off
@@ -202,7 +223,8 @@ class DFlash2 {
   // whether decode loops run the copy lane with this drafter: NI_COPY, else on for MoE targets and DFlash (v1)
   // drafters and off for a dense target's DFlash2 drafter, as measured over the recorded agent session (writing rate:
   // 35B +7.4%, 4B +34%, 27B -1.2%: its drafter already drafts most of what the copy would)
-  bool copy_lane() const { return copy_lane_enabled(tg_.config().moe || cfg_.v1); }
+  // chain cycles only: a KFlash tree cycle verifies the drafter's tree, not a chain the copy lane could replace
+  bool copy_lane() const { return !tree_ && copy_lane_enabled(tg_.config().moe || cfg_.v1); }
 
   // results of the last pass (host-visible after the command buffer completed)
   const int* cand_ids() const { return cand_i_.as<int>(); }       // [7][16]
@@ -243,22 +265,25 @@ class DFlash2 {
 
   void load_config(const std::string& dir);
   const Tensor* own(const Tensor& t, const char* label);
-  QLinear quantize(const std::vector<const Tensor*>& parts, const char* label);
+  QLinear quantize(const std::vector<const Tensor*>& parts, const char* label, const std::vector<uint32_t>& perm = {});
   QLinear row_view(const QLinear& src, uint32_t r0, uint32_t n);
   void alloc_buffers();
 
+  // dfl_qmm8, or the target's tensor-op GEMM qmm8t (src/kernels/tensor/verify8t.metal) on the X8 table's T table
+  // when the target has it on (Qwen35::v8_tw) and every segment is 4-bit group 64 with oscale 1
   void enc_qmm8(Encoder& e, const std::vector<DflSeg8>& segs, const Buffer& xh, const Buffer& xs, uint32_t K,
-                uint32_t x_ld) {
-    dfl_enc_qmm8(e, segs, xh, xs, K, x_ld);
-  }
+                uint32_t x_ld);
+  bool tw_for(const std::vector<DflSeg8>& segs, uint32_t K) const;
   void enc_qmm8_gu(Encoder& e, const QLinear& g, const QLinear& u, const Buffer& xh, const Buffer& xs) {
     dfl_enc_qmm8_gu(e, g, u, xh, xs, hh_, hs_);
   }
   void enc_qmm_rows(Encoder& e, const QLinear& L, const Buffer& xh, const Buffer& y, int M);  // prefill GEMM
   void enc_commit_kv(Encoder& e, DFlashSeq& d, const Buffer& kv, int rows, int pos0);
-  // encode_commit's projections of m rows of `src` (bf16 [8][n_slots * H]; the verify captures capt_ by default)
-  void enc_commit_from(Encoder& e, DFlashSeq& d, int m, const Buffer& src);
-  void encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const SamplingParams& sp, bool gpu);
+  // encode_commit's projections of m rows of `src` (bf16 [8][n_slots * H]; the verify captures capt_ by default);
+  // gather: rows gst[4 + r] of src (a tree cycle's accepted path)
+  void enc_commit_from(Encoder& e, DFlashSeq& d, int m, const Buffer& src, bool gather = false);
+  void encode_draft_impl(Encoder& e, Seq& s, DFlashSeq& d, int P, const SamplingParams& sp, bool gpu,
+                         bool tree = false);
   void dbg(Encoder& e, const std::string& name, const Buffer& src, size_t bytes);
 
   Qwen35& tg_;
@@ -277,7 +302,7 @@ class DFlash2 {
   int pf_n_ = 0, pf_rows_ = 0;
 
   // pass buffers (8 rows)
-  Buffer h_, n_, xh_, xs_, hh_, hs_, dyn_, q_, kv_, Q_, Kb_, Vb_, part_o_, part_ml_, u_;
+  Buffer h_, n_, xh_, xs_, xh2_, xs2_, hh_, hs_, gu_g_, gu_u_, dyn_, q_, kv_, Q_, Kb_, Vb_, part_o_, part_ml_, u_;
   Buffer logits_, sel_, tk_v_, tk_i_, cand_v_, cand_i_, edges_, walk_s_, qprob_, walk_k_, rope_cs_;
   // acceptance: target distributions of the verify rows, result {a, token}
   Buffer dist_id_, dist_p_, dist_keep_, acc_, kdyn_, gst_;
@@ -289,7 +314,13 @@ class DFlash2 {
   float dyn_tau_ = 0.0f;    // T = 0 (0: dynamic depth off)
   float dyn_tau_t_ = 0.0f;  // T > 0
   uint32_t dyn_rule_ = 0;   // dfl_depth rule (NI_DFLASH_DYN_RULE)
-  bool exact_moe_ = true;  // T > 0 on MoE targets: row-independent expert numerics (NI_DFLASH_EXACT_MOE=0 off)
+  bool exact_moe_ = true;  // MoE targets: row-independent expert numerics, tree verifies at every T and the chain's at T > 0 (NI_DFLASH_EXACT_MOE=0 off)
+  // KFlash (see tree()): the tree descriptor (int32 [kf::kWords]), the lattice's children tables (clq float
+  // [7][16][16], ctok int, the constant successors), the builder's live-row word, the budget
+  bool tree_ = false;
+  bool gst_tree_ = false;  // the drafter state's rows are a tree acceptance's path (gst[4 ..]): commits gather them
+  Buffer tree_buf_, kf_clq_, kf_tok_, kf_next_, kf_live_;
+  std::unique_ptr<KfBudget> kf_budget_;
   // T > 0: the walk samples its chain at T_q = walk_tf_ * T (NI_DFLASH_QT; 0 = argmax chain with one-hot q)
   float walk_tf_ = 1.0f;
   // MLP and LM head on the target's 8-row verify GEMMs (Qwen35::enc_gu8 / enc_qmm8 with the verify's V8Knobs;
@@ -309,10 +340,13 @@ class DFlash2 {
   const QLinear& draft_head() const { return head_n_ ? head_sub_ : tg_.lm_head(); }
   uint32_t draft_vocab() const { return head_n_ ? head_n_ : uint32_t(cfg_.vocab); }
   void enc_to_v8(Encoder& e, const Buffer& xh, uint32_t K, const Buffer& table);
+  void enc_qmm8_cp(Encoder& e, const QLinear& L, const Tensor* base, const Buffer& xh, const Buffer& xs);
   // context commit
   Buffer capt_, y8_, c8_, kv8_, cdbg_;
   Buffer pcap_, xph_, yph_, cph_, kvph_;
-  int max_splits_ = 32;
+  int max_splits_ = 32;  // partial buffers (attention splits)
+  // context splits of the draft attention (NI_DFLASH_ATTN_SPLITS, <= max_splits_)
+  int attn_splits_ = std::clamp(getenv("NI_DFLASH_ATTN_SPLITS") ? atoi(getenv("NI_DFLASH_ATTN_SPLITS")) : 16, 1, 32);
   bool h0_set_ = false, debug_ = false;
   int attn_variant_ = 0, pf8_ = -1;
   std::map<std::string, Buffer> dbg_;
