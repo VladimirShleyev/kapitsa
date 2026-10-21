@@ -110,6 +110,7 @@ Fake.log.clear()
 Fake.cache_sessions = 8
 ca = agentic.t_cache(a, log=lambda m: None)
 check(ca["warm_cached_tokens"] and ca["warm_hit_rate"] and ca["warm_hit_rate"] > 0.9, "warm prefix is hit", str(ca))
+check(ca.get("followup_hit_rate") and ca["followup_hit_rate"] > 0.9 and ca["followup_ttft_s"], "follow-up turn is hit", str(ca))
 check(ca["interleave_prefix_kept"] is True, "multi-slot engine keeps the prefix across another chat", str(ca))
 Fake.last.clear()
 Fake.cache_sessions = 1

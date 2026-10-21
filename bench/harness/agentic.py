@@ -237,8 +237,10 @@ def t_cache(a, log=print):
               "b": f"[session {random.getrandbits(64):016x}] {bench.SYS}\n\n# Repository context\n{ctx_b}"}
     res, invalid, flags = {"target": tg, "turns": []}, [], []
 
-    def ask(who, i, label):
+    def ask(who, i, label, history=None):
         msgs = [{"role": "system", "content": sysmsg[who]}, {"role": "user", "content": SHORT_Q[i % len(SHORT_Q)]}]
+        if history:  # a grown conversation: the earlier question and its answer, then a new question
+            msgs = [msgs[0]] + history + [msgs[1]]
         # 256 tokens: the answer ends by itself (a turn cut by max_tokens is not reusable in some engines)
         try:
             r = bench.stream_chat(a.base_url, bench.body_of(a, msgs, 256), session=sid[who])
@@ -250,11 +252,19 @@ def t_cache(a, log=print):
              "cached_tokens": bench.cached_of(u, r["timings"]), "ttft_s": r["ttft"], "finish": r["finish"]}
         for why in bench.thinking_leak(r):
             invalid.append(f"cache {label}: {why}")
+        t["answer"] = r["content"]
         res["turns"].append(t)
         log(f"  cache {label}: prompt {t['prompt_tokens']} (cached {t['cached_tokens']}), TTFT {bench.f2(t['ttft_s'])}s")
         return t
 
     cold = ask("a", 0, "A cold")
+    # Follow-up: same conversation grown by one turn (what a chat or tool loop sends). Engines that keep only the live
+    # state or turn-boundary checkpoints reuse this but not a new question on the shared prefix (the warm turns below).
+    fol = None
+    if cold and cold.get("answer"):
+        time.sleep(a.turn_gap)
+        hist = [{"role": "user", "content": SHORT_Q[0]}, {"role": "assistant", "content": cold["answer"]}]
+        fol = ask("a", 5, "A follow-up", history=hist)
     warm = []
     for i in (1, 2, 3):
         time.sleep(a.turn_gap)
@@ -269,6 +279,11 @@ def t_cache(a, log=print):
         res["cold_cached_tokens"] = cold["cached_tokens"]
         if cold["cached_tokens"] and cold["cached_tokens"] > bench.COLD_CACHE_MAX:
             invalid.append(f"cache: cold prompt reported {cold['cached_tokens']} cached tokens")
+    if fol:
+        res["followup_ttft_s"] = fol["ttft_s"]
+        res["followup_cached_tokens"] = fol["cached_tokens"]
+        res["followup_hit_rate"] = (round(fol["cached_tokens"] / fol["prompt_tokens"], 4)
+                                    if fol["cached_tokens"] is not None and fol["prompt_tokens"] else None)
     res["warm_ttft_s"] = med([w["ttft_s"] for w in warm])
     res["warm_cached_tokens"] = med([w["cached_tokens"] for w in warm])
     wp = sum(w["prompt_tokens"] or 0 for w in warm)
@@ -277,6 +292,8 @@ def t_cache(a, log=print):
     if back:
         res["interleave_ttft_s"] = back["ttft_s"]
         res["interleave_cached_tokens"] = back["cached_tokens"]
+    for t in res["turns"]:
+        t.pop("answer", None)
     res.update(summarize_cache(res))
     res.update({"invalid": invalid, "flags": flags})
     return res

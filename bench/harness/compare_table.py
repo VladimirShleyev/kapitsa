@@ -218,7 +218,8 @@ def extract_agentic(d, path, base):
     peak = (d.get("memory") or {}).get("sweep", {}).get("phys_footprint_peak_mb") or d.get("peak_memory_mb")
     r.update({"start_s": (cs or {}).get("spawn_to_first_token_s"), "penalty_s": (cs or {}).get("first_request_penalty_s"),
               "ttft_1k": t1, "ttft_16k": t16, "ttft_max": tm, "dec_1k": d1, "dec_max": dm, "max_tokens": ptm,
-              "retention": (sw or {}).get("decode_retention"), "warm_ttft": (ca or {}).get("warm_ttft_s"),
+              "retention": (sw or {}).get("decode_retention"), "warm_ttft": (ca or {}).get("warm_ttft_s"), "followup_ttft": (ca or {}).get("followup_ttft_s"),
+              "followup_hit_rate": (ca or {}).get("followup_hit_rate"),
               "warm_speedup": (ca or {}).get("warm_vs_cold_speedup"),
               "kept": (ca or {}).get("interleave_prefix_kept"), "interleave": (ca or {}).get("interleave_vs_cold"),
               "hit_rate": hit, "warm_hit_rate": (ca or {}).get("warm_hit_rate"),
@@ -239,7 +240,8 @@ AGENTIC_COLS = [  # key, header, fmt, better
     ("dec_1k", "decode 1K tok/s", "%.1f", "max"),
     ("dec_max", "decode max tok/s", "%.1f", "max"),
     ("retention", "decode retention", "%.2f", "max"),
-    ("warm_ttft", "warm-prefix TTFT s", "%.2f", "min"),
+    ("warm_ttft", "new-question TTFT s", "%.2f", "min"),
+    ("followup_ttft", "follow-up TTFT s", "%.2f", "min"),
     ("hit_rate", "agent cache hit rate", "%.0f%%", "max"),
     ("falloff", "sustained falloff %", "%.1f", "min"),
 ]
@@ -281,7 +283,7 @@ def agentic_table(model, rows):
 
 
 AGENTIC_CSV_COLS = ["model", "display", "key", "engine", "version", "when"] + [k for k, *_ in AGENTIC_COLS] + [
-    "max_tokens", "warm_speedup", "kept", "interleave", "warm_hit_rate", "sustain_s", "idle_mb", "peak_mb", "invalid",
+    "max_tokens", "warm_speedup", "followup_hit_rate", "kept", "interleave", "warm_hit_rate", "sustain_s", "idle_mb", "peak_mb", "invalid",
     "flags", "contended", "ours", "file"]
 
 
